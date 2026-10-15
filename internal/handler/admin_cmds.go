@@ -9,6 +9,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 
 	"glaciertdb/internal/admin"
+	"glaciertdb/internal/config"
 	"glaciertdb/internal/logx"
 	"glaciertdb/internal/meta"
 )
