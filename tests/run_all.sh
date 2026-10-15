@@ -145,6 +145,7 @@ echo "---- test_concurrent.py ----"; python /tests/test_concurrent.py || rc=1
 echo "---- test_timeseries.py ----"; python /tests/test_timeseries.py || rc=1
 echo "---- test_admin.py ----"; python /tests/test_admin.py || rc=1
 echo "---- test_navicat.py ----"; python /tests/test_navicat.py || rc=1
+echo "---- test_mysql_compat.py ----"; python /tests/test_mysql_compat.py || rc=1
 exit $rc
 EOF
 )

@@ -59,7 +59,7 @@ parallel_query:
 SUBMIT QUERY 'SELECT …'
   [CALLBACK 'http://ops/hook' [SIGN '<secret>']]     -- POST 回调；SIGN 开启 HMAC 签名（可选）
   [TIMEOUT 3600]
-  [START AFTER '17:00']                               -- 时间策略：每天 17:00 后执行（也支持 '周X HH:MM'）
+  [WINDOW '17:00-20:00']                              -- 时间策略：每日执行窗口 [起,止)（支持跨午夜 '22:00-06:00'、'周X HH:MM-HH:MM'）
   [WHEN CPU < 70 AND DISK_IO < 50 AND MEM < 80]       -- 性能策略门槛（多条件 AND）
   [PARTITION BY ROWS 50000 | BYTES 8388608]           -- 分片回调：每片一次 POST
   [SCRIPT '/srv/jobs/report.js' [OUTPUT xls|csv]];    -- JS 后处理管道，直出表格
@@ -67,7 +67,9 @@ SUBMIT QUERY 'SELECT …'
 
 ### 3.2 策略引擎
 
-- **时间策略**：`START AFTER` 定义执行窗口（如"晚上 5 点之后"避峰）；到窗 + 性能门槛满足才触发；
+- **时间策略**：`WINDOW` 定义**每日执行区间**（如 `'17:00-20:00'` = 17 点后、20 点前），必须给**双边区间**——避免单边"5 点后"无限延伸导致跨天误执行；支持跨午夜窗口（`'22:00-06:00'`）；
+  - 提交时已在窗口内且资源达标 → 立即执行；
+  - 在窗口内等待资源，但**窗口结束仍未达标 → 当日放弃**，job 转 `EXPIRED`（不滚动到次日，防止"明天的查询"意外执行）；需要每日调度时显式 `EVERY DAY` 修饰（调度型 job 单列，不与一次性查询混淆）；
 - **性能策略**：CPU 占用 / 磁盘 IO 写入 / 内存使用率三类指标，每条支持**两个层级**：
   - `全局（服务器级）`：整机指标（Linux 读 `/proc` + gopsutil，纯 Go）；
   - `应用级（当前程序）`：本进程 CPU、RSS、累计写盘字节（runtime + /proc/self）；

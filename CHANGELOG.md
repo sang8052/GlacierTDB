@@ -2,6 +2,13 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.0.3.alpha] - 2026-10-15
+
+### 新增
+- **MySQL 兼容增强 M1（高频批）**：`LIMIT offset,count` 双参写法、`CONCAT()`（含嵌套与 NULL 传播）、`IF(c,a,b)`、`RAND()`、`UUID()`（v4 样式）；**DDL 类型映射**——MySQL 建表语句直接粘贴可用（INT 族→INTEGER、VARCHAR 族→TEXT、DATETIME/TIMESTAMP→TEXT、DOUBLE/FLOAT→REAL、DECIMAL→TEXT、BINARY 族→BLOB，UNSIGNED/ZEROFILL/AUTO_INCREMENT/内联 KEY 段/ENGINE 表尾/COMMENT 自动清理）；`DEFAULT CURRENT_TIMESTAMP` → `datetime('now')`。
+- 新增第 9 大类黑盒测试 `test_mysql_compat.py`（14 项），全套回归 ALL TESTS PASSED。
+- FEATURE.md：异步查询时间策略修正为**每日窗口区间**（双边 `WINDOW '17:00-20:00'`，支持跨午夜；窗外未达标当日 EXPIRED 不跨天滚动）。
+
 ## [1.0.2.alpha] - 2026-10-15
 
 首个完整功能版。

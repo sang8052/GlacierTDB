@@ -224,6 +224,10 @@ func RewriteDialect(q string) string {
 	if reTrunc.MatchString(q) {
 		q = reTrunc.ReplaceAllString(q, "DELETE FROM ")
 	}
+	// ---- MySQL 兼容 M1（LIMIT 双参 / CONCAT / IF / RAND / UUID）----
+	q = RewriteMySQLCompat(q)
+	// ---- DDL 类型映射（仅 CREATE/ALTER TABLE 等语句生效）----
+	q = RewriteDDLTypes(q)
 	return q
 }
 
