@@ -2,6 +2,31 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.0.7.alpha] - 2026-10-15
+
+### 新增
+- **EVERY 周期定时任务**（无 CALLBACK 即定时任务）：`EVERY DAY [AT '17:00']` / `EVERY HOUR` / `EVERY n SECONDS|MINUTES|HOURS`；执行完自动重排；`recur_group` 链标记，`CANCEL` 取消整链（DONE 链头亦可停链）。
+- **VACUUM 释放空间**：管理面 `VACUUM DATABASE <db>`——⚠️ 执行期间该库**全部写入阻塞**（结果集含警示列）；`maintenance.no_hot_vacuum: true` 禁止热刷新改用 CLI（`glaciertdb -vacuum -db-dir <dir>`，刷新时服务必须停止）。
+- **db 目录唯一锁**：服务与 CLI 互斥、同目录单实例（flock，进程退出自动释放）；`--force-unlock`（拒绝抢活进程的锁）。
+- **SQLite 静态加密**：`security.encrypt/passphrase`（ncruces adiantum VFS，4KiB 块 + Argon2id）；首次启用要求空目录/已加密库，存量明文库启动报错列出；实测密文文件头、内容不可 grep、错口令 `file is not a database`。
+- 新增 `test_v107.py` 12 项；全套回归 ALL TESTS PASSED（12 大类）。
+
+## [1.0.6.alpha] - 2026-10-15
+
+### 新增
+- **回调通道扩展**：HTTP（原有）/ **TCP**（客户端开端口，服务端连接推送元信息+列头+数据流）/ **RabbitMQ**（`amqp://… QUEUE q`）/ **Kafka**（`kafka://broker TOPIC t`）；四态（DONE/ERROR/EXPIRED/CANCELLED）一律推送。
+- **结果保存时间**：`async_query.result_retain_sec` 默认 **60 秒**到期自动删除；`RETAIN n|n s|n m|n h` 按任务覆盖；`DROP QUERY RESULT` 主动清除。
+
+## [1.0.5.alpha] - 2026-10-15
+
+### 新增
+- **异步查询引擎**：`SUBMIT QUERY` 秒回 job_id；AT 指定时刻 / WINDOW 每日双边窗口（EXPIRED 不跨天）/ WHEN 资源门槛（CPU/MEM/APP_CPU/APP_MEM/IO_MBPS，30s 采样最低 10s）；DONE/ERROR/EXPIRED 回调（可选 HMAC）；结果 JSONL 落盘分页拉取（query_jobs/query_result/FETCH/CANCEL）。
+
+## [1.0.4.alpha] - 2026-10-15
+
+### 新增
+- **多核并行查询**：`/*+ PARALLEL(n) */` hint；单表顶层聚合分片-并行-合并（rowid/单列主键分片，AVG 拆 sum+count）；自动回退串行。
+
 ## [1.0.3.alpha] - 2026-10-15
 
 ### 新增

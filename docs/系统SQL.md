@@ -190,7 +190,26 @@ DO 0;  /* ping */
 
 ---
 
-## 4. 快速速查
+## 4. 异步查询与定时任务（v1.0.5–1.0.7）
+
+```sql
+SUBMIT QUERY 'SELECT …'
+  [CALLBACK '<url>']                    -- http(s)://… | tcp://host:port | amqp://… [QUEUE q] | kafka://broker [TOPIC t]
+  [SIGN '<secret>'] [TIMEOUT 3600] [RETAIN 300]
+  [AT '17:00' | '2026-10-16 17:00:00']  -- 指定时刻执行
+  [WINDOW '17:00-20:00']                -- 每日窗口（EXPIRED 不跨天）
+  [WHEN CPU < 70 AND MEM < 80 AND APP_CPU < 50 AND IO_MBPS < 10]
+  [EVERY DAY [AT '17:00'] | EVERY HOUR | EVERY 30 MINUTES];  -- 周期定时任务
+
+SHOW QUERY JOBS;  SELECT * FROM query_jobs WHERE state='DONE';
+SELECT * FROM query_result('j_xxx') LIMIT 1000 OFFSET 5000;
+CANCEL QUERY 'j_xxx';  DROP QUERY RESULT 'j_xxx';
+VACUUM DATABASE backup;   -- ⚠️ 执行期间该库全部写入阻塞；CLI: glaciertdb -vacuum
+```
+
+四态回调（DONE/ERROR/EXPIRED/CANCELLED）；结果默认 60 秒自动删除；加密/目录锁见配置说明。
+
+## 5. 快速速查
 
 ```sql
 -- 日常

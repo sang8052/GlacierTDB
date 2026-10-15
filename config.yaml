@@ -42,6 +42,15 @@ async_query:
   # nodejs_path: ""          # SCRIPT 后处理 runtime（空=禁用；沙箱边界见 FEATURE.md）
   # python_path: ""
 
+# 维护：VACUUM 会锁该库全部写入；no_hot_vacuum=true 禁止运行中 VACUUM（仅 CLI）
+maintenance:
+  no_hot_vacuum: false
+
+# 静态加密（adiantum，防外部程序直接读 .db 文件）；首次启用要求空目录或已加密库
+security:
+  encrypt: false
+  passphrase: ""        # 启用时必填
+
 log:
   level: info              # debug | info | warn | error
   slow_query_ms: 200       # 慢查询阈值
