@@ -325,7 +325,7 @@ GlacierTDB/
 │   └── logx/             # 轻量日志 + SQL 审计日志
 ├── schema/timeseries.sql # 时序冷库标准 schema
 ├── docs/                 # 文档：配置说明 / 系统SQL / 时序数据库 / 部署运维
-├── FEATURE.md            # 后续功能路线（单一收集页）
+├── FEATURE.md            # 后续功能路线
 ├── CHANGELOG.md          # 更新日志
 ├── tests/                # 黑盒测试（CLI/PyMySQL/SQLAlchemy/并发/多库/时序/管理面）
 ├── Dockerfile
