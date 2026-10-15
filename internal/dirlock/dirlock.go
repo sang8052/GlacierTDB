@@ -71,13 +71,8 @@ func holderAlive(info string) (int, bool) {
 	for _, kv := range strings.Fields(info) {
 		if strings.HasPrefix(kv, "pid=") {
 			if pid, err := strconv.Atoi(strings.TrimPrefix(kv, "pid=")); err == nil {
-				if p, err := os.FindProcess(pid); err == nil {
-					if runtime.GOOS == "windows" {
-						return pid, true
-					}
-					if err := p.Signal(syscall.Signal(0)); err == nil {
-						return pid, true
-					}
+				if processAlive(pid) {
+					return pid, true
 				}
 			}
 			return 0, false
