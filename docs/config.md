@@ -1,0 +1,174 @@
+# GlacierTDB 配置手册
+
+> 配置文件为 YAML（默认路径 `/app/config.yaml`，容器内）；
+> **所有项均可省略**，省略时使用内置默认值。
+> 改配置后重启生效；运行期可用管理面 SQL 热改部分参数（见 [系统SQL.md](系统SQL.md)）。
+
+---
+
+## 1. 完整配置示例（含默认值）
+
+```yaml
+listen: 0.0.0.0:3309        # 监听地址
+db_dir: /data               # 库目录：一个库 = 目录下一个 <库名>.db 文件
+default_db: backup          # 连接未指定库时的默认库（不存在则自动创建）
+server_version: "8.99.999"  # 对外呈现的 MySQL 版本号
+
+# ---- 资源保护 ----
+memory_limit_mb: 0     # Go 运行时软内存上限（0 = 不限制）
+max_connections: 64    # 最大并发客户端连接数（超限直接断开）
+
+# ---- 并发模型：读并发多线程（可按库限流）；写单库单线程互斥（多库写入并行）----
+concurrency:
+  global_threads: 0              # 全局并发执行上限（读写共享，0=不限）
+  per_db_read_threads: 0         # 全局默认：单库读并发上限（0=不限）
+  per_db_read_threads_override:  # 按库覆盖（可选）
+    # backup: 8
+    # logs: 2
+
+# ---- 认证 ----
+auth:
+  user: glacier             # 固定值，配置其他名字会被忽略
+  password: "changeme"      # mysql_native_password；管理面 SET PASSWORD 热改后
+                            # 以 <db_dir>/glacier.json 为准（重启亦是）
+  readonly_users: []        # 命中则拒绝一切写操作（返回 1290）
+
+# ---- SQLite ----
+sqlite:
+  synchronous: NORMAL       # OFF | NORMAL | FULL | EXTRA（持久化强度）
+  busy_timeout_ms: 5000     # 锁等待兜底（主策略是网关层每库写锁）
+  cache_size_kb: 256        # 每连接页缓存
+  max_result_rows: 1000000  # 单查询返回行数上限（内存保护）
+
+# ---- 日志 ----
+log:
+  level: info               # debug | info | warn | error
+  slow_query_ms: 200        # 慢查询阈值（超过则记入运行日志）
+  sql_log_file: ""          # SQL 审计日志路径（空=关闭），如 /data/sql.log
+```
+
+---
+
+## 2. 逐项说明
+
+### 2.1 基础（listen / db_dir / default_db / server_version）
+
+| 项 | 默认 | 说明 |
+| --- | --- | --- |
+| `listen` | `0.0.0.0:3309` | MySQL 协议监听地址；只本机用改 `127.0.0.1:3309` |
+| `db_dir` | `/data` | 库目录。**一个库 = 目录下一个 `<库名>.db` 文件**；目录需事先存在且可写（WAL 需创建 `-wal`/`-shm`）。Windows 支持原生路径 `H:\glacier\data`、正斜杠 `H:/glacier/data`、相对路径 `.\data` |
+| `default_db` | `backup` | 客户端连接未指定库时进入的库；不存在自动创建（空文件 + WAL） |
+| `server_version` | `8.99.999` | 对外模拟的 MySQL 协议版本（`SELECT @@version` 返回值）。注意与 GlacierTDB 自身版本（`SELECT glacier_version`，编译于代码常量，当前 `1.0.2.alpha`）区分 |
+
+### 2.2 资源保护（memory_limit_mb / max_connections）
+
+| 项 | 默认 | 说明 |
+| --- | --- | --- |
+| `memory_limit_mb` | `0` | Go 运行时软内存上限（等价 `GOMEMLIMIT`）：GC 更积极回收，逼近上限时降低吞吐而非 OOM。0 = 不限制 |
+| `max_connections` | `64` | 最大并发客户端连接数；超限新连接直接断开（日志有 `reject connection` 记录） |
+
+另有一道内存防线：`sqlite.max_result_rows`（见 2.5）。
+
+### 2.3 并发（concurrency）
+
+并发模型：**读并发多线程**（WAL 下读不互斥，可按库限流）；**写单库单线程**（每库一把互斥锁，多库写入天然并行）。
+
+| 项 | 默认 | 说明 |
+| --- | --- | --- |
+| `global_threads` | `0` | 全局并发执行闸门（读 + 写共享）。压测或 CPU 保护场景用；0 = 不限 |
+| `per_db_read_threads` | `0` | 全局默认：单个库的并发读上限。0 = 不限 |
+| `per_db_read_threads_override` | `{}` | 按库覆盖全局默认（map：库名 → 上限）。例：热点库给 8、冷库给 2 |
+
+三项均支持管理面热改（`USE GlacierTDB; SET GLOBAL_THREADS=32;`），**热改重启失效回到本文件值**。当前生效值：`SELECT * FROM server_config WHERE name LIKE 'concurrency.%'`。
+
+### 2.4 认证（auth）
+
+| 项 | 默认 | 说明 |
+| --- | --- | --- |
+| `user` | `glacier` | **固定值**：写其他名字会被忽略（管理面约定） |
+| `password` | `changeme` | `mysql_native_password` 口令。⚠️ 管理面执行 `SET PASSWORD='新密码'` 后：热生效并持久化到 `<db_dir>/glacier.json`，**此后以此文件为准（含重启）**，本项成为首次部署的初始密码 |
+| `readonly_users` | `[]` | 只读账号名单；但当前为单账号模型，实际仅当包含 `glacier` 时整个服务变只读（写语句返回 1290） |
+
+### 2.5 SQLite（sqlite）
+
+| 项 | 默认 | 说明 |
+| --- | --- | --- |
+| `synchronous` | `NORMAL` | `OFF`（最快，掉电可能丢最近事务）/ `NORMAL`（推荐，WAL 下仅断电风险）/ `FULL`（每事务 fsync，最稳）/ `EXTRA` |
+| `busy_timeout_ms` | `5000` | SQLite 层锁等待兜底。注意：网关对写已做每库互斥，此项主要防外部进程同时打开同一文件 |
+| `cache_size_kb` | `256` | 每连接页缓存；并发连接多时总缓存 ≈ 连接数 × 该值 |
+| `max_result_rows` | `1000000` | 单条查询最大返回行数（超出报错），防止误查大表拖垮网关；大结果集请加 LIMIT |
+
+启动时对每个后端连接自动应用（顺序重要，`busy_timeout` 最先）：
+
+```sql
+PRAGMA busy_timeout = 5000;
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+PRAGMA synchronous  = NORMAL;
+PRAGMA cache_size   = -256;
+```
+
+### 2.6 日志（log）
+
+| 项 | 默认 | 说明 |
+| --- | --- | --- |
+| `level` | `info` | `debug`（含每条 SQL） / `info` / `warn` / `error`；输出到 stderr（`docker logs` 可见） |
+| `slow_query_ms` | `200` | 语句耗时超过该值记入运行日志 |
+| `sql_log_file` | `""` | **SQL 审计日志**：空 = 关闭；如 `/data/sql.log` |
+
+**SQL 审计日志**（调试利器）：每条语句一行 JSON，100MB 自动轮转为 `.old`：
+
+```json
+{"ts":"2026-10-15 17:04:10.700","conn":10001,"user":"glacier","remote":"172.18.0.1:38080",
+ "db":"backup","admin":false,"cost_ms":7.111,"status":"OK","rows":-1,"affected":1,
+ "insert_id":16,"sql":"INSERT INTO t1(name,val) VALUES('audit_row',9.9)"}
+```
+
+- `status`：`OK` / `ERROR`（ERROR 时附 `error` 字段，含完整错误消息）
+- `cost_ms`：服务端执行耗时；`rows`：返回行数（-1 = 非结果集）；`affected` / `insert_id`：写语句回填
+- 客户端探活语句同样记录——客户端报错时对日志即可看到它实际发了什么
+
+---
+
+## 3. 命令行参数
+
+优先级高于配置文件。
+
+| 参数 | 说明 |
+| --- | --- |
+| `-config <path>` | 配置文件路径，默认 `/app/config.yaml` |
+| `-db-dir <dir>` | 覆盖库目录 |
+| `-db <file.db>` | 兼容旧参数：取目录 = 所在目录、默认库 = 文件名去扩展 |
+| `-listen <addr>` | 覆盖监听地址 |
+| `-v` / `--version` | 打印 GlacierTDB 自身版本后退出（非 MySQL 协议版本） |
+
+```bash
+./glaciertdb -v
+# GlacierTDB 1.0.2.alpha (mysql protocol 8.99.999, linux/amd64)
+```
+
+---
+
+## 4. 最小配置
+
+只写非默认项即可，其余全走内置默认：
+
+```yaml
+db_dir: /data/glacier     # Windows: H:\glacier\data
+```
+
+---
+
+## 5. 常见问题
+
+**Q：改了 `auth.password` 重启后怎么没生效？**
+管理面 `SET PASSWORD` 会在 `<db_dir>/glacier.json` 留下持久化密码，它**优先于**配置文件。删除该文件即可回到配置文件密码。
+
+**Q：连接报「db dir 不存在或不是目录」？**
+`db_dir` 指向的目录需要**事先创建**且可写（WAL 要在同目录建 `-wal`/`-shm`）；挂载 Docker 卷时挂**目录**，不要挂单个 `.db` 文件。
+
+**Q：`memory_limit_mb=512` 为什么内存还是能超过一点？**
+它是 Go 运行时**软**上限（GOMEMLIMIT 语义）：GC 会尽全力回收压回，但不含 SQLite 页缓存之外的少量运行时开销，也不代替 `max_result_rows` 的查询防线。
+
+**Q：并发热改后重启丢了？**
+设计如此：`SET GLOBAL_THREADS` 等仅运行时生效，持久值写回 `config.yaml` 的 `concurrency` 段。
