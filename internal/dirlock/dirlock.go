@@ -69,9 +69,12 @@ func tryFlock(f *os.File) error {
 }
 
 func tryUnflock(f *os.File) {
-	if runtime.GOOS != "windows" {
-		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	if runtime.GOOS == "windows" {
+		return
 	}
+	// LOCK_UN 常量在部分平台（windows）不可引用；Close 亦会释放，这里显式 UN 一次
+	const lockUn = 0x8 // syscall.LOCK_UN
+	_ = syscall.Flock(int(f.Fd()), lockUn)
 }
 
 func readHolder(f *os.File) string {
