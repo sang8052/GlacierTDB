@@ -15,6 +15,7 @@
 | [docs/S3对象存储.md](docs/S3对象存储.md) | 后续路线：S3 协议兼容、base64/图片缩放/QoS 扩展、多机冗余 |
 | [docs/异步查询.md](docs/异步查询.md) | 后续路线：超大数据异步查询（HTTP 回调 + SQL 拉取、结果落盘分页） |
 | [docs/MySQL兼容增强.md](docs/MySQL兼容增强.md) | 后续路线：LIMIT 双参/CONCAT/IF/DDL 类型映射等高频 MySQL 写法补齐 |
+| [feature.md](feature.md) | 后续功能路线收集（rollup / S3 / 异步查询 / MySQL 兼容） |
 | [CHANGELOG.md](CHANGELOG.md) | 更新日志 |
 
 **一句话**：把 SQLite 变成一台"MySQL 服务器"，让现有的 MySQL 客户端、ORM、运维脚本**不改一行配置**就能通过 TCP 远程读写 SQLite；配合时序冷库设计（见[「❄️ 时序冷库设计」](#️-时序冷库设计glaciertdb-路线)），为历史归档与冷数据提供 InfluxDB 级的查询体验。
