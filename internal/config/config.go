@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.0.4.alpha"
+const GlacierVersion = "1.0.5.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -24,6 +24,21 @@ type ConcurrencyOpts struct {
 // 用 Disable 而非 Enable 以便省略时默认开启（yaml bool 零值）。
 type ParallelOpts struct {
 	Disable bool `yaml:"disable"` // true = 关闭并行查询
+}
+
+// AsyncOpts 异步查询引擎。
+type AsyncOpts struct {
+	Enable            bool   `yaml:"enable"`
+	Workers           int    `yaml:"workers"`
+	MetricsIntervalSec int   `yaml:"metrics_interval_sec"` // WHEN 采样周期，最低 10
+	ResultTTLHours    int    `yaml:"result_ttl_hours"`
+	JobsDir           string `yaml:"jobs_dir"`
+	JobsDirMaxGB      int    `yaml:"jobs_dir_max_gb"`
+	DefaultTimeoutSec int    `yaml:"default_timeout_sec"`
+	CallbackMaxInlineKB int  `yaml:"callback_max_inline_kb"`
+	NodejsPath        string `yaml:"nodejs_path"`  // 后处理 runtime（空=禁用 nodejs）
+	PythonPath        string `yaml:"python_path"`  // 后处理 runtime（空=禁用 python）
+	ScriptDir         string `yaml:"script_dir"`   // SCRIPT 白名单目录（必须位于其下）
 }
 
 type Auth struct {
@@ -58,6 +73,7 @@ type Config struct {
 
 	Concurrency ConcurrencyOpts `yaml:"concurrency"`
 	ParallelQuery ParallelOpts `yaml:"parallel_query"`
+	AsyncQuery    AsyncOpts    `yaml:"async_query"`
 
 	Auth   Auth       `yaml:"auth"`
 	SQLite SQLiteOpts `yaml:"sqlite"`
@@ -78,6 +94,13 @@ func Default() *Config {
 		MemoryLimitMB:  0,
 		MaxConnections: 64,
 		ParallelQuery: ParallelOpts{},
+		AsyncQuery: AsyncOpts{
+			Workers:            2,
+			MetricsIntervalSec: 30,
+			ResultTTLHours:     24,
+			DefaultTimeoutSec:  1800,
+			CallbackMaxInlineKB: 64,
+		},
 		Concurrency: ConcurrencyOpts{
 			GlobalThreads:            0,
 			PerDBReadThreads:         0,
@@ -140,6 +163,21 @@ func (c *Config) Fill() {
 	c.Auth.User = "glacier"
 	if c.MaxConnections <= 0 {
 		c.MaxConnections = 64
+	}
+	if c.AsyncQuery.MetricsIntervalSec > 0 && c.AsyncQuery.MetricsIntervalSec < 10 {
+		c.AsyncQuery.MetricsIntervalSec = 10
+	}
+	if c.AsyncQuery.MetricsIntervalSec == 0 {
+		c.AsyncQuery.MetricsIntervalSec = 30
+	}
+	if c.AsyncQuery.ResultTTLHours <= 0 {
+		c.AsyncQuery.ResultTTLHours = 24
+	}
+	if c.AsyncQuery.DefaultTimeoutSec <= 0 {
+		c.AsyncQuery.DefaultTimeoutSec = 1800
+	}
+	if c.AsyncQuery.Workers <= 0 {
+		c.AsyncQuery.Workers = 2
 	}
 	if c.MemoryLimitMB < 0 {
 		c.MemoryLimitMB = 0

@@ -17,6 +17,7 @@ import (
 	sqlite3 "github.com/ncruces/go-sqlite3"
 
 	"glaciertdb/internal/admin"
+	"glaciertdb/internal/asyncq"
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/logx"
 	"glaciertdb/internal/meta"
@@ -36,6 +37,7 @@ type Handler struct {
 	autocommit bool // 客户端视角 autocommit（SET AUTOCOMMIT=0 后写语句惰性开隐式事务）
 
 	registry   *admin.Registry
+	async      *asyncq.Engine
 	adminMode  bool     // USE GlacierTDB 后进入管理面
 	lastQuery  string   // 最近一条语句（管理面展示）
 	txStartedAt time.Time // 当前事务开启时刻
@@ -47,7 +49,7 @@ var reSetAutocommit = regexp.MustCompile(`(?i)^SET\s+(?:@@?[A-Za-z_]*\.)?AUTOCOM
 var _ meta.Querier = (*sqlite.Session)(nil)
 
 // New 创建连接级 handler（连到 defaultDB）。
-func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *admin.Registry) (*Handler, error) {
+func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *admin.Registry, aq *asyncq.Engine) (*Handler, error) {
 	s, err := b.OpenSession(cfg.Auth.User, remote, defaultDB)
 	if err != nil {
 		return nil, err
@@ -61,6 +63,7 @@ func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *a
 		startedAt:  time.Now(),
 		autocommit: true,
 		registry:   reg,
+		async:      aq,
 	}, nil
 }
 
@@ -212,6 +215,11 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 	s := meta.StripComments(query)
 	// 剥掉「当前库名.表」前缀（客户端工具常发 backup.tbl / `backup`.`tbl`）
 	s = meta.RewriteDBPrefix(s, h.session.CurrentDB())
+
+	// 异步查询命令（SUBMIT/SHOW QUERY JOBS/FETCH/CANCEL/DROP，私有语法，先于探活）
+	if res, ok, err := h.handleAsyncQ(s); ok || err != nil {
+		return res, err
+	}
 
 	// USE GlacierTDB → 进入管理面；USE 普通库 → 退出管理面（在探活层之前拦截）
 	if am, ok := IsAdminUse(s); ok {

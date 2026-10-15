@@ -147,6 +147,7 @@ echo "---- test_admin.py ----"; python /tests/test_admin.py || rc=1
 echo "---- test_navicat.py ----"; python /tests/test_navicat.py || rc=1
 echo "---- test_mysql_compat.py ----"; python /tests/test_mysql_compat.py || rc=1
 echo "---- test_parallel.py ----"; python /tests/test_parallel.py || rc=1
+echo "---- test_async.py ----"; python /tests/test_async.py || rc=1
 exit $rc
 EOF
 )
@@ -155,7 +156,7 @@ PYRUN="${PYRUN//__PIP_PROXY__/$PIP_PROXY}"
 if docker run --rm --network "$NET" \
         -v "$TESTS_DIR":/tests:ro \
         -e http_proxy="$PIP_PROXY" -e https_proxy="$PIP_PROXY" \
-        "$PY_IMG" bash -c "$PYRUN" 2>&1 | tee "$LOG_DIR/python_tests.out"; then
+        --name pyclient-$(date +%s) --network-alias pyclient "$PY_IMG" bash -c "$PYRUN" 2>&1 | tee "$LOG_DIR/python_tests.out"; then
     record "python 三件套（pymysql/sqlalchemy/concurrent）: PASS"
 else
     record "python 三件套（pymysql/sqlalchemy/concurrent）: FAIL"

@@ -9,6 +9,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/server"
 
 	"glaciertdb/internal/admin"
+	"glaciertdb/internal/asyncq"
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/handler"
 	"glaciertdb/internal/logx"
@@ -21,6 +22,12 @@ func Run(cfg *config.Config, backend *sqlite.Backend) error {
 	meta.MapSQLError = handler.MapSQLiteErr
 
 	reg := admin.NewRegistry()
+	var aq *asyncq.Engine
+	if cfg.AsyncQuery.Enable {
+		aq = asyncq.NewEngine(backend, cfg)
+		logx.Infof("async query engine: jobs_dir=%s metrics_interval=%ds ttl=%dh", cfg.DBDir+"/jobs",
+			cfg.AsyncQuery.MetricsIntervalSec, cfg.AsyncQuery.ResultTTLHours)
+	}
 
 	srv := server.NewServer(cfg.ServerVersion, mysql.DEFAULT_COLLATION_ID, mysql.AUTH_NATIVE_PASSWORD, nil, nil)
 
@@ -37,11 +44,11 @@ func Run(cfg *config.Config, backend *sqlite.Backend) error {
 			logx.Errorf("accept: %v", err)
 			continue
 		}
-		go handleConn(srv, c, cfg, backend, reg)
+		go handleConn(srv, c, cfg, backend, reg, aq)
 	}
 }
 
-func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *sqlite.Backend, reg *admin.Registry) {
+func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *sqlite.Backend, reg *admin.Registry, aq *asyncq.Engine) {
 	remote := raw.RemoteAddr().String()
 	logx.Debugf("new connection from %s", remote)
 	// 初始握手包的 status 位默认 0（无 AUTOCOMMIT），会导致 pymysql/SQLAlchemy
@@ -55,7 +62,7 @@ func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 		return
 	}
 
-	h, err := handler.New(backend, cfg, remote, cfg.DefaultDB, reg)
+	h, err := handler.New(backend, cfg, remote, cfg.DefaultDB, reg, aq)
 	if err != nil {
 		logx.Errorf("open sqlite session for %s: %v", remote, err)
 		raw.Close()
