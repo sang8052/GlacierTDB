@@ -1,8 +1,7 @@
 data/
+dist/
 *.db
 *.db-wal
 *.db-shm
 *.log
-__pycache__/
-*.pyc
-dist/
+*.zip
