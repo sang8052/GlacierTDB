@@ -12,6 +12,7 @@
 | [docs/系统SQL.md](docs/系统SQL.md) | 系统 SQL 手册：管理面私有 SQL、系统库兼容层、SHOW 兜底 |
 | [docs/时序数据库.md](docs/时序数据库.md) | 时序冷库设计：存储模型、查询改写、rollup 与压缩路线 |
 | [docs/部署运维.md](docs/部署运维.md) | 部署（Docker/裸机/systemd）、升级、备份恢复、监控、故障排查 |
+| [docs/S3对象存储.md](docs/S3对象存储.md) | 后续路线：S3 协议兼容、base64/图片缩放/QoS 扩展、多机冗余 |
 | [CHANGELOG.md](CHANGELOG.md) | 更新日志 |
 
 **一句话**：把 SQLite 变成一台"MySQL 服务器"，让现有的 MySQL 客户端、ORM、运维脚本**不改一行配置**就能通过 TCP 远程读写 SQLite；配合时序冷库设计（见[「❄️ 时序冷库设计」](#️-时序冷库设计glaciertdb-路线)），为历史归档与冷数据提供 InfluxDB 级的查询体验。
@@ -322,7 +323,8 @@ GlacierTDB/
 │   ├── sqlite/           # 多库后端、每库写锁、读限流、事务
 │   └── logx/             # 轻量日志 + SQL 审计日志
 ├── schema/timeseries.sql # 时序冷库标准 schema
-├── docs/                 # 文档：配置说明.md / 系统SQL.md / 时序数据库.md / 部署运维.md
+├── docs/                 # 文档：配置说明 / 系统SQL / 时序数据库 / 部署运维 / S3对象存储
+├── CHANGELOG.md          # 更新日志
 ├── tests/                # 黑盒测试（CLI/PyMySQL/SQLAlchemy/并发/多库/时序/管理面）
 ├── Dockerfile
 ├── docker-compose.yml
