@@ -6,6 +6,12 @@
 
 > 🤖 **本项目全程由 GLM5.3 驱动。**
 
+| 📄 文档 | 说明 |
+| --- | --- |
+| [docs/config.md](docs/config.md) | 配置手册：全部配置项、默认值、热改关系、命令行参数、FAQ |
+| [docs/系统SQL.md](docs/系统SQL.md) | 系统 SQL 手册：管理面私有 SQL、系统库兼容层、SHOW 兜底 |
+| [docs/时序数据库.md](docs/时序数据库.md) | 时序冷库设计：存储模型、查询改写、rollup 与压缩路线 |
+
 **一句话**：把 SQLite 变成一台"MySQL 服务器"，让现有的 MySQL 客户端、ORM、运维脚本**不改一行配置**就能通过 TCP 远程读写 SQLite；配合时序冷库设计（见[「❄️ 时序冷库设计」](#️-时序冷库设计glaciertdb-路线)），为历史归档与冷数据提供 InfluxDB 级的查询体验。
 
 ---
@@ -103,55 +109,11 @@ PRAGMA cache_size   = -256;     -- 每连接 256 KB，控制内存
 
 ---
 
-## ❄️ 时序冷库设计（GlacierTDB 路线）
+## ❄️ 时序冷库能力
 
-热数据留在独立部署的 MySQL，GlacierTDB 专注**冷查询 / 历史归档**。时序查询优化围绕三件事：**时间有序存储、rollup 预聚合、冷压缩**——全部落在 SQLite 与网关改写层的能力圆内，不引入任何中间件。
+为冷查询 / 历史归档设计的时序能力：`series` 维表 + `points` (series_id, ts) 聚簇事实表标准 schema，配合网关改写层——`NOW() - INTERVAL n UNIT` / 日期字符串谓词自动整数化（命中聚簇索引）、`GROUP BY time(N)` InfluxDB 风格桶化、`FROM_UNIXTIME()` 转换；实测 8640 点回填、EXPLAIN 确认无全表扫。
 
-### 存储：series 维表 + 时间聚簇
-
-```sql
--- series 维表 = InfluxDB 的 series key（measurement + tagset）
-CREATE TABLE series (
-  id   INTEGER PRIMARY KEY,
-  meas TEXT NOT NULL,
-  tags TEXT NOT NULL,            -- JSON: {"host":"a1","region":"bj"}
-  UNIQUE(meas, tags)
-);
-
--- 事实表：(series_id, ts) 聚簇主键 = 时间有序存储，
--- 同一序列物理相邻、时间递增，范围扫描即顺序 IO
-CREATE TABLE points (
-  series_id INTEGER NOT NULL,
-  ts        INTEGER NOT NULL,    -- epoch ms
-  val       REAL,
-  PRIMARY KEY (series_id, ts)
-) WITHOUT ROWID;
-
--- 常用 tag 过滤 = 表达式索引（单个 tag 的"倒排"）
-CREATE INDEX idx_host ON series(json_extract(tags, '$.host'));
-```
-
-### 查询：改写层自动路由 rollup
-
-- 回填 ETL 同一遍落 raw + m1 / h1 / d1 多粒度汇总表——**导入时物化，无后台任务**；
-- 网关按请求的时间范围与桶宽，自动路由到**能满足精度的最粗汇总表**："全年按天"扫的是 d1 表几千行，不触达原始点——这正是 InfluxDB 长范围聚合快的本质；
-- 时间谓词整数化（`NOW() - INTERVAL 1 HOUR` → 时间戳范围），保证命中聚簇索引，杜绝全表扫；
-- `GROUP BY time(N)` 桶化、`first()/last()` 窗口函数改写，客户端保持纯 MySQL 写法；
-- 冷库查询模式可预测，Top-N 高频报表可在导入时直接物化成结果表。
-
-### 压缩与固化
-
-- 超出明细保留期的分区离线压缩为 Gorilla chunk（时间戳 delta-of-delta + 浮点 XOR，一行 = 一序列一天），整库 5–10 倍压缩，对齐 InfluxDB 存储水位；
-- 分区固化：`PRAGMA journal_mode=DELETE; VACUUM;` → 不可变文件；
-- 固化后可 `mode=ro` 只读打开：免 `-wal/-shm`、可挂单文件、可放只读介质，**N 个网关实例挂同一份文件即读扩展**——复制文件 + 起容器，无复制协议。
-
-### 与 InfluxDB 的差异（诚实声明）
-
-| 维度 | GlacierTDB |
-| --- | --- |
-| ✅ 对齐 | 时间范围查询延迟、长范围聚合（rollup）、tag 过滤、分区管理 |
-| ⚠️ 低于 | 原生压缩比（由 chunk 压缩补齐）、并行查询（单查询单核） |
-| ✅ 反超 | **标准 SQL 全量能力**（JOIN / 窗口函数 / CTE 随便用）、一个文件拷走就是备份、零中间件、信创无障碍 |
+**完整设计（存储模型 / 查询改写 / rollup 路线 / 压缩固化 / 与 InfluxDB 差异）见 [docs/时序数据库.md](docs/时序数据库.md)**，建表脚本见 [schema/timeseries.sql](schema/timeseries.sql)。
 
 ---
 
@@ -180,21 +142,6 @@ USE backup;                               -- 退出管理面，恢复正常 SQL
 > 内存与连接保护：`memory_limit_mb`（Go 运行时软内存上限）、`max_connections`（最大并发连接，超限拒绝）。
 >
 > **SQL 审计日志**：`log.sql_log_file` 指定路径即开启（如 `/data/sql.log`），每条语句一行 JSON——`ts / conn / user / remote / db / admin / cost_ms / status(OK|ERROR) / rows / affected / insert_id / sql / error`，便于调试与排障；100MB 自动轮转为 `.old`。
-
----
-
-## ❄️ 时序查询能力
-
-标准 schema 见 `schema/timeseries.sql`（series 维表 + points `(series_id, ts)` 聚簇事实表，`ts` 为 epoch 毫秒）。网关改写层自动完成：
-
-| MySQL 写法 | 自动改写为 | 说明 |
-| --- | --- | --- |
-| `ts >= NOW() - INTERVAL 1 HOUR` | `ts >= (strftime('%s','now')*1000-3600000)` | 时间谓词整数化，命中聚簇索引 |
-| `ts >= '2026-10-01 00:00:00'` | `ts >= strftime('%s','2026-10-01 00:00:00')*1000` | 日期字符串整数化（UTC），避免 INTEGER 列与 TEXT 比较静默失真 |
-| `GROUP BY time(3600000)` | `GROUP BY (ts/3600000*3600000)` | InfluxDB 风格整数分桶 |
-| `SELECT FROM_UNIXTIME(ts/1000)` | `datetime(ts/1000,'unixepoch')` | 秒级时间戳转可读时间 |
-
-实测（时序 11 项测试全过）：8640 点回填，INTERVAL 改写与数字比较等价；小时桶满桶 60 点；`EXPLAIN QUERY PLAN` 命中 `(series_id, ts)` 聚簇主键与 `ts` 二级索引，无全表扫。
 
 ---
 
@@ -373,6 +320,7 @@ GlacierTDB/
 │   ├── sqlite/           # 多库后端、每库写锁、读限流、事务
 │   └── logx/             # 轻量日志 + SQL 审计日志
 ├── schema/timeseries.sql # 时序冷库标准 schema
+├── docs/                 # 文档：config.md / 系统SQL.md / 时序数据库.md
 ├── tests/                # 黑盒测试（CLI/PyMySQL/SQLAlchemy/并发/多库/时序/管理面）
 ├── Dockerfile
 ├── docker-compose.yml
