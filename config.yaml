@@ -32,6 +32,16 @@ concurrency:
     # backup: 8
     # logs: 2
 
+# 异步查询引擎（SUBMIT QUERY / 回调 / 定时窗口）详见 docs/系统SQL.md 与 FEATURE.md
+async_query:
+  enable: true
+  workers: 2
+  metrics_interval_sec: 30   # WHEN 资源采样周期（最低 10）
+  result_ttl_hours: 24
+  default_timeout_sec: 1800
+  # nodejs_path: ""          # SCRIPT 后处理 runtime（空=禁用；沙箱边界见 FEATURE.md）
+  # python_path: ""
+
 log:
   level: info              # debug | info | warn | error
   slow_query_ms: 200       # 慢查询阈值
