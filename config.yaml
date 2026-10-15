@@ -1,0 +1,39 @@
+# GlacierTDB 配置
+# 多库模型：一个库 = db_dir 目录下一个 <库名>.db 文件
+# 所有项均可省略，省略时使用内置默认值。
+
+listen: 0.0.0.0:3309
+db_dir: /data          # 库目录（必须挂载目录，WAL 需可写）
+default_db: backup     # 连接未指定库时的默认库（不存在则自动创建）
+server_version: "8.99.999"   # 对外呈现的 MySQL 版本号
+
+# 用户名固定为 glacier（管理面约定），此处仅配置密码；
+# 管理面执行 SET PASSWORD='新密码' 后热生效并持久化到 <db_dir>/glacier.json
+memory_limit_mb: 0     # Go 运行时软内存上限（0 = 不限制）
+max_connections: 64    # 最大并发客户端连接数（超限直接断开）
+
+auth:
+  user: glacier            # 固定值，配置其他名字会被忽略
+  password: "changeme"     # mysql_native_password；管理面 SET PASSWORD 热改后以此文件为重启基线
+  readonly_users: []       # 命中则拒绝一切写操作（返回 1290）
+
+sqlite:
+  synchronous: NORMAL      # OFF | NORMAL | FULL | EXTRA（持久化强度）
+  busy_timeout_ms: 5000
+  cache_size_kb: 256       # 每连接页缓存
+  max_result_rows: 1000000 # 单查询返回行数上限（内存保护）
+
+# 并发模型：读并发多线程（可按库限流）；写单库单线程互斥（多库写入并行）。
+# 均可被管理面热改（USE GlacierTDB; SET GLOBAL_THREADS=32; 重启失效回到此处值）
+concurrency:
+  global_threads: 0              # 全局并发执行上限（读写共享，0=不限）
+  per_db_read_threads: 0         # 全局默认：单库读并发上限（0=不限）
+  per_db_read_threads_override:  # 按库覆盖（可选）
+    # backup: 8
+    # logs: 2
+
+log:
+  level: info              # debug | info | warn | error
+  slow_query_ms: 200       # 慢查询阈值
+  sql_log_file: ""         # SQL 审计日志（JSON 行：语句/OK|ERROR/错误消息/耗时/行数/连接），空=关闭
+                           # 例：/data/sql.log（100MB 自动轮转为 .old）

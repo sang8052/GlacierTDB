@@ -1,0 +1,12 @@
+services:
+  proxy:
+    build: .
+    image: glaciertdb:latest
+    container_name: glaciertdb
+    ports:
+      - "3309:3309"
+    volumes:
+      # 必须挂「目录」而非单个文件 —— WAL 模式需要同目录创建 -wal/-shm
+      - ./data:/data
+    command: ["-config", "/app/config.yaml", "-db-dir", "/data"]
+    restart: unless-stopped
