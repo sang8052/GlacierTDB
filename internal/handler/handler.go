@@ -234,6 +234,11 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 		h.mu.Unlock()
 	}
 
+	// VACUUM DATABASE <db>（写锁警示见 handleVacuumDB）
+	if res, ok, err := h.handleVacuumDB(s); ok || err != nil {
+		return res, err
+	}
+
 	// KILL <id>（全局生效）
 	if handled, err := h.handleKill(s); handled || err != nil {
 		if err != nil {

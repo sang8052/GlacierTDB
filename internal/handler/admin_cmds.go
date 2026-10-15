@@ -36,6 +36,27 @@ func IsAdminUse(q string) (adminMode bool, ok bool) {
 	return false, false
 }
 
+var reVacuumDB = regexp.MustCompile("(?i)^VACUUM\\s+DATABASE\\s+`?([A-Za-z0-9_-]+)`?\\s*$")
+
+// handleVacuumDB 管理面 VACUUM —— ⚠️ 执行期间该库全部写入被阻塞（写锁长持）。
+func (h *Handler) handleVacuumDB(q string) (*mysql.Result, bool, error) {
+	m := reVacuumDB.FindStringSubmatch(q)
+	if m == nil {
+		return nil, false, nil
+	}
+	if h.cfg.Maintenance.NoHotVacuum {
+		return nil, true, mysql.NewError(1149,
+			"hot VACUUM disabled (maintenance.no_hot_vacuum); 请停止服务后使用 CLI: glaciertdb -vacuum -db-dir <dir>")
+	}
+	cost, sizeBefore, sizeAfter, err := h.backend.VacuumDB(m[1])
+	if err != nil {
+		return nil, true, MapSQLiteErr(err)
+	}
+	res, err2 := meta.SimpleRS([]string{"database", "cost_ms", "size_before", "size_after", "note"},
+		[][]any{{m[1], cost.Milliseconds(), sizeBefore, sizeAfter, "执行期间该库所有写入被阻塞（写锁长持至 VACUUM 完成）；wasm 落盘略滞后，size_after 仅供参考"}})
+	return res, true, err2
+}
+
 // handleKill 处理 KILL <id>（全局生效，不限管理面）。
 func (h *Handler) handleKill(q string) (handled bool, err error) {
 	m := reKillConn.FindStringSubmatch(q)

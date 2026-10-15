@@ -18,6 +18,7 @@ import (
 	"time"
 
 	_ "github.com/ncruces/go-sqlite3/driver"
+	_ "github.com/ncruces/go-sqlite3/vfs/adiantum"
 
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/logx"
@@ -50,6 +51,9 @@ type Backend struct {
 
 	authMu       sync.RWMutex
 	authPassword string // 当前生效密码（可被管理面热改）
+
+	encrypt    bool
+	passphrase string
 }
 
 // Session 是一个客户端连接专属的 SQLite 会话（独占一个物理连接，绑定当前库）。
@@ -91,6 +95,16 @@ func NewBackend(cfg *config.Config) (*Backend, error) {
 	q.Add("_pragma", fmt.Sprintf("synchronous(%d)", cfg.SQLite.SynchronousLevel()))
 	q.Add("_pragma", fmt.Sprintf("cache_size(-%d)", cfg.SQLite.CacheSizeKB))
 	b.dsnOpts = q.Encode()
+	b.encrypt = cfg.Security.Encrypt
+	b.passphrase = cfg.Security.Passphrase
+	if b.encrypt && b.passphrase == "" {
+		return nil, fmt.Errorf("security.encrypt 开启时必须配置 security.passphrase")
+	}
+	if b.encrypt {
+		if bad, err := b.detectPlaintextDBs(); err == nil && len(bad) > 0 {
+			return nil, fmt.Errorf("目录中存在未加密的库 %v；加密模式要求空目录或已加密库（新库自动加密，存量迁移工具见 FEATURE.md）", bad)
+		}
+	}
 
 	st, err := os.Stat(b.dir)
 	if err != nil || !st.IsDir() {
@@ -565,5 +579,72 @@ func (b *Backend) dsnFor(file string) string {
 	//   H:/x.db     → file:H:/x.db        （Windows API 原生接受正斜杠盘符路径）
 	// 带三斜杠的 file:///H:/x 在 wazero VFS 下会被解析成 POSIX 路径 "/H:/..."，
 	// 报 CreateFile /H:: 语法错误，故禁用 authority 形式。
+	if b.encrypt {
+		// textkey 必须先于其它 pragma（连接后立即生效）
+		kv := url.Values{}
+		kv.Add("vfs", "adiantum")
+		kv.Add("_pragma", fmt.Sprintf("textkey('%s')", b.passphrase))
+		return "file:" + sb.String() + "?" + kv.Encode() + "&" + b.dsnOpts
+	}
 	return "file:" + sb.String() + "?" + b.dsnOpts
 }
+
+// detectPlaintextDBs 找出目录中的明文库（文件头 == "SQLite format 3\x00"）。
+func (b *Backend) detectPlaintextDBs() ([]string, error) {
+	entries, err := os.ReadDir(b.dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".db") {
+			continue
+		}
+		f, err := os.Open(filepath.Join(b.dir, name))
+		if err != nil {
+			continue
+		}
+		hdr := make([]byte, 16)
+		n, _ := f.Read(hdr)
+		f.Close()
+		if n == 16 && string(hdr) == "SQLite format 3\x00" {
+			out = append(out, name)
+		}
+	}
+	return out, nil
+}
+
+// VacuumDB 对指定库执行 VACUUM：获取该库写锁并长持至完成（执行期间该库所有写入阻塞）。
+// 返回（耗时, 释放字节数）。
+func (b *Backend) VacuumDB(db string) (time.Duration, int64, int64, error) {
+	if !reDBName.MatchString(db) {
+		return 0, 0, 0, fmt.Errorf("invalid database name %q", db)
+	}
+	file := b.fileFor(db)
+	s, err := b.OpenSession("vacuum", "cli", db)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	s.AcquireWrite()
+	start := time.Now()
+	sizeBefore := fileSize(file)
+	_, _, err = s.Exec("VACUUM")
+	s.ReleaseWrite()
+	s.Close() // 连接关闭时 VACUUM 的文件替换/落盘才最终完成（wasm VFS 行为）
+	if err != nil {
+		return time.Since(start), 0, 0, err
+	}
+	return time.Since(start), sizeBefore, fileSize(file), nil
+}
+
+func fileSize(p string) int64 {
+	st, err := os.Stat(p)
+	if err != nil {
+		return 0
+	}
+	return st.Size()
+}
+
+// CloseAll 释放后端（CLI 模式用）。
+func (b *Backend) CloseAll() {}

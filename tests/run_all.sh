@@ -148,6 +148,7 @@ echo "---- test_navicat.py ----"; python /tests/test_navicat.py || rc=1
 echo "---- test_mysql_compat.py ----"; python /tests/test_mysql_compat.py || rc=1
 echo "---- test_parallel.py ----"; python /tests/test_parallel.py || rc=1
 echo "---- test_async.py ----"; python /tests/test_async.py || rc=1
+echo "---- test_v107.py ----"; python /tests/test_v107.py || rc=1
 exit $rc
 EOF
 )

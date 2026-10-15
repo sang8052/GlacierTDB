@@ -70,6 +70,9 @@ type Job struct {
 	Script      string     `json:"script,omitempty"`
 	ScriptOut   string     `json:"script_output,omitempty"`
 	WhenExpr    string     `json:"when,omitempty"` // WHEN 资源门槛表达式
+	EverySec    int        `json:"every_sec,omitempty"`    // 周期秒（0=一次性）
+	EveryAt     string     `json:"every_at,omitempty"`     // EVERY DAY AT 'HH:MM' 的每日时刻
+	RecurGroup  string     `json:"recur_group,omitempty"`  // 周期链 ID；CANCEL 取消整链
 	CancelCh    chan struct{} `json:"-"`
 }
 
@@ -83,6 +86,8 @@ type Engine struct {
 	client  *http.Client
 	jobsDir string
 	samp    *Sampler // WHEN 资源采样器
+	cgrpMu  sync.Mutex
+	cgrp    map[string]bool // 已取消的周期链
 }
 
 // NewEngine 创建引擎并启动调度循环。
@@ -94,6 +99,7 @@ func NewEngine(b *sqlite.Backend, cfg *config.Config) *Engine {
 		client:  &http.Client{Timeout: 10 * time.Second},
 		jobsDir: cfg.AsyncQuery.JobsDir,
 		samp:    NewSampler(cfg.AsyncQuery.MetricsIntervalSec),
+		cgrp:    make(map[string]bool),
 	}
 	if e.jobsDir == "" {
 		e.jobsDir = filepath.Join(cfg.DBDir, "jobs")
@@ -115,6 +121,11 @@ func (e *Engine) Submit(j *Job) string {
 	j.State = StatePending
 	j.SubmitTS = time.Now()
 	j.CancelCh = make(chan struct{})
+	if j.EverySec > 0 || j.EveryAt != "" {
+		if j.RecurGroup == "" {
+			j.RecurGroup = fmt.Sprintf("g_%s_%04d", time.Now().Format("20060102_150405"), time.Now().UnixNano()%10000)
+		}
+	}
 	ttl := time.Duration(e.cfg.AsyncQuery.ResultRetainSec) * time.Second
 	if j.RetainSec > 0 {
 		ttl = time.Duration(j.RetainSec) * time.Second
@@ -274,6 +285,35 @@ func (e *Engine) finish(j *Job, st State, errMsg string) {
 	j.ElapsedMs = j.EndTS.Sub(j.StartTS).Milliseconds()
 	j.Error = errMsg
 	e.mu.Unlock()
+	// 周期任务：未取消 → 自动排下一次（定时任务升级版）
+	if j.RecurGroup != "" && j.State != StateCancelled {
+		e.cgrpMu.Lock()
+		cancelled := e.cgrp[j.RecurGroup]
+		e.cgrpMu.Unlock()
+		if !cancelled {
+			next := *j
+			next.ID = ""
+			next.State = StatePending
+			next.Rows, next.Bytes, next.Error = 0, 0, ""
+			next.SubmitTS = time.Now()
+			next.CancelCh = make(chan struct{})
+			if j.EveryAt != "" {
+				var h, m int
+				fmt.Sscanf(j.EveryAt, "%d:%d", &h, &m)
+				now := time.Now()
+				t := time.Date(now.Year(), now.Month(), now.Day(), h, m, 0, 0, now.Location())
+				if !t.After(now) {
+					t = t.Add(24 * time.Hour)
+				}
+				next.At = &t
+				next.Window = [2]string{}
+			} else {
+				t := time.Now().Add(time.Duration(j.EverySec) * time.Second)
+				next.At = &t
+			}
+			e.SubmitClone(&next)
+		}
+	}
 	if j.CallbackURL != "" {
 		payload := map[string]any{
 			"job_id":     j.ID,
@@ -406,10 +446,25 @@ func (e *Engine) Cancel(id string) error {
 	if !ok {
 		return fmt.Errorf("unknown job '%s'", id)
 	}
+	if j.RecurGroup != "" {
+		// 周期链：即使链头已 DONE，CANCEL 也表示停止整条链
+		e.cgrpMu.Lock()
+		e.cgrp[j.RecurGroup] = true
+		e.cgrpMu.Unlock()
+		if j.State == StatePending || j.State == StateRunning {
+			close(j.CancelCh)
+		}
+		return nil
+	}
 	if j.State == StateDone || j.State == StateError || j.State == StateExpired || j.State == StateCancelled {
 		return fmt.Errorf("job '%s' already finished (%s)", id, j.State)
 	}
 	close(j.CancelCh) // runWhenDue/execute 感知
+	if j.RecurGroup != "" {
+		e.cgrpMu.Lock()
+		e.cgrp[j.RecurGroup] = true
+		e.cgrpMu.Unlock()
+	}
 	return nil
 }
 
@@ -453,4 +508,11 @@ func parseHM(s string) (int, int, bool) {
 		return h, m, true
 	}
 	return 0, 0, false
+}
+
+// SubmitClone 内部克隆提交（周期链重排，保留 RecurGroup）。
+func (e *Engine) SubmitClone(j *Job) string {
+	id := e.Submit(j)
+	_ = id
+	return id
 }

@@ -6,6 +6,11 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"time"
+	"path/filepath"
+	"strings"
+
+	"glaciertdb/internal/dirlock"
 	"runtime"
 	"runtime/debug"
 	"syscall"
@@ -20,6 +25,9 @@ func main() {
 	var (
 		showVer  = flag.Bool("v", false, "print GlacierTDB version and exit")
 		showVer2 = flag.Bool("version", false, "print GlacierTDB version and exit")
+		forceUnlock = flag.Bool("force-unlock", false, "db 目录锁被异常占用时强制解锁启动（拒绝抢活进程的锁）")
+		vacuumMode  = flag.Bool("vacuum", false, "CLI 真空模式：VACUUM 库目录（服务必须停止；与目录锁互斥）")
+		vacuumDB    = flag.String("vacuum-db", "", "仅 VACUUM 指定库（默认目录内全部库）")
 		configPath = flag.String("config", "/app/config.yaml", "path to config.yaml")
 		dbDir      = flag.String("db-dir", "", "override sqlite db directory (one db = one .db file)")
 		dbPath     = flag.String("db", "", "override sqlite db file path (legacy; dir=dirname, default db=basename)")
@@ -68,6 +76,37 @@ func main() {
 		config.GlacierVersion, cfg.ServerVersion, cfg.DBDir, cfg.DefaultDB, cfg.SQLite.Synchronous,
 		cfg.SQLite.BusyTimeoutMs, cfg.SQLite.CacheSizeKB)
 
+	// db 目录唯一锁：服务与 CLI（-vacuum）互斥，同一目录仅一个进程
+	lock, lerr := dirlock.Acquire(cfg.DBDir, *forceUnlock)
+	if lerr != nil {
+		logx.Errorf("%v", lerr)
+		os.Exit(1)
+	}
+	defer lock.Release()
+	logx.Infof("db dir lock acquired: %s", cfg.DBDir)
+
+	if *vacuumMode {
+		// CLI 真空模式：VACUUM 释放空间；执行时服务必然未运行（目录锁保证）
+		var dbNames []string
+		if *vacuumDB != "" {
+			dbNames = []string{*vacuumDB}
+		} else if gs, _ := filepath.Glob(filepath.Join(cfg.DBDir, "*.db")); len(gs) > 0 {
+			for _, g := range gs {
+				dbNames = append(dbNames, strings.TrimSuffix(filepath.Base(g), ".db"))
+			}
+		}
+		for _, db := range dbNames {
+			cost, sizeBefore, sizeAfter, err := backendVacuum(cfg, db)
+			if err != nil {
+				logx.Errorf("VACUUM %s 失败: %v", db, err)
+				os.Exit(1)
+			}
+			logx.Infof("VACUUM %s 完成：耗时 %s（%d → %d 字节，执行期间该库写入被阻塞）", db, cost, sizeBefore, sizeAfter)
+		}
+		logx.Infof("vacuum 完成，退出")
+		return
+	}
+
 	backend, err := sqlite.NewBackend(cfg)
 	if err != nil {
 		logx.Errorf("init sqlite backend: %v\nhint: db 所在目录必须可写（WAL 需创建 -wal/-shm 文件），且应挂载目录而非单个 db 文件", err)
@@ -86,4 +125,14 @@ func main() {
 		logx.Errorf("listen %s: %v", cfg.Listen, err)
 		os.Exit(1)
 	}
+}
+
+// backendVacuum CLI 真空（独立于服务进程的轻量后端：仅做 VACUUM）。
+func backendVacuum(cfg *config.Config, db string) (time.Duration, int64, int64, error) {
+	b, err := sqlite.NewBackend(cfg)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer b.CloseAll()
+	return b.VacuumDB(db)
 }

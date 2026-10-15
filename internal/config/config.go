@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.0.6.alpha"
+const GlacierVersion = "1.0.7.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -40,6 +40,17 @@ type AsyncOpts struct {
 	NodejsPath        string `yaml:"nodejs_path"`  // 后处理 runtime（空=禁用 nodejs）
 	PythonPath        string `yaml:"python_path"`  // 后处理 runtime（空=禁用 python）
 	ScriptDir         string `yaml:"script_dir"`   // SCRIPT 白名单目录（必须位于其下）
+}
+
+// MaintOpts 维护策略：VACUUM（执行期间锁该库全部写入）。
+type MaintOpts struct {
+	NoHotVacuum bool `yaml:"no_hot_vacuum"` // true = 禁止运行中 VACUUM（仅 CLI，服务停止时）
+}
+
+// SecOpts 静态加密（adiantum VFS，4KiB 块加密，防外部程序直接读底层文件）。
+type SecOpts struct {
+	Encrypt    bool   `yaml:"encrypt"`    // 首次启用要求空目录或已有加密库
+	Passphrase string `yaml:"passphrase"` // 启用时必填
 }
 
 type Auth struct {
@@ -75,6 +86,8 @@ type Config struct {
 	Concurrency ConcurrencyOpts `yaml:"concurrency"`
 	ParallelQuery ParallelOpts `yaml:"parallel_query"`
 	AsyncQuery    AsyncOpts    `yaml:"async_query"`
+	Maintenance   MaintOpts    `yaml:"maintenance"`
+	Security      SecOpts      `yaml:"security"`
 
 	Auth   Auth       `yaml:"auth"`
 	SQLite SQLiteOpts `yaml:"sqlite"`
@@ -95,6 +108,7 @@ func Default() *Config {
 		MemoryLimitMB:  0,
 		MaxConnections: 64,
 		ParallelQuery: ParallelOpts{},
+		Maintenance:   MaintOpts{},
 		AsyncQuery: AsyncOpts{
 			Workers:            2,
 			MetricsIntervalSec: 30,

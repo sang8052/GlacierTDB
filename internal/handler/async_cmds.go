@@ -26,7 +26,7 @@ var (
 )
 
 // parseSubmitOpts 解析 SUBMIT 之后的选项段。
-func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time.Time, win [2]string, when, part, script, scriptOut string, retainSec int, err error) {
+func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time.Time, win [2]string, when, part, script, scriptOut string, retainSec, everySec int, everyAt string, err error) {
 	s := strings.TrimSpace(rest)
 	// WHEN 到 PARTITION/SCRIPT 前的整段
 	var whenRaw string
@@ -104,6 +104,43 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 		case "TOPIC", "QUEUE":
 			cbOpt = next()
 			i++
+		case "EVERY":
+			v := strings.ToUpper(next())
+			i++
+			switch v {
+			case "DAY":
+				everySec = 86400
+				// EVERY DAY AT 'HH:MM'
+				if i+1 < len(toks) && strings.ToUpper(toks[i+1]) == "AT" {
+					everyAt = strings.Trim(toks[i+2], "'")
+					i += 2
+				}
+			case "HOUR":
+				everySec = 3600
+			case "MINUTE":
+				everySec = 60
+			case "SECOND":
+				everySec = 1
+			default:
+				var n int
+				if _, e := fmt.Sscanf(v, "%d", &n); e != nil || n <= 0 {
+					err = fmt.Errorf("invalid EVERY %q (expect DAY [AT 'HH:MM'] / HOUR / MINUTE / SECOND / n SECONDS|MINUTES|HOURS)", v)
+					return
+				}
+				u := strings.ToUpper(next())
+				i++
+				switch u {
+				case "SECOND", "SECONDS":
+					everySec = n
+				case "MINUTE", "MINUTES":
+					everySec = n * 60
+				case "HOUR", "HOURS":
+					everySec = n * 3600
+				default:
+					err = fmt.Errorf("invalid EVERY unit %q", u)
+					return
+				}
+			}
 		case "RETAIN":
 			d := next()
 			var n int
@@ -179,7 +216,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			return nil, true, roErr()
 		}
 		sqlText := strings.ReplaceAll(m[1], "''", "'")
-		cb, cbOpt, sign, timeout, at, win, when, part, script, scriptOut, retainSec, perr := parseSubmitOpts(m[2])
+		cb, cbOpt, sign, timeout, at, win, when, part, script, scriptOut, retainSec, everySec, everyAt, perr := parseSubmitOpts(m[2])
 		if perr != nil {
 			return nil, true, mysql.NewError(1064, perr.Error())
 		}
@@ -196,6 +233,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			SQL: sqlText, CallbackURL: cb, SignSecret: sign, TimeoutSec: timeout,
 			At: at, Window: win, WhenExpr: when, PartRows: partRows,
 			Script: script, ScriptOut: scriptOut, RetainSec: retainSec,
+			EverySec: everySec, EveryAt: everyAt,
 		}
 		// 回调通道解析：http(s):// | tcp://host:port | amqp://… | kafka://broker
 		lcb := strings.ToLower(cb)
@@ -291,7 +329,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 }
 
 var asyncJobCols = []string{"job_id", "state", "sql", "submit_ts", "elapsed_ms", "rows", "bytes",
-	"error", "callback_url", "at", "window", "when"}
+	"error", "callback_url", "at", "window", "when", "every_sec", "recur_group"}
 
 func jobsRows(jobs []asyncq.Job) [][]any {
 	var out [][]any
@@ -299,13 +337,15 @@ func jobsRows(jobs []asyncq.Job) [][]any {
 		at, win := "", ""
 		if j.At != nil {
 			at = j.At.Format("2006-01-02 15:04:05")
+		} else if j.EveryAt != "" {
+			at = "daily " + j.EveryAt
 		}
 		if j.Window[0] != "" {
 			win = j.Window[0] + "-" + j.Window[1]
 		}
 		out = append(out, []any{j.ID, string(j.State), j.SQL,
 			j.SubmitTS.Format("2006-01-02 15:04:05"), j.ElapsedMs, j.Rows, j.Bytes,
-			j.Error, j.CallbackURL, at, win, j.WhenExpr})
+			j.Error, j.CallbackURL, at, win, j.WhenExpr, j.EverySec, j.RecurGroup})
 	}
 	return out
 }
