@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.0.5.alpha"
+const GlacierVersion = "1.0.6.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -31,7 +31,8 @@ type AsyncOpts struct {
 	Enable            bool   `yaml:"enable"`
 	Workers           int    `yaml:"workers"`
 	MetricsIntervalSec int   `yaml:"metrics_interval_sec"` // WHEN 采样周期，最低 10
-	ResultTTLHours    int    `yaml:"result_ttl_hours"`
+	ResultTTLHours    int    `yaml:"result_ttl_hours"`   // 兼容字段（小时）
+	ResultRetainSec   int    `yaml:"result_retain_sec"`   // 结果保留秒数，默认 60，到期自动删除
 	JobsDir           string `yaml:"jobs_dir"`
 	JobsDirMaxGB      int    `yaml:"jobs_dir_max_gb"`
 	DefaultTimeoutSec int    `yaml:"default_timeout_sec"`
@@ -172,6 +173,9 @@ func (c *Config) Fill() {
 	}
 	if c.AsyncQuery.ResultTTLHours <= 0 {
 		c.AsyncQuery.ResultTTLHours = 24
+	}
+	if c.AsyncQuery.ResultRetainSec <= 0 {
+		c.AsyncQuery.ResultRetainSec = 60
 	}
 	if c.AsyncQuery.DefaultTimeoutSec <= 0 {
 		c.AsyncQuery.DefaultTimeoutSec = 1800

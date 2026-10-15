@@ -26,7 +26,7 @@ var (
 )
 
 // parseSubmitOpts 解析 SUBMIT 之后的选项段。
-func parseSubmitOpts(rest string) (cb, sign string, timeout int, at *time.Time, win [2]string, when, part, script, scriptOut string, err error) {
+func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time.Time, win [2]string, when, part, script, scriptOut string, retainSec int, err error) {
 	s := strings.TrimSpace(rest)
 	// WHEN 到 PARTITION/SCRIPT 前的整段
 	var whenRaw string
@@ -52,7 +52,19 @@ func parseSubmitOpts(rest string) (cb, sign string, timeout int, at *time.Time, 
 		}
 		switch up {
 		case "CALLBACK":
-			cb = strings.Trim(next(), "'")
+			v := strings.Trim(next(), "'")
+			cb = v
+			switch {
+			case strings.HasPrefix(strings.ToLower(v), "tcp:"):
+				cb = v
+			case strings.HasPrefix(strings.ToLower(v), "tcp://"):
+				cb = v
+			}
+			// TCP 形式：CALLBACK TCP host:port
+			if strings.ToUpper(v) == "TCP" {
+				cb = "tcp://" + next()
+				i++
+			}
 			i++
 		case "SIGN":
 			sign = strings.Trim(next(), "'")
@@ -89,6 +101,34 @@ func parseSubmitOpts(rest string) (cb, sign string, timeout int, at *time.Time, 
 			i++
 		case "BY", "ROWS", "BYTES":
 			// 已由 PARTITION 消费
+		case "TOPIC", "QUEUE":
+			cbOpt = next()
+			i++
+		case "RETAIN":
+			d := next()
+			var n int
+			if _, e := fmt.Sscanf(d, "%d", &n); e != nil || n <= 0 {
+				err = fmt.Errorf("invalid RETAIN %q (expect e.g. 30 / 30s / 5m / 2h)", d)
+				return
+			}
+			unit := strings.ToLower(strings.TrimLeft(fmt.Sprintf("%d", n), "0123456789"))
+			dl := strings.ToLower(d)
+			unit = strings.TrimSpace(dl[len(fmt.Sprintf("%d", n)):])
+			if unit == "" {
+				unit = "s" // 裸数字默认秒
+			}
+			switch unit {
+			case "s", "sec", "secs", "second", "seconds":
+			case "m", "min", "mins", "minute", "minutes":
+				n *= 60
+			case "h", "hour", "hours":
+				n *= 3600
+			default:
+				err = fmt.Errorf("invalid RETAIN unit %q (s/m/h)", unit)
+				return
+			}
+			retainSec = n
+			i++
 		case "SCRIPT":
 			script = strings.Trim(next(), "'")
 			i++
@@ -139,7 +179,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			return nil, true, roErr()
 		}
 		sqlText := strings.ReplaceAll(m[1], "''", "'")
-		cb, sign, timeout, at, win, when, part, script, scriptOut, perr := parseSubmitOpts(m[2])
+		cb, cbOpt, sign, timeout, at, win, when, part, script, scriptOut, retainSec, perr := parseSubmitOpts(m[2])
 		if perr != nil {
 			return nil, true, mysql.NewError(1064, perr.Error())
 		}
@@ -155,8 +195,24 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		job := &asyncq.Job{
 			SQL: sqlText, CallbackURL: cb, SignSecret: sign, TimeoutSec: timeout,
 			At: at, Window: win, WhenExpr: when, PartRows: partRows,
-			Script: script, ScriptOut: scriptOut,
+			Script: script, ScriptOut: scriptOut, RetainSec: retainSec,
 		}
+		// 回调通道解析：http(s):// | tcp://host:port | amqp://… | kafka://broker
+		lcb := strings.ToLower(cb)
+		switch {
+		case cb == "":
+		case strings.HasPrefix(lcb, "tcp://") || strings.HasPrefix(lcb, "tcp:"):
+			job.CallbackProto = "tcp"
+			job.CallbackURL = strings.TrimPrefix(strings.TrimPrefix(cb, "tcp://"), "tcp:")
+		case strings.HasPrefix(lcb, "amqp://"):
+			job.CallbackProto = "amqp"
+		case strings.HasPrefix(lcb, "kafka://"):
+			job.CallbackProto = "kafka"
+			job.CallbackURL = strings.TrimPrefix(cb, "kafka://")
+		default:
+			job.CallbackProto = "http"
+		}
+		job.CallbackOpt = cbOpt
 		id := h.async.Submit(job)
 		res, err := meta.SimpleRS([]string{"job_id", "state"},
 			[][]any{{id, string(asyncq.StatePending)}})

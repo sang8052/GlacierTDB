@@ -50,7 +50,9 @@ type Job struct {
 	ID          string     `json:"job_id"`
 	SQL         string     `json:"sql"`
 	State       State      `json:"state"`
-	CallbackURL string     `json:"callback_url,omitempty"`
+	CallbackURL string     `json:"callback_url,omitempty"` // http(s) URL / tcp:host:port / amqp:amqp://… / kafka:broker
+	CallbackProto string  `json:"callback_proto,omitempty"` // http|tcp|amqp|kafka
+	CallbackOpt  string    `json:"callback_opt,omitempty"`  // kafka topic / amqp routing key
 	SignSecret  string     `json:"-"`
 	At          *time.Time `json:"at,omitempty"`     // AT 指定时刻
 	Window      [2]string  `json:"window,omitempty"` // WINDOW 每日 ["17:00","20:00"]
@@ -64,6 +66,7 @@ type Job struct {
 	Error       string     `json:"error,omitempty"`
 	ExpiresTS   time.Time  `json:"expires_ts"`
 	PartRows    int64      `json:"partition_rows,omitempty"` // 分片回调大小
+	RetainSec   int        `json:"retain_sec,omitempty"`     // 结果保留秒数（覆盖全局默认 60s）
 	Script      string     `json:"script,omitempty"`
 	ScriptOut   string     `json:"script_output,omitempty"`
 	WhenExpr    string     `json:"when,omitempty"` // WHEN 资源门槛表达式
@@ -112,9 +115,12 @@ func (e *Engine) Submit(j *Job) string {
 	j.State = StatePending
 	j.SubmitTS = time.Now()
 	j.CancelCh = make(chan struct{})
-	ttl := time.Duration(e.cfg.AsyncQuery.ResultTTLHours) * time.Hour
+	ttl := time.Duration(e.cfg.AsyncQuery.ResultRetainSec) * time.Second
+	if j.RetainSec > 0 {
+		ttl = time.Duration(j.RetainSec) * time.Second
+	}
 	if ttl <= 0 {
-		ttl = 24 * time.Hour
+		ttl = 60 * time.Second // 默认 60s，到期自动删除
 	}
 	j.ExpiresTS = time.Now().Add(ttl)
 
@@ -134,7 +140,7 @@ func (e *Engine) loop() {
 		now := time.Now()
 		e.mu.Lock()
 		for id, j := range e.jobs {
-			if j.State == StateDone && now.After(j.ExpiresTS) {
+			if (j.State == StateDone || j.State == StateError) && now.After(j.ExpiresTS) {
 				j.State = StateExpired
 				_ = os.Remove(e.resultPath(id))
 			}
@@ -269,25 +275,25 @@ func (e *Engine) finish(j *Job, st State, errMsg string) {
 	j.Error = errMsg
 	e.mu.Unlock()
 	if j.CallbackURL != "" {
-		go e.callback(j)
+		payload := map[string]any{
+			"job_id":     j.ID,
+			"state":      string(j.State),
+			"rows":       j.Rows,
+			"bytes":      j.Bytes,
+			"elapsed_ms": j.ElapsedMs,
+			"expires_ts": j.ExpiresTS.Format("2006-01-02 15:04:05"),
+		}
+		if j.Error != "" {
+			payload["error"] = j.Error
+		}
+		body, _ := json.Marshal(payload)
+		_ = body
+		go e.deliver(j, payload)
 	}
 }
 
-// callback POST 回调（带可选签名，退避重试）。
-func (e *Engine) callback(j *Job) {
-	payload := map[string]any{
-		"job_id":      j.ID,
-		"state":       string(j.State),
-		"rows":        j.Rows,
-		"bytes":       j.Bytes,
-		"elapsed_ms":  j.ElapsedMs,
-		"expires_ts":  j.ExpiresTS.Format("2006-01-02 15:04:05"),
-		"result_path": filepath.Base(e.resultPath(j.ID)),
-	}
-	if j.Error != "" {
-		payload["error"] = j.Error
-	}
-	body, _ := json.Marshal(payload)
+// callbackHTTP POST 回调（带可选签名，退避重试）。
+func (e *Engine) callbackHTTP(j *Job, body []byte) {
 	for attempt, backoff := range []time.Duration{0, time.Second, 5 * time.Second, 15 * time.Second} {
 		time.Sleep(backoff)
 		req, err := http.NewRequest(http.MethodPost, j.CallbackURL, bytes.NewReader(body))
