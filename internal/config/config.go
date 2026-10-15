@@ -11,13 +11,19 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.0.3.alpha"
+const GlacierVersion = "1.0.4.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
 	GlobalThreads            int            `yaml:"global_threads"`                // 全局并发执行上限（读写共享，0=不限）
 	PerDBReadThreads         int            `yaml:"per_db_read_threads"`           // 全局默认：单库读并发上限（0=不限）
 	PerDBReadThreadsOverride map[string]int `yaml:"per_db_read_threads_override"`  // 按库覆盖（如 backup: 8）
+}
+
+// ParallelOpts 多核并行查询：hint /*+ PARALLEL(n) */ 触发的聚合分片并行。
+// 用 Disable 而非 Enable 以便省略时默认开启（yaml bool 零值）。
+type ParallelOpts struct {
+	Disable bool `yaml:"disable"` // true = 关闭并行查询
 }
 
 type Auth struct {
@@ -51,6 +57,7 @@ type Config struct {
 	MaxConnections int `yaml:"max_connections"` // 最大并发客户端连接数
 
 	Concurrency ConcurrencyOpts `yaml:"concurrency"`
+	ParallelQuery ParallelOpts `yaml:"parallel_query"`
 
 	Auth   Auth       `yaml:"auth"`
 	SQLite SQLiteOpts `yaml:"sqlite"`
@@ -70,6 +77,7 @@ func Default() *Config {
 		},
 		MemoryLimitMB:  0,
 		MaxConnections: 64,
+		ParallelQuery: ParallelOpts{},
 		Concurrency: ConcurrencyOpts{
 			GlobalThreads:            0,
 			PerDBReadThreads:         0,

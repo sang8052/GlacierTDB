@@ -375,6 +375,13 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 
 	// 6) 读写分发
 	if isReadStmt(sq) {
+		// 多核并行查询：hint /*+ PARALLEL(n) */ 触发（不满足条件自动回退串行）
+		if clean, deg := parallelHint(sq); deg > 0 {
+			if res, ok, err := h.tryParallel(clean, deg); ok || err != nil {
+				return res, err
+			}
+			sq = clean
+		}
 		cols, rows, err := h.session.Query(sq)
 		h.slow(start, s)
 		if err != nil {
