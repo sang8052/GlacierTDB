@@ -33,7 +33,7 @@ SELECT name FROM server_config WHERE name LIKE 'sqlite.%';
 
 | 键 | 说明 |
 | --- | --- |
-| `glacier_version` | GlacierTDB 自身版本（如 `1.0.2.alpha`） |
+| `glacier_version` | GlacierTDB 自身版本（如 `1.0.8.alpha`） |
 | `server` / `server_version` | 产品名 / 对外模拟的 MySQL 协议版本（`8.99.999`） |
 | `listen` / `db_dir` / `default_db` / `databases` | 监听、库目录、默认库、当前库列表 |
 | `auth.user` | 固定为 `glacier` |
@@ -190,7 +190,9 @@ DO 0;  /* ping */
 
 ---
 
-## 4. 异步查询与定时任务（v1.0.5–1.0.7）
+## 4. 异步查询与定时任务（v1.0.5–1.0.8）
+
+> 完整语法、生命周期、回调协议与示例见 **[docs/异步任务.md](异步任务.md)**（v1.0.8 新增专册）。
 
 ```sql
 SUBMIT QUERY 'SELECT …'
@@ -198,7 +200,9 @@ SUBMIT QUERY 'SELECT …'
   [SIGN '<secret>'] [TIMEOUT 3600] [RETAIN 300]
   [AT '17:00' | '2026-10-16 17:00:00']  -- 指定时刻执行
   [WINDOW '17:00-20:00']                -- 每日窗口（EXPIRED 不跨天）
+  [WINDOW '周五 17:00-20:00']           -- 周几限定窗口（周一..周日 / MON..SUN，v1.0.8）
   [WHEN CPU < 70 AND MEM < 80 AND APP_CPU < 50 AND IO_MBPS < 10]
+  [PARTITION BY ROWS 50000 | BY BYTES 8388608]   -- 分片回调：每片独立 POST（v1.0.8 实装）
   [EVERY DAY [AT '17:00'] | EVERY HOUR | EVERY 30 MINUTES];  -- 周期定时任务
 
 SHOW QUERY JOBS;  SELECT * FROM query_jobs WHERE state='DONE';
@@ -207,13 +211,42 @@ CANCEL QUERY 'j_xxx';  DROP QUERY RESULT 'j_xxx';
 VACUUM DATABASE backup;   -- ⚠️ 执行期间该库全部写入阻塞；CLI: glaciertdb -vacuum
 ```
 
-四态回调（DONE/ERROR/EXPIRED/CANCELLED）；结果默认 60 秒自动删除；加密/目录锁见配置说明。
+四态回调（DONE/ERROR/EXPIRED/CANCELLED）；结果默认 60 秒自动删除；`query_jobs` v1.0.8 新增 `partition_rows` / `partition_bytes` 列。
 
-## 5. 快速速查
+## 4.1 多核并行查询（EXPLAIN PARALLEL）
+
+```sql
+SELECT /*+ PARALLEL(4) */ COUNT(*), SUM(v), AVG(v) FROM big_table WHERE g < 90;  -- hint 显式触发
+SELECT COUNT(*) FROM big_table;   -- 估算行数 ≥ parallel_query.scan_rows（默认 100 万）自动触发
+EXPLAIN PARALLEL SELECT COUNT(*) FROM big_table;   -- 查看拆分计划（分片键/估算行数/并行度/策略）
+```
+
+- 适用：单表顶层可合并聚合（COUNT/SUM/MIN/MAX/AVG），无 GROUP BY/ORDER/LIMIT；分片键 rowid 或单列主键；
+- v1.0.8 修复：注释剥离曾连带剥掉 `/*+ PARALLEL(n) */` hint（hint 从未生效、静默串行回退），现已保留。
+
+## 5. MySQL 函数兼容（v1.0.3 M1 + v1.0.8 M2）
+
+文本改写（v1.0.3）：`NOW()/CURDATE()/CURTIME()/UNIX_TIMESTAMP()/FROM_UNIXTIME()/LAST_INSERT_ID()/TRUNCATE`、`LIMIT o,n`、`CONCAT`、`IF`、`RAND()`、`UUID()`、DDL 类型映射、`DEFAULT CURRENT_TIMESTAMP`。
+
+Go 标量函数（v1.0.8，注册进每个后端连接，任意表达式位置可用）：
+
+| 函数 | 说明 |
+| --- | --- |
+| `MD5(s)` / `SHA1(s)` / `SHA256(s)` | 小写 hex；入参 NULL → NULL |
+| `SHA2(s, n)` | n∈{0,256,384,512}，0 视为 256；其他 → NULL（MySQL 语义） |
+| `LEFT(s,n)` / `RIGHT(s,n)` | UTF-8 安全；n≤0 → ''（MySQL 语义） |
+| `SUBSTRING_INDEX(s,d,n)` | n>0 正数第 n 个分隔符之前（含）；n<0 倒数第 \|n\| 个之后 |
+| `DATEDIFF(a,b)` | a−b 整天数（时间部分截断） |
+| `TIMESTAMPDIFF(unit,a,b)` | b−a；unit∈MICROSECOND/SECOND/MINUTE/HOUR/DAY/WEEK/MONTH/QUARTER/YEAR（日历感知） |
+| `DATE_FORMAT(d,fmt)` | `%Y %y %m %c %d %e %H %k %h %I %l %i %s %S %f %p %r %T %W %a %M %b %j %w %%` |
+
+语句改写（v1.0.8 M2）：`INSERT IGNORE INTO` → `INSERT OR IGNORE INTO`；`TIMESTAMPDIFF(MONTH, …)` 单位关键字自动字符串化。
+
+## 6. 快速速查
 
 ```sql
 -- 日常
-SELECT glacier_version;                          -- 1.0.2.alpha
+SELECT glacier_version;                          -- 1.0.8.alpha
 USE GlacierTDB;                                  -- 进管理面
 SHOW CLIENTS;                                    -- 看连接
 SHOW TRANSACTIONS;                               -- 看事务

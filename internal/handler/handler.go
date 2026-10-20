@@ -46,6 +46,9 @@ type Handler struct {
 
 var reSetAutocommit = regexp.MustCompile(`(?i)^SET\s+(?:@@?[A-Za-z_]*\.)?AUTOCOMMIT\s*=\s*([01])`)
 
+// EXPLAIN PARALLEL <query>：展示并行拆分计划
+var reExplainParallel = regexp.MustCompile(`(?is)^EXPLAIN\s+PARALLEL\s+(.+)$`)
+
 var _ meta.Querier = (*sqlite.Session)(nil)
 
 // New 创建连接级 handler（连到 defaultDB）。
@@ -388,19 +391,34 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 
 	// 6) 读写分发
 	if isReadStmt(sq) {
-		// 多核并行查询：hint /*+ PARALLEL(n) */ 触发（不满足条件自动回退串行）
+		// EXPLAIN PARALLEL <query>：查看并行拆分计划（不执行查询本体）
+		if m := reExplainParallel.FindStringSubmatch(sq); m != nil {
+			q := strings.TrimSpace(m[1])
+			deg := h.autoDeg()
+			if clean, hd := parallelHint(q); hd > 0 {
+				q, deg = clean, hd
+			} else if deg <= 0 {
+				deg = 4 // 仅作计划展示
+			}
+			h.slow(start, s)
+			return h.explainParallel(q, deg)
+		}
+		// 多核并行查询：hint /*+ PARALLEL(n) */ 显式触发（不满足条件自动回退串行）；
+		// 无 hint 时按 parallel_query.scan_rows 阈值自动触发
 		if clean, deg := parallelHint(sq); deg > 0 {
-			if res, ok, err := h.tryParallel(clean, deg); ok || err != nil {
+			if res, ok, err := h.tryParallel(clean, deg, true); ok || err != nil {
 				return res, err
 			}
 			sq = clean
+		} else if res, ok, err := h.maybeAutoParallel(sq); ok || err != nil {
+			return res, err
 		}
 		cols, rows, err := h.session.Query(sq)
 		h.slow(start, s)
 		if err != nil {
 			return nil, MapSQLiteErr(err)
 		}
-		rs, err := mysql.BuildSimpleResultset(cols, rows, false)
+		rs, err := meta.BuildResultset(cols, rows)
 		if err != nil {
 			return nil, MapSQLiteErr(err)
 		}

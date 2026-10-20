@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.0.7.alpha"
+const GlacierVersion = "1.0.8.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -20,10 +20,14 @@ type ConcurrencyOpts struct {
 	PerDBReadThreadsOverride map[string]int `yaml:"per_db_read_threads_override"`  // 按库覆盖（如 backup: 8）
 }
 
-// ParallelOpts 多核并行查询：hint /*+ PARALLEL(n) */ 触发的聚合分片并行。
+// ParallelOpts 多核并行查询：
+//   1) hint /*+ PARALLEL(n) */ 显式触发；
+//   2) 自动触发——单表可合并聚合语句，行数估算 ≥ scan_rows（0=关闭自动触发，默认 100 万）。
 // 用 Disable 而非 Enable 以便省略时默认开启（yaml bool 零值）。
 type ParallelOpts struct {
-	Disable bool `yaml:"disable"` // true = 关闭并行查询
+	Disable  bool  `yaml:"disable"`  // true = 关闭并行查询
+	Workers  int   `yaml:"workers"`  // 自动触发的并行度（0 = CPU 核数，上限 32）
+	ScanRows int64 `yaml:"scan_rows"` // 自动触发阈值：估算行数 ≥ 此值才并行（0=关闭）
 }
 
 // AsyncOpts 异步查询引擎。
@@ -107,7 +111,7 @@ func Default() *Config {
 		},
 		MemoryLimitMB:  0,
 		MaxConnections: 64,
-		ParallelQuery: ParallelOpts{},
+		ParallelQuery: ParallelOpts{ScanRows: 1000000},
 		Maintenance:   MaintOpts{},
 		AsyncQuery: AsyncOpts{
 			Workers:            2,

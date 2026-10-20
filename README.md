@@ -10,6 +10,7 @@
 | --- | --- |
 | [docs/配置说明.md](docs/配置说明.md) | 配置手册：全部配置项、默认值、热改关系、命令行参数、FAQ |
 | [docs/系统SQL.md](docs/系统SQL.md) | 系统 SQL 手册：管理面私有 SQL、系统库兼容层、SHOW 兜底 |
+| [docs/异步任务.md](docs/异步任务.md) | 异步任务手册：SUBMIT 全量语法、任务类型、回调协议、分片与示例（v1.0.8 新增） |
 | [docs/时序数据库.md](docs/时序数据库.md) | 时序冷库设计：存储模型、查询改写、rollup 与压缩路线 |
 | [docs/部署运维.md](docs/部署运维.md) | 部署（Docker/裸机/systemd）、升级、备份恢复、监控、故障排查 |
 
@@ -246,7 +247,10 @@ log:
 | 多库管理 | 一个库 = `db_dir` 下一个 `.db` 文件；`SHOW DATABASES` 列出、`USE` 切换后端文件、`CREATE DATABASE` / `DROP DATABASE` 建删文件（库名仅限 `[A-Za-z0-9_-]`）、`SHOW CREATE DATABASE` |
 | 系统库兼容层 | `information_schema`（21 张常用表）/ `mysql.user` / `performance_schema` / `sys` 由网关直接应答（支持列投影与 WHERE 过滤），不透传报错 |
 | 探活应答表 | `SELECT @@version / @@sql_mode / …`、`SHOW TABLES / COLUMNS / INDEX / CREATE TABLE / TABLE STATUS / VARIABLES / ENGINES / COLLATION / CHARSET / PROCESSLIST / TRIGGERS / PROCEDURE STATUS …`、`SET NAMES / SET SESSION`、`DO 0`、`/* ping */`；**未覆盖的 SHOW 变体一律兜底空结果集** |
-| 方言改写 | `NOW()` / `CURDATE()` / `CURTIME()` / `UNIX_TIMESTAMP()` / `LAST_INSERT_ID()` / `TRUNCATE TABLE` / `FROM_UNIXTIME()` / `NOW() ± INTERVAL n UNIT` / `GROUP BY time(N)` / 日期字符串谓词整数化 / `DESC 表` / `库名.表` 前缀剥除 |
+| 方言改写 | `NOW()` / `CURDATE()` / `CURTIME()` / `UNIX_TIMESTAMP()` / `LAST_INSERT_ID()` / `TRUNCATE TABLE` / `FROM_UNIXTIME()` / `NOW() ± INTERVAL n UNIT` / `GROUP BY time(N)` / 日期字符串谓词整数化 / `DESC 表` / `库名.表` 前缀剥除；`LIMIT o,n` / `CONCAT` / `IF` / `RAND` / `UUID` / `INSERT IGNORE`；DDL 类型映射（MySQL 建表直接粘贴） |
+| MySQL 函数（Go 标量，v1.0.8） | `MD5` / `SHA1` / `SHA2` / `SHA256` / `LEFT` / `RIGHT` / `SUBSTRING_INDEX` / `DATEDIFF` / `TIMESTAMPDIFF` / `DATE_FORMAT`——注册进每个后端连接，SELECT/WHERE/UPDATE 任意表达式可用 |
+| 多核并行查询 | hint `/*+ PARALLEL(n) */` 显式触发 + **自动触发**（估算行数 ≥ `parallel_query.scan_rows`，默认 100 万）；单表可合并聚合分片-并行-合并；`EXPLAIN PARALLEL` 查看拆分计划 |
+| 异步查询引擎 | `SUBMIT QUERY` 秒回 job_id；AT 定时 / WINDOW 每日·周几窗口 / WHEN 资源门槛 / EVERY 周期任务；回调四通道（HTTP+HMAC 签名 / TCP 流 / RabbitMQ / Kafka）；**PARTITION BY ROWS/BYTES 分片回调**；结果 JSONL 落盘分页拉取（详见 docs/异步任务.md） |
 | 标准 SQL 透传 | `COM_QUERY` → prepare → 逐行 step → 流式发包，大结果集不整体物化 |
 | 并发模型 | 读并发多线程（`global_threads` + `per_db_read_threads` + 按库覆盖）；写单库互斥锁（多库写入并行）；`BEGIN IMMEDIATE` 持锁至 `COMMIT`/`ROLLBACK`/断开 |
 | 事务 | `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `SET AUTOCOMMIT=0` 惰性隐式事务 |
@@ -278,7 +282,7 @@ bash tests/run_all.sh
 
 附加验证项：`BEGIN … INSERT … ROLLBACK` 数据不落盘、10 万行大结果集内存平稳、BLOB 二进制字段往返无损、中文表名 / 列名（反引号）、`information_schema` / `mysql.user` 系统库兼容层、时序改写与索引命中。
 
-**2026-10-15 实测战果（ALL TESTS PASSED，7 大类）**：mysql:8 CLI 32 项 ✅ ｜ PyMySQL 31 项 ✅（utf8mb4 emoji、BLOB 字节级往返、executemany、多库 CREATE/USE/DROP）｜ SQLAlchemy 14 项 ✅（inspect 反射、事务提交/回滚）｜ 并发 12 项 + 多库模型 7 项 ✅（**跨库写并行 0.00s / 同库写排队 1.50s**、三级并发配置热改、glacier 保留名拒绝）｜ 时序 11 项 ✅（INTERVAL/日期谓词整数化、time(N) 桶化、索引命中）｜ 管理面 21 项 ✅（查配置/连接/事务、KILL、改密热生效+持久化）｜ v1.0.6 回调通道（TCP/RabbitMQ/Kafka）+ 结果 TTL 默认 60s ✅ ｜ v1.0.7 周期定时任务/VACUUM/目录锁单实例/静态加密 12 项 ✅ ｜ 十万行全表往返内存 7.4 MB ✅。管理面 21 项 ✅ ｜ **MySQL 兼容 M1 14 项 ✅**（LIMIT 双参/CONCAT/IF/RAND/UUID/MySQL DDL 直接建表+类型映射/DEFAULT CURRENT_TIMESTAMP）｜ v1.0.6 回调通道（TCP/RabbitMQ/Kafka）+ 结果 TTL 默认 60s ✅ ｜ v1.0.7 周期定时任务/VACUUM/目录锁单实例/静态加密 12 项 ✅ ｜ 十万行全表往返内存 7.4 MB ✅。管理面 21 项 ✅ ｜ MySQL 兼容 M1 14 项 ✅ ｜ **多核并行查询 9 项 ✅**（80 万行聚合对拍一致）｜ **异步查询 20 项 ✅**（SUBMIT/AT 定时/每日窗口/WHEN 资源门槛/DONE·ERROR·EXPIRED 三态 HTTP 回调+HMAC 签名/JSONL 分页拉取）｜ v1.0.6 回调通道（TCP/RabbitMQ/Kafka）+ 结果 TTL 默认 60s ✅ ｜ v1.0.7 周期定时任务/VACUUM/目录锁单实例/静态加密 12 项 ✅ ｜ 十万行全表往返内存 7.4 MB ✅。默认监听 **3309**，对外版本 **8.99.999**，登录用户固定 **glacier**。
+**2026-10-20 实测战果（ALL TESTS PASSED）**：mysql:8 CLI ✅ ｜ PyMySQL ✅（utf8mb4 emoji、BLOB 字节级往返、executemany、多库 CREATE/USE/DROP）｜ SQLAlchemy ✅（inspect 反射、事务提交/回滚）｜ 并发 + 多库模型 ✅（**跨库写并行 0.00s / 同库写排队 1.50s**、三级并发配置热改）｜ 时序 ✅（INTERVAL/日期谓词整数化、time(N) 桶化、索引命中）｜ 管理面 21 项 ✅ ｜ **MySQL 兼容 M1+M2 ✅**（LIMIT 双参/CONCAT/IF/RAND/UUID/DDL 类型映射/INSERT IGNORE + MD5/SHA 族/LEFT/RIGHT/SUBSTRING_INDEX/DATEDIFF/TIMESTAMPDIFF/DATE_FORMAT）｜ **多核并行查询 9 项 ✅**（80 万行聚合对拍一致 + EXPLAIN PARALLEL）｜ **异步查询 ✅**（SUBMIT/AT/窗口/WHEN/EVERY/四通道回调+HMAC/分片回调/JSONL 分页拉取）｜ v1.0.7 周期任务/VACUUM/目录锁/静态加密 ✅ ｜ **v1.0.8 共 37 项新增回归 ✅**（空串回读修复、MD5、分片回调、周窗口）。默认监听 **3309**，对外版本 **8.99.999**，登录用户固定 **glacier**。
 
 ---
 
@@ -298,7 +302,7 @@ bash tests/run_all.sh
 - `SHOW CREATE TABLE` 生成的 MySQL 方言 DDL 为近似还原（类型沿用 SQLite 声明）；
 - 无 `DECIMAL` 精确类型（SQLite 为动态类型），金额类字段建议按 TEXT 存取；
 - 无 `TINYINT` / `DATETIME` 等原生类型，日期时间以 TEXT 或 INTEGER 存储，客户端所见列类型标识与真实 MySQL 有差异；
-- 日期 / 字符串函数仅改写最常用若干个，`IFNULL()`、`GROUP_CONCAT()` 等 SQLite 原生可用，其余不保证；
+- 日期 / 字符串函数覆盖常用集（含 v1.0.8 的 `MD5`/`SHA` 族、`LEFT/RIGHT`、`SUBSTRING_INDEX`、`DATEDIFF`/`TIMESTAMPDIFF`、`DATE_FORMAT`），`IFNULL()`、`GROUP_CONCAT()` 等 SQLite 原生可用，其余不保证；
 - `ALTER TABLE` 仅支持 SQLite 能力集（`ADD COLUMN` / `RENAME` / `DROP COLUMN`），其余按 `1064` 报错。
 
 **部署层**

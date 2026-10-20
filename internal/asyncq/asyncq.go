@@ -56,6 +56,7 @@ type Job struct {
 	SignSecret  string     `json:"-"`
 	At          *time.Time `json:"at,omitempty"`     // AT 指定时刻
 	Window      [2]string  `json:"window,omitempty"` // WINDOW 每日 ["17:00","20:00"]
+	WindowWd    int        `json:"window_weekday,omitempty"` // WINDOW 周几限定（0=每日，1..7=周一..周日）
 	TimeoutSec  int        `json:"timeout_sec"`
 	SubmitTS    time.Time  `json:"submit_ts"`
 	StartTS     time.Time  `json:"-"`
@@ -65,7 +66,8 @@ type Job struct {
 	Bytes       int64      `json:"bytes"`
 	Error       string     `json:"error,omitempty"`
 	ExpiresTS   time.Time  `json:"expires_ts"`
-	PartRows    int64      `json:"partition_rows,omitempty"` // 分片回调大小
+	PartRows    int64      `json:"partition_rows,omitempty"` // 分片回调大小（行数）
+	PartBytes   int64      `json:"partition_bytes,omitempty"` // 分片回调大小（行序列化字节数）
 	RetainSec   int        `json:"retain_sec,omitempty"`     // 结果保留秒数（覆盖全局默认 60s）
 	Script      string     `json:"script,omitempty"`
 	ScriptOut   string     `json:"script_output,omitempty"`
@@ -187,23 +189,15 @@ func (e *Engine) runWhenDue(j *Job) {
 		if j.At != nil && now.Before(*j.At) {
 			continue
 		}
-		// WINDOW：窗外等待；窗口尾刻过 → EXPIRED（不跨天）
+		// WINDOW：窗外等待；窗口尾刻过 → EXPIRED（不跨天）；带周几限定时非当日等待
 		if j.Window[0] != "" {
-			inWin, winEnd := inDailyWindow(now, j.Window[0], j.Window[1])
+			inWin, winEnd := inWindow(now, j.WindowWd, j.Window[0], j.Window[1])
 			if !inWin {
 				if now.After(winEnd) {
 					e.finish(j, StateExpired, "daily window closed before execution")
 					return
 				}
 				continue
-			}
-			wd := winEnd
-			if now.After(deadline) || wd.After(deadline) {
-				// 窗口或超时先到：以先到者为准判定
-				if wd.After(deadline) {
-					wd = deadline
-				}
-				_ = wd
 			}
 		}
 		// WHEN：资源门槛
@@ -307,6 +301,7 @@ func (e *Engine) finish(j *Job, st State, errMsg string) {
 				}
 				next.At = &t
 				next.Window = [2]string{}
+				next.WindowWd = 0
 			} else {
 				t := time.Now().Add(time.Duration(j.EverySec) * time.Second)
 				next.At = &t
@@ -326,9 +321,83 @@ func (e *Engine) finish(j *Job, st State, errMsg string) {
 		if j.Error != "" {
 			payload["error"] = j.Error
 		}
+		if j.PartRows > 0 {
+			payload["parts"] = (j.Rows + j.PartRows - 1) / j.PartRows
+			payload["partition_rows"] = j.PartRows
+		}
+		if j.PartBytes > 0 {
+			payload["partition_bytes"] = j.PartBytes
+		}
 		body, _ := json.Marshal(payload)
 		_ = body
 		go e.deliver(j, payload)
+		// PARTITION 分片回调：每片独立 POST（v1.0.8；仅 HTTP 通道）
+		if (j.PartRows > 0 || j.PartBytes > 0) && j.State == StateDone &&
+			j.CallbackProto != "tcp" && j.CallbackProto != "amqp" && j.CallbackProto != "kafka" {
+			go e.deliverParts(j)
+		}
+	}
+}
+
+// deliverParts 分片回调：把结果按 PartRows（行数）或 PartBytes（行序列化字节数）
+// 切片逐片 POST；单片负载超过 callback_max_inline_kb 时省略 data、附拉取凭证。
+func (e *Engine) deliverParts(j *Job) {
+	cols, rows, err := e.Fetch(j.ID, 0, 0)
+	if err != nil || len(rows) == 0 {
+		return
+	}
+	type chunk struct{ off, end int }
+	var chunks []chunk
+	if j.PartRows > 0 {
+		for off := 0; off < len(rows); off += int(j.PartRows) {
+			end := off + int(j.PartRows)
+			if end > len(rows) {
+				end = len(rows)
+			}
+			chunks = append(chunks, chunk{off, end})
+		}
+	} else if j.PartBytes > 0 {
+		cur, start := 0, 0
+		for k, r := range rows {
+			b, _ := json.Marshal(r)
+			cur += len(b)
+			if int64(cur) >= j.PartBytes {
+				chunks = append(chunks, chunk{start, k + 1})
+				start, cur = k+1, 0
+			}
+		}
+		if start < len(rows) {
+			chunks = append(chunks, chunk{start, len(rows)})
+		}
+	}
+	total := int64(len(chunks))
+	limitKB := int64(e.cfg.AsyncQuery.CallbackMaxInlineKB)
+	for pi, c := range chunks {
+		payload := map[string]any{
+			"job_id":        j.ID,
+			"state":         string(j.State),
+			"part":          int64(pi + 1),
+			"parts":         total,
+			"rows":          int64(c.end - c.off),
+			"columns":       cols,
+			"data_encoding": "json",
+		}
+		body, merr := json.Marshal(payload)
+		if merr != nil {
+			return
+		}
+		if limitKB <= 0 || int64(len(body)) < limitKB*1024 {
+			withData := make(map[string]any, len(payload)+1)
+			for k, v := range payload {
+				withData[k] = v
+			}
+			withData["data"] = rows[c.off:c.end]
+			body, _ = json.Marshal(withData)
+		} else {
+			payload["fetch"] = fmt.Sprintf("FETCH QUERY RESULT '%s' LIMIT %d OFFSET %d", j.ID, c.end-c.off, c.off)
+			body, _ = json.Marshal(payload)
+		}
+		e.callbackHTTP(j, body) // 复用签名头 + 退避重试
 	}
 }
 
@@ -481,8 +550,15 @@ func (e *Engine) Drop(id string) error {
 	return nil
 }
 
-// inDailyWindow 判断 now 是否位于每日窗口 [start,end)（支持跨午夜），返回窗口结束时刻。
-func inDailyWindow(now time.Time, startHM, endHM string) (bool, time.Time) {
+// inWindow 判断 now 是否位于窗口 [start,end)（支持跨午夜），返回窗口结束时刻。
+// wd：0=每日窗口；1..7=周一..周日限定（非当日不满足，返回 24h 后作伪窗口尾，由 TIMEOUT 兜底）。
+func inWindow(now time.Time, wd int, startHM, endHM string) (bool, time.Time) {
+	if wd != 0 {
+		// Go: Sunday=0..Saturday=6；约定 wd: 1=周一..7=周日
+		if int(now.Weekday()) != wd%7 {
+			return false, now.Add(24 * time.Hour)
+		}
+	}
 	sh, sm, ok1 := parseHM(startHM)
 	eh, em, ok2 := parseHM(endHM)
 	if !ok1 || !ok2 {

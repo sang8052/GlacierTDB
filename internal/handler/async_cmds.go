@@ -26,7 +26,7 @@ var (
 )
 
 // parseSubmitOpts 解析 SUBMIT 之后的选项段。
-func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time.Time, win [2]string, when, part, script, scriptOut string, retainSec, everySec int, everyAt string, err error) {
+func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time.Time, win [2]string, weekWd int, when, part, partBytes, script, scriptOut string, retainSec, everySec int, everyAt string, err error) {
 	s := strings.TrimSpace(rest)
 	// WHEN 到 PARTITION/SCRIPT 前的整段
 	var whenRaw string
@@ -82,22 +82,45 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 			i++
 		case "WINDOW":
 			w := strings.Trim(next(), "'")
+			// 可选周几前缀：周一..周日 / MON..SUN（单日限定），如 '周五 17:00-20:00'
+			if k := strings.IndexAny(w, " \t"); k > 0 {
+				head, restW := w[:k], strings.TrimSpace(w[k+1:])
+				if d, ok := parseWeekday(head); ok && restW != "" {
+					weekWd = d
+					w = restW
+				}
+			}
 			parts := strings.SplitN(w, "-", 2)
 			if len(parts) != 2 {
-				err = fmt.Errorf("invalid WINDOW '%s' (expect 'HH:MM-HH:MM')", w)
+				err = fmt.Errorf("invalid WINDOW '%s' (expect 'HH:MM-HH:MM' or '周X HH:MM-HH:MM')", w)
 				return
 			}
 			win = [2]string{strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])}
 			i++
 		case "PARTITION":
-			// PARTITION BY ROWS n / BYTES n
-			if strings.ToUpper(next()) == "BY" {
+			// PARTITION BY ROWS n / BYTES n（v1.0.8：BYTES 按行序列化字节数切分）
+			if i+1 < len(toks) && strings.ToUpper(toks[i+1]) == "BY" {
 				i++
 			}
-			if i+1 < len(toks) && strings.ToUpper(next()) == "ROWS" {
-				i++
+			unit := ""
+			if i+1 < len(toks) {
+				unit = strings.ToUpper(toks[i+1])
 			}
-			part = next()
+			if unit != "ROWS" && unit != "BYTES" {
+				err = fmt.Errorf("invalid PARTITION (expect BY ROWS n or BY BYTES n)")
+				return
+			}
+			i++
+			val := strings.TrimSpace(next())
+			if n, e := strconv.ParseInt(val, 10, 64); e != nil || n <= 0 {
+				err = fmt.Errorf("PARTITION expects a positive number, got %q", val)
+				return
+			}
+			if unit == "BYTES" {
+				partBytes = val
+			} else {
+				part = val
+			}
 			i++
 		case "BY", "ROWS", "BYTES":
 			// 已由 PARTITION 消费
@@ -205,6 +228,48 @@ func parseAtTime(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("unsupported time %q (use HH:MM or YYYY-MM-DD HH:MM:SS)", s)
 }
 
+// parseWeekday 解析周几：周一..周日 / 周1..周7 / MON..SUN → 1..7（周一=1，周日=7）。
+func parseWeekday(s string) (int, bool) {
+	t := strings.ToUpper(strings.TrimSpace(s))
+	if len(t) >= 2 && (t[0:1] == "周" || strings.HasPrefix(t, "星期")) {
+		num := strings.TrimPrefix(strings.TrimPrefix(t, "星期"), "周")
+		switch num {
+		case "一", "1":
+			return 1, true
+		case "二", "2":
+			return 2, true
+		case "三", "3":
+			return 3, true
+		case "四", "4":
+			return 4, true
+		case "五", "5":
+			return 5, true
+		case "六", "6":
+			return 6, true
+		case "日", "天", "7":
+			return 7, true
+		}
+		return 0, false
+	}
+	switch t {
+	case "MON", "MONDAY":
+		return 1, true
+	case "TUE", "TUESDAY":
+		return 2, true
+	case "WED", "WEDNESDAY":
+		return 3, true
+	case "THU", "THURSDAY":
+		return 4, true
+	case "FRI", "FRIDAY":
+		return 5, true
+	case "SAT", "SATURDAY":
+		return 6, true
+	case "SUN", "SUNDAY":
+		return 7, true
+	}
+	return 0, false
+}
+
 // handleAsyncQ 异步查询命令分发；handled=false 表示非本类命令。
 func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 	// SUBMIT QUERY
@@ -216,7 +281,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			return nil, true, roErr()
 		}
 		sqlText := strings.ReplaceAll(m[1], "''", "'")
-		cb, cbOpt, sign, timeout, at, win, when, part, script, scriptOut, retainSec, everySec, everyAt, perr := parseSubmitOpts(m[2])
+		cb, cbOpt, sign, timeout, at, win, weekWd, when, part, partBytes, script, scriptOut, retainSec, everySec, everyAt, perr := parseSubmitOpts(m[2])
 		if perr != nil {
 			return nil, true, mysql.NewError(1064, perr.Error())
 		}
@@ -229,9 +294,13 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		if part != "" {
 			partRows, _ = strconv.ParseInt(part, 10, 64)
 		}
+		var partBytesN int64
+		if partBytes != "" {
+			partBytesN, _ = strconv.ParseInt(partBytes, 10, 64)
+		}
 		job := &asyncq.Job{
 			SQL: sqlText, CallbackURL: cb, SignSecret: sign, TimeoutSec: timeout,
-			At: at, Window: win, WhenExpr: when, PartRows: partRows,
+			At: at, Window: win, WindowWd: weekWd, WhenExpr: when, PartRows: partRows, PartBytes: partBytesN,
 			Script: script, ScriptOut: scriptOut, RetainSec: retainSec,
 			EverySec: everySec, EveryAt: everyAt,
 		}
@@ -329,7 +398,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 }
 
 var asyncJobCols = []string{"job_id", "state", "sql", "submit_ts", "elapsed_ms", "rows", "bytes",
-	"error", "callback_url", "at", "window", "when", "every_sec", "recur_group"}
+	"error", "callback_url", "at", "window", "when", "every_sec", "recur_group", "partition_rows", "partition_bytes"}
 
 func jobsRows(jobs []asyncq.Job) [][]any {
 	var out [][]any
@@ -342,12 +411,24 @@ func jobsRows(jobs []asyncq.Job) [][]any {
 		}
 		if j.Window[0] != "" {
 			win = j.Window[0] + "-" + j.Window[1]
+			if j.WindowWd > 0 {
+				win = weekdayCN(j.WindowWd) + " " + win
+			}
 		}
 		out = append(out, []any{j.ID, string(j.State), j.SQL,
 			j.SubmitTS.Format("2006-01-02 15:04:05"), j.ElapsedMs, j.Rows, j.Bytes,
-			j.Error, j.CallbackURL, at, win, j.WhenExpr, j.EverySec, j.RecurGroup})
+			j.Error, j.CallbackURL, at, win, j.WhenExpr, j.EverySec, j.RecurGroup, j.PartRows, j.PartBytes})
 	}
 	return out
+}
+
+// weekdayCN 1..7 → 周一..周日（任务表展示用）。
+func weekdayCN(wd int) string {
+	names := []string{"", "周一", "周二", "周三", "周四", "周五", "周六", "周日"}
+	if wd >= 1 && wd <= 7 {
+		return names[wd]
+	}
+	return fmt.Sprintf("周%d", wd)
 }
 
 // filterAsyncRows 支持 col = 'v' / col LIKE 'p' / col IN (...) AND 组合。

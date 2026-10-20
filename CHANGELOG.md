@@ -2,6 +2,26 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.0.8.alpha] - 2026-10-20
+
+### 修复
+- **空字符串回读为 NULL**：go-mysql 结果集编码把 Go 空字符串 `""` 编成 MySQL 协议 NULL（0xfb）——存储层无损（`WHERE v=''` 命中、`LENGTH=0`、`IS NULL=0`），仅结果集编码失真，`ip=''` 列被客户端读成 None 直接打爆 pydantic。网关在编码前统一规范化（`''`/空 `[]byte` → 长度 0 字符串，真 NULL 不动），三个结果集出口全部修复。
+- **hint 从未生效的隐藏 bug**：注释剥离（StripComments）会连带剥掉 `/*+ PARALLEL(n) */` 优化器 hint，v1.0.4 以来的并行查询实际一直静默串行回退（历史测试只验证结果正确性，串行也能过）。现保留 `/*+ */` 形式的 hint。
+- `DEFAULT ('...')` 括号形式已知限制维持不变（SQLite 视为非常量），继续要求裸 `DEFAULT ''` 写法。
+
+### 新增
+- **MySQL 标量函数（Go 实现，注册进每个后端连接）**：`MD5` / `SHA1` / `SHA2(s,n)` / `SHA256`（小写 hex、NULL 传播，任意表达式位置可用，`UPDATE … SET col=MD5(…)` 直通）；`LEFT` / `RIGHT`（UTF-8 安全）；`SUBSTRING_INDEX`（正负计数）；`DATEDIFF` / `TIMESTAMPDIFF`（9 种单位，MONTH/QUARTER/YEAR 日历感知，单位关键字自动字符串化改写）；`DATE_FORMAT`（MySQL 格式符子集）。
+- **多核并行查询自动触发**：无 hint 时单表可合并聚合语句按估算行数（rowid/主键跨度）≥ `parallel_query.scan_rows`（默认 100 万，0=关闭）自动并行，并行度 `parallel_query.workers`（0=CPU 核数）。
+- **`EXPLAIN PARALLEL <query>`**：查看拆分计划（表 / 分片键 / 估算行数 / 并行度 / 不满足原因）。
+- **异步 PARTITION 分片回调实装**：`PARTITION BY ROWS n | BY BYTES n`——任务级元信息 POST（含 parts）后逐片独立 POST（片号/列头/数据内联，超 `callback_max_inline_kb` 改发拉取凭证），每片独立 HMAC 签名与重试；`query_jobs` 新增 `partition_rows` / `partition_bytes` 列。
+- **WINDOW 周几限定**：`WINDOW '周五 17:00-20:00'` / `'FRI …'`（周一..周日 / MON..SUN），非指定日等待、TIMEOUT 兜底。
+- `INSERT IGNORE INTO` → `INSERT OR IGNORE INTO` 改写（M2 批）。
+- 新增第 5 册文档 **docs/异步任务.md**（任务类型 / SUBMIT 全量语法与参数 / 生命周期 / 回调协议 / 分片协议 / 配置与示例）；`tests/test_v108.py` 37 项；全套回归 ALL TESTS PASSED（13 个测试脚本）。
+
+### 变更
+- SQLite 物理连接改经 `driver.Open(dsn, hook)` 建立（连接初始化钩子注册兼容函数），行为不变；
+- `parallel_query` 配置新增 `workers` / `scan_rows`（原 `disable` 兼容保留）。
+
 ## [1.0.7.alpha] - 2026-10-15
 
 ### 新增

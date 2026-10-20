@@ -32,13 +32,21 @@ concurrency:
     # backup: 8
     # logs: 2
 
-# 异步查询引擎（SUBMIT QUERY / 回调 / 定时窗口）详见 docs/系统SQL.md 与 FEATURE.md
+# 多核并行查询（v1.0.8）：hint /*+ PARALLEL(n) */ 显式触发；
+# 无 hint 时单表可合并聚合语句估算行数 ≥ scan_rows 自动并行（0=关闭自动触发）
+parallel_query:
+  disable: false
+  workers: 0            # 自动触发并行度（0 = CPU 核数，上限 32）
+  scan_rows: 1000000    # 自动触发阈值
+
+# 异步查询引擎（SUBMIT QUERY / 回调 / 定时窗口 / 分片回调）详见 docs/异步任务.md
 async_query:
   enable: true
   workers: 2
   metrics_interval_sec: 30   # WHEN 资源采样周期（最低 10）
-  result_ttl_hours: 24
+  result_retain_sec: 60      # 结果默认保留秒数（RETAIN 按任务覆盖）
   default_timeout_sec: 1800
+  callback_max_inline_kb: 64 # 分片回调单片数据内联上限
   # nodejs_path: ""          # SCRIPT 后处理 runtime（空=禁用；沙箱边界见 FEATURE.md）
   # python_path: ""
 

@@ -149,6 +149,7 @@ echo "---- test_mysql_compat.py ----"; python /tests/test_mysql_compat.py || rc=
 echo "---- test_parallel.py ----"; python /tests/test_parallel.py || rc=1
 echo "---- test_async.py ----"; python /tests/test_async.py || rc=1
 echo "---- test_v107.py ----"; python /tests/test_v107.py || rc=1
+echo "---- test_v108.py ----"; python /tests/test_v108.py || rc=1
 exit $rc
 EOF
 )

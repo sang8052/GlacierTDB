@@ -973,13 +973,21 @@ func likeMatch(pattern, s string) bool {
 	return ok
 }
 
-var reBlockComment = regexp.MustCompile(`/\*.*?\*/`)
+// reBlockComment 匹配全部块注释；StripComments 剥除时保留 /*+ ... */ 优化器 hint
+// （如 /*+ PARALLEL(n) */）—— v1.0.8 前会把 hint 一并剥掉，
+// 导致并行查询 hint 从未生效（静默串行回退）。
+var reBlockComment = regexp.MustCompile(`(?s)/\*.*?\*/`)
 
 // StripComments 去掉 /* */ 块注释、首尾空白与结尾分号。
 func StripComments(q string) string {
 	s := strings.TrimSpace(q)
 	s = strings.TrimSuffix(s, ";")
-	s = reBlockComment.ReplaceAllString(s, "")
+	s = reBlockComment.ReplaceAllStringFunc(s, func(m string) string {
+		if strings.HasPrefix(m, "/*+") {
+			return m // 优化器 hint（/*+ PARALLEL(n) */ 等）保留
+		}
+		return ""
+	})
 	return strings.TrimSpace(s)
 }
 

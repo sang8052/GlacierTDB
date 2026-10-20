@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	_ "github.com/ncruces/go-sqlite3/driver"
+	"github.com/ncruces/go-sqlite3/driver"
 	_ "github.com/ncruces/go-sqlite3/vfs/adiantum"
 
 	"glaciertdb/internal/config"
@@ -134,7 +134,9 @@ func NewBackend(cfg *config.Config) (*Backend, error) {
 func (b *Backend) fileFor(db string) string { return filepath.Join(b.dir, db+".db") }
 
 func (b *Backend) openFile(file string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", b.dsnFor(file))
+	// driver.Open（带连接初始化钩子）：每个物理连接注册 MD5/SHA/LEFT/RIGHT/
+	// SUBSTRING_INDEX/DATEDIFF/TIMESTAMPDIFF/DATE_FORMAT 等 MySQL 兼容标量函数
+	db, err := driver.Open(b.dsnFor(file), registerCompatFuncs)
 	if err != nil {
 		return nil, err
 	}

@@ -14,6 +14,9 @@ var (
 	reUUID       = regexp.MustCompile(`(?i)\bUUID\s*\(\s*\)`)
 	reCallConcat = regexp.MustCompile(`(?i)\bCONCAT\s*\(`)
 	reCallIF     = regexp.MustCompile(`(?i)\bIF\s*\(`)
+	reInsertIgn  = regexp.MustCompile(`(?i)^(\s*INSERT\s+)IGNORE(\s+INTO\b)`)
+	// TIMESTAMPDIFF(MONTH, a, b)：MySQL 单位是裸关键字，SQLite 会解析为列名 → 改写为字符串字面量
+	reTsDiffUnit = regexp.MustCompile(`(?i)\bTIMESTAMPDIFF\s*\(\s*(MICROSECOND|SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|QUARTER|YEAR)\s*,`)
 	reIsDDL      = regexp.MustCompile(`(?i)^\s*(CREATE\s+(?:TEMP\s+|UNIQUE\s+)?(?:TABLE|INDEX|VIEW)|ALTER\s+TABLE)\b`)
 
 	// DDL 词法映射（MySQL → SQLite）；带括号形式在前、裸词在后（词边界防 INTEGER 误伤）
@@ -56,6 +59,14 @@ func RewriteMySQLCompat(q string) string {
 	// LIMIT offset, count → LIMIT count OFFSET offset（仅语句尾部，一次）
 	if reMySQLLimit.MatchString(q) {
 		q = reMySQLLimit.ReplaceAllString(q, "LIMIT $2 OFFSET $1")
+	}
+	// INSERT IGNORE INTO → INSERT OR IGNORE INTO（M2）
+	if reInsertIgn.MatchString(q) {
+		q = reInsertIgn.ReplaceAllString(q, "${1}OR IGNORE${2}")
+	}
+	// TIMESTAMPDIFF 单位关键字字符串化（M2；Go 函数实现见 internal/sqlite/funcs.go）
+	if reTsDiffUnit.MatchString(q) {
+		q = reTsDiffUnit.ReplaceAllString(q, "TIMESTAMPDIFF('$1',")
 	}
 	if reRand.MatchString(q) {
 		q = reRand.ReplaceAllString(q, "(abs(random())/9223372036854775808.0)")
