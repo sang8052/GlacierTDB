@@ -2,6 +2,23 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.0.9.alpha] - 2026-10-22
+
+### 修复
+- **文本值中的引号转义被多余持久化（BUG.txt）**：MySQL 协议客户端（pymysql / mysql CLI / SQLAlchemy 等）把参数值按 MySQL 规则转义后拼进 SQL 文本（`"` → `\"`、`'` → `\'`、`\` → `\\`、换行 → `\n`），SQLite 的 `'...'` 字面量不处理反斜杠，转义序列被原样落盘——JSON 配置存入后读回带 `\` 污染、标准 JSON 库无法解析、`WHERE json_field = ...` 永远无法命中、每次「读出→改→写回」还会再叠加一层转义。网关现统一在语句进入 SQLite 前对单引号字面量做 MySQL→SQLite 还原（按 MySQL 规则解码后按 SQLite 规则重编码 `'` → `''`；`\%` / `\_`（LIKE 通配符字面量）与 `\0`（无法进入 SQLite SQL 文本）保守保留；反引号/双引号段与注释不参与扫描），同步查询、写语句与异步任务执行三条路径全部覆盖，附 Go 单元测试（`internal/meta/escape_test.go`）。⚠️ 修复前已落盘的污染数据不自动清洗，可用 `UPDATE t SET cfg = REPLACE(cfg, '\\"', '"')` 一类语句自行修复。
+- **CPU 采样恒为 -1（存量）**：`readGlobalCPUPct` 用 `Fscanln(&line)` 读 `/proc/stat` 首行，按空白分词只读到 `cpu` 一个词，后续数值全解析为 0——CPU 指标自 v1.0.5 起从未产生过有效样本（`WHEN CPU<70` 因 -1<70 恒真而被掩盖）。改按 `strings.Fields` 解析全行；随 `SHOW QUERY VARS` 暴露并修复。
+- **`WHEN` 作为 SUBMIT 首个选项解析失败（存量）**：`SUBMIT QUERY '…' WHEN CPU<70` 中 WHEN 紧跟 SQL 引号时，旧正则要求 WHEN 前必须有空白而失配，报 `unknown SUBMIT option near "WHEN"`（此前测试只覆盖过 WHEN 之前还有别的选项的写法）。现 WHEN / PARTITION / SCRIPT 允许出现在选项串开头；WHEN 与 PARTITION/SCRIPT 共存时 WHEN 表达式正确截断到 PARTITION/SCRIPT 之前。
+
+### 新增
+- **只读账号（`auth.readonly_user` / `auth.readonly_password`，默认 `glacier_ro`）**：与管理账号 `glacier` 完全同等的认证体系——mysql_native_password 登录、密码可配置、管理面热改（`SET PASSWORD FOR glacier_ro='新密码'` / `ALTER USER glacier_ro IDENTIFIED BY '...'`，与管理员密码同一 `<db_dir>/glacier.json` 持久化，`readonly_password` 字段向后兼容）。权限：查询、`SHOW`、管理面查看（SERVER CONFIG / CLIENTS / TRANSACTIONS / QUERY JOBS / QUERY VARS）放行；数据面写语句、`BEGIN` 事务、`SUBMIT/CANCEL/DROP QUERY`、管理面变更命令（SET PASSWORD / SET *_THREADS / KILL / VACUUM）一律 1290 拒绝。原 `readonly_users` 名单配置移除（单账号模型下实际不可用）。`readonly_password` 置空可禁用只读登录。
+- **`SHOW QUERY VARS`**：查看 WHEN 监测变量当前值（Variable_name / Value / Level / Description 四列；值 <0 表示首采只建基线，返回 NULL）。
+- **`DISK_MBPS` 服务器级磁盘写速率指标**：`/proc/diskstats` 物理盘（sd/vd/xvd/hd/nvme/mmcblk，分区不计）sectors written 增量折算 MB/s；容器内 `/proc/diskstats` 为宿主机视图，反映整机。WHEN 表达式与 `SHOW QUERY VARS` 均可用。
+
+### 变更
+- FEATURE.md：**多机服务冗余（原 §5）从路线移除**——坚持单机单写者与零中间件模型，不做多机部署支持；读扩展/写主备方案不再规划。
+- 管理面 `SET PASSWORD` / `ALTER USER` 支持目标账号（`FOR <user>` / `ALTER USER <user>`），命中只读账号名改只读密码，缺省或管理员名改管理员密码；`SHOW SERVER CONFIG` 新增 `auth.readonly_user` 行；SQL 审计日志与 `SHOW CLIENTS` 的 `User` 列记录真实登录账号。
+- `tests/test_v109.py` 新增 32 项；全套回归 ALL TESTS PASSED（14 个测试脚本）。
+
 ## [1.0.8.alpha] - 2026-10-20
 
 ### 修复

@@ -4,6 +4,7 @@ package handler
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -22,22 +23,33 @@ var (
 	reCancelJob  = regexp.MustCompile(`(?i)^CANCEL\s+QUERY\s+'?([A-Za-z0-9_]+)'?\s*$`)
 	reDropJob    = regexp.MustCompile(`(?i)^DROP\s+QUERY\s+RESULT\s+'?([A-Za-z0-9_]+)'?\s*$`)
 	reShowJobs   = regexp.MustCompile(`(?i)^SHOW\s+QUERY\s+JOBS\s*$`)
+	reShowQVars  = regexp.MustCompile(`(?i)^SHOW\s+QUERY\s+VARS\s*$`)
 	reJobsTable  = regexp.MustCompile(`(?is)^SELECT\s+(.+?)\s+FROM\s+query_jobs(?:\s+WHERE\s+(.+?))?(?:\s+ORDER\s+BY\s+.+?)?(?:\s+LIMIT\s+\d+(?:\s*,\s*\d+)?)?\s*$`)
 )
 
 // parseSubmitOpts 解析 SUBMIT 之后的选项段。
 func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time.Time, win [2]string, weekWd int, when, part, partBytes, script, scriptOut string, retainSec, everySec int, everyAt string, err error) {
 	s := strings.TrimSpace(rest)
-	// WHEN 到 PARTITION/SCRIPT 前的整段
+	// WHEN 到 PARTITION/SCRIPT 前的整段。v1.0.9 修复：WHEN 作为首个选项
+	// （紧跟 SQL 引号）时，旧正则要求 WHEN 前必须有空白，导致报 unknown SUBMIT
+	// option near "WHEN"——现允许 WHEN/PARTITION/SCRIPT 出现在选项串开头。
 	var whenRaw string
-	if i := regexp.MustCompile(`(?i)\s+(PARTITION|SCRIPT)\b`).FindStringIndex(s); i != nil {
-		if w := regexp.MustCompile(`(?i)\s+WHEN\s+(.*)$`).FindStringSubmatch(s); w != nil {
+	reWhenTail := regexp.MustCompile(`(?i)(?:^|\s)WHEN\s+(.*)$`)
+	reWhenStop := regexp.MustCompile(`(?i)(?:^|\s)WHEN\s+(.*?)\s+(?:PARTITION|SCRIPT)\b`)
+	rePartHead := regexp.MustCompile(`(?i)(?:^|\s)(?:PARTITION|SCRIPT)\b`)
+	if rePartHead.MatchString(s) {
+		if m := reWhenStop.FindStringSubmatch(s); m != nil {
+			whenRaw = strings.TrimSpace(m[1])
+		} else if w := reWhenTail.FindStringSubmatch(s); w != nil {
 			whenRaw = strings.TrimSpace(w[1])
-			s = strings.TrimSpace(s[:strings.Index(strings.ToUpper(s), "WHEN")])
 		}
-	} else if w := regexp.MustCompile(`(?i)\s+WHEN\s+(.+)$`).FindStringSubmatch(s); w != nil {
+	} else if w := reWhenTail.FindStringSubmatch(s); w != nil {
 		whenRaw = strings.TrimSpace(w[1])
-		s = strings.TrimSpace(s[:len(s)-len(w[0])])
+	}
+	if whenRaw != "" {
+		if i := strings.Index(strings.ToUpper(s), "WHEN"); i >= 0 {
+			s = strings.TrimSpace(s[:i])
+		}
 	}
 	when = whenRaw
 
@@ -326,6 +338,23 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		return res, true, err
 	}
 
+	// SHOW QUERY VARS —— WHEN 监测变量当前值（v1.0.9；含服务器级 DISK_MBPS）
+	if reShowQVars.MatchString(s) {
+		if h.async == nil {
+			return nil, true, mysql.NewError(1235, "async query is disabled")
+		}
+		var rows [][]any
+		for _, v := range h.async.Vars() {
+			var val any
+			if v.Value >= 0 { // <0 = 尚无有效样本（首采只建基线）
+				val = math.Round(v.Value*100) / 100
+			}
+			rows = append(rows, []any{v.Name, val, v.Level, v.Desc})
+		}
+		res, err := meta.SimpleRS([]string{"Variable_name", "Value", "Level", "Description"}, rows)
+		return res, true, err
+	}
+
 	// SHOW QUERY JOBS / query_jobs 表
 	if reShowJobs.MatchString(s) || reJobsTable.MatchString(s) {
 		if h.async == nil {
@@ -379,6 +408,9 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		if h.async == nil {
 			return nil, true, mysql.NewError(1235, "async query is disabled")
 		}
+		if h.readonly {
+			return nil, true, roErr()
+		}
 		if err := h.async.Cancel(m[1]); err != nil {
 			return nil, true, mysql.NewError(1105, err.Error())
 		}
@@ -388,6 +420,9 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 	if m := reDropJob.FindStringSubmatch(s); m != nil {
 		if h.async == nil {
 			return nil, true, mysql.NewError(1235, "async query is disabled")
+		}
+		if h.readonly {
+			return nil, true, roErr()
 		}
 		if err := h.async.Drop(m[1]); err != nil {
 			return nil, true, mysql.NewError(1105, err.Error())

@@ -77,6 +77,15 @@ func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 		raw.Close()
 		return
 	}
+	// 只读账号（v1.0.9）与管理账号同等认证：密码可配置/热改（glacier.json）；
+	// readonly_password 为空 = 禁用只读登录
+	if cfg.Auth.ReadOnlyUser != "" && backend.GetReadonlyPassword() != "" {
+		if err := authHandler.AddUser(cfg.Auth.ReadOnlyUser, backend.GetReadonlyPassword()); err != nil {
+			logx.Errorf("add readonly auth user %s: %v", cfg.Auth.ReadOnlyUser, err)
+			raw.Close()
+			return
+		}
+	}
 	mc, err := srv.NewCustomizedConn(c, authHandler, h)
 	if err != nil {
 		logx.Debugf("handshake with %s failed: %v", remote, err)

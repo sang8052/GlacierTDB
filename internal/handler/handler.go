@@ -31,6 +31,7 @@ type Handler struct {
 	session   *sqlite.Session
 	remote    string
 	readonly  bool
+	user      string // 握手成功后的真实登录账号（glacier / 只读账号）
 	connID     uint64
 	startedAt  time.Time
 	mc         *server.Conn
@@ -63,6 +64,7 @@ func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *a
 		session:    s,
 		remote:     remote,
 		readonly:   cfg.IsReadOnlyUser(cfg.Auth.User),
+		user:       cfg.Auth.User,
 		startedAt:  time.Now(),
 		autocommit: true,
 		registry:   reg,
@@ -72,9 +74,17 @@ func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *a
 
 // BindConn 在 go-mysql 握手完成后回填连接并声明 autocommit 状态位
 //（真 MySQL 每个 OK/EOF 都带 SERVER_STATUS_AUTOCOMMIT，客户端据此判断事务态）。
+// 握手成功后同时回填真实登录账号：只读账号据此进入只读语义（v1.0.9）。
 func (h *Handler) BindConn(mc *server.Conn) {
 	h.mc = mc
 	h.connID = uint64(mc.ConnectionID())
+	if u := mc.GetUser(); u != "" {
+		h.user = u
+		h.readonly = h.cfg.IsReadOnlyUser(u)
+		if h.session != nil {
+			h.session.User = u
+		}
+	}
 	mc.SetStatus(mysql.SERVER_STATUS_AUTOCOMMIT)
 	if h.registry != nil {
 		h.registry.Add(h.connID, h)
@@ -189,7 +199,7 @@ func (h *Handler) auditSQL(start time.Time, query string, res *mysql.Result, err
 	rec := map[string]any{
 		"ts":       time.Now().Format("2006-01-02 15:04:05.000"),
 		"conn":     h.connID,
-		"user":     h.cfg.Auth.User,
+		"user":     h.user,
 		"remote":   h.remote,
 		"db":       h.session.CurrentDB(),
 		"admin":    admin,
@@ -295,7 +305,7 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 			}
 			return h.session.CurrentDB()
 		}(),
-		User:    h.cfg.Auth.User,
+		User:    h.user,
 		Version: h.cfg.ServerVersion,
 		ConnID:  h.connID,
 		Remote:  h.remote,
@@ -327,11 +337,12 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 
 	// 2b) 管理面：未匹配管理命令的普通 SQL 一律拒绝（管理命令已在探活前拦截）
 	if h.adminMode {
-		return nil, mysql.NewError(1064, "GlacierTDB is the admin database; supported: SHOW SERVER CONFIG / SHOW CLIENTS / SHOW TRANSACTIONS / SET PASSWORD='new' / SET GLOBAL_THREADS=n / SET PER_DB_READ_THREADS=n / SET DB_READ_THREADS db=n / KILL <id>, or USE <db> to exit")
+		return nil, mysql.NewError(1064, "GlacierTDB is the admin database; supported: SHOW SERVER CONFIG / SHOW CLIENTS / SHOW TRANSACTIONS / SET PASSWORD[ FOR user]='new' / SET GLOBAL_THREADS=n / SET PER_DB_READ_THREADS=n / SET DB_READ_THREADS db=n / KILL <id>, or USE <db> to exit")
 	}
 
-	// 3) 方言改写
-	sq := meta.RewriteDialect(meta.RewriteLastInsertID(s))
+	// 3) 方言改写（先把 MySQL 转义序列的字面量还原为 SQLite 语义——
+	//    pymysql 等客户端把 " 转义为 \" 发送，SQLite 不处理反斜杠会原样落盘）
+	sq := meta.RewriteDialect(meta.RewriteLastInsertID(meta.UnescapeLiterals(s)))
 
 	// 4) 文本协议占位符拒绝：真 MySQL 对 select $$ / select ? 报 1064，
 	//    SQLite 却会按未绑定参数执行返回 NULL 结果集，客户端消费失步

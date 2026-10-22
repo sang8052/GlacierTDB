@@ -50,7 +50,8 @@ type Backend struct {
 	sessionSeq atomic.Uint64
 
 	authMu       sync.RWMutex
-	authPassword string // 当前生效密码（可被管理面热改）
+	authPassword string // 管理员账号当前生效密码（可被管理面热改）
+	roPassword   string // 只读账号当前生效密码（可被管理面热改，v1.0.9）
 
 	encrypt    bool
 	passphrase string
@@ -77,6 +78,7 @@ func NewBackend(cfg *config.Config) (*Backend, error) {
 		maxRows:      cfg.SQLite.MaxResultRows,
 		slowMs:       cfg.Log.SlowQueryMs,
 		authPassword: cfg.Auth.Password,
+		roPassword:   cfg.Auth.ReadOnlyPassword,
 		dbLocks:      make(map[string]*sync.Mutex),
 		globalSem:    newDynSem(cfg.Concurrency.GlobalThreads),
 		readGlobal:   newDynSem(cfg.Concurrency.PerDBReadThreads),
@@ -113,6 +115,7 @@ func NewBackend(cfg *config.Config) (*Backend, error) {
 	b.loadAuthOverride() // 管理面改过的密码优先于配置文件
 	b.authMu.RLock()
 	cfg.Auth.Password = b.authPassword
+	cfg.Auth.ReadOnlyPassword = b.roPassword
 	b.authMu.RUnlock()
 	// 确保默认库存在（首次启动自动创建）
 	if err := b.CreateDatabase(cfg.DefaultDB); err != nil {
@@ -412,28 +415,54 @@ func (s *Session) Close() {
 	}
 }
 
-// GetAuthPassword 返回当前生效密码。
+// GetAuthPassword 返回管理员账号当前生效密码。
 func (b *Backend) GetAuthPassword() string {
 	b.authMu.RLock()
 	defer b.authMu.RUnlock()
 	return b.authPassword
 }
 
-// SetAuthPassword 热改密码并持久化到 <db_dir>/glacier.json。
+// GetReadonlyPassword 返回只读账号当前生效密码（v1.0.9）。
+func (b *Backend) GetReadonlyPassword() string {
+	b.authMu.RLock()
+	defer b.authMu.RUnlock()
+	return b.roPassword
+}
+
+// SetAuthPassword 热改管理员密码并持久化到 <db_dir>/glacier.json。
 func (b *Backend) SetAuthPassword(newPwd string) error {
+	b.authMu.Lock()
+	b.authPassword = newPwd
+	b.authMu.Unlock()
+	return b.saveAuthMeta()
+}
+
+// SetReadonlyPassword 热改只读账号密码并持久化（与管理员密码同一 glacier.json）。
+func (b *Backend) SetReadonlyPassword(newPwd string) error {
+	b.authMu.Lock()
+	b.roPassword = newPwd
+	b.authMu.Unlock()
+	return b.saveAuthMeta()
+}
+
+// saveAuthMeta 原子落盘 glacier.json（管理员 + 只读账号密码；
+// readonly_password 为 v1.0.9 新增字段，旧文件缺失时按配置值补写，向后兼容）。
+func (b *Backend) saveAuthMeta() error {
+	b.authMu.RLock()
+	data, err := json.Marshal(map[string]string{
+		"password":          b.authPassword,
+		"readonly_password": b.roPassword,
+	})
+	b.authMu.RUnlock()
+	if err != nil {
+		return err
+	}
 	file := filepath.Join(b.dir, authMetaFile)
-	data := []byte(fmt.Sprintf(`{"password": %q}`, newPwd))
 	tmp := file + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, file); err != nil {
-		return err
-	}
-	b.authMu.Lock()
-	b.authPassword = newPwd
-	b.authMu.Unlock()
-	return nil
+	return os.Rename(tmp, file)
 }
 
 func (b *Backend) loadAuthOverride() {
@@ -442,13 +471,20 @@ func (b *Backend) loadAuthOverride() {
 		return
 	}
 	var m struct {
-		Password string `json:"password"`
+		Password         string  `json:"password"`
+		ReadOnlyPassword *string `json:"readonly_password"` // 指针区分「缺失」与「空串禁用」
 	}
-	if err := json.Unmarshal(data, &m); err == nil && m.Password != "" {
-		b.authMu.Lock()
+	if err := json.Unmarshal(data, &m); err != nil {
+		return
+	}
+	b.authMu.Lock()
+	if m.Password != "" {
 		b.authPassword = m.Password
-		b.authMu.Unlock()
 	}
+	if m.ReadOnlyPassword != nil && *m.ReadOnlyPassword != "" {
+		b.roPassword = *m.ReadOnlyPassword
+	}
+	b.authMu.Unlock()
 }
 
 // HoldsWriteLock 返回会话当前是否持有全局写锁（管理面展示用）。

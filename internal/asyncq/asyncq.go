@@ -29,6 +29,7 @@ import (
 
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/logx"
+	"glaciertdb/internal/meta"
 	"glaciertdb/internal/sqlite"
 )
 
@@ -227,7 +228,7 @@ func (e *Engine) execute(j *Job) {
 	}
 	defer s.Close()
 
-	cols, rows, err := s.Query(j.SQL)
+	cols, rows, err := s.Query(meta.UnescapeLiterals(j.SQL))
 	if err != nil {
 		e.finish(j, StateError, err.Error())
 		return
@@ -457,6 +458,9 @@ func (e *Engine) Get(id string) (Job, bool) {
 	}
 	return *j, true
 }
+
+// Vars 返回 WHEN 监测变量当前快照（SHOW QUERY VARS，v1.0.9）。
+func (e *Engine) Vars() []VarInfo { return e.samp.Snapshot() }
 
 // Fetch 分页读取结果：返回列头 + 行。
 func (e *Engine) Fetch(id string, limit, offset int) ([]string, [][]any, error) {

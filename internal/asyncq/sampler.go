@@ -11,7 +11,8 @@ import (
 )
 
 // Sampler 资源指标异步采样器（Linux /proc）。
-// 指标：CPU（服务器 %）、MEM（服务器可用 %）、APP_CPU（本进程 %）、APP_MEM（本进程 RSS %）、IO_MBPS（本进程写 MB/s）。
+// 指标：CPU（服务器 %）、MEM（服务器已用 %）、DISK_MBPS（服务器磁盘写 MB/s，v1.0.9）、
+// APP_CPU（本进程 %）、APP_MEM（本进程 RSS %）、IO_MBPS（本进程写 MB/s）。
 // 采样周期默认 30s，可调，最低 10s（低于 10 拒绝，回退 10s 并告警）。
 type Sampler struct {
 	mu   sync.RWMutex
@@ -55,14 +56,45 @@ func (s *Sampler) loop() {
 func (s *Sampler) sample() {
 	cpu := readGlobalCPUPct()
 	mem := readGlobalMemPct()
+	disk := readGlobalDiskWriteMBps(s.iv)
 	appCPU, appMem, ioMBps := readAppStats(s.iv)
 	s.mu.Lock()
 	s.m["CPU"] = cpu
 	s.m["MEM"] = mem
+	s.m["DISK_MBPS"] = disk
 	s.m["APP_CPU"] = appCPU
 	s.m["APP_MEM"] = appMem
 	s.m["IO_MBPS"] = ioMBps
 	s.mu.Unlock()
+}
+
+// VarInfo 监测变量快照（SHOW QUERY VARS 展示）。
+type VarInfo struct {
+	Name  string
+	Value float64 // <0 表示尚无有效样本
+	Level string  // 服务器级 / 应用级
+	Desc  string
+}
+
+// varMeta 监测变量元信息（顺序即展示顺序）。
+var varMeta = []struct{ name, level, desc string }{
+	{"CPU", "服务器级", "服务器整机 CPU 占用 %（/proc/stat）"},
+	{"MEM", "服务器级", "服务器内存已用 %（/proc/meminfo）"},
+	{"DISK_MBPS", "服务器级", "服务器磁盘写速率 MB/s（/proc/diskstats 物理盘合计，v1.0.9）"},
+	{"APP_CPU", "应用级", "本网关进程 CPU %（/proc/self/stat）"},
+	{"APP_MEM", "应用级", "本网关进程 RSS / 总内存 %（/proc/self/status）"},
+	{"IO_MBPS", "应用级", "本网关进程写盘速率 MB/s（/proc/self/io）"},
+}
+
+// Snapshot 返回全部监测变量当前值（SHOW QUERY VARS 用）。
+func (s *Sampler) Snapshot() []VarInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]VarInfo, 0, len(varMeta))
+	for _, m := range varMeta {
+		out = append(out, VarInfo{Name: m.name, Value: s.m[m.name], Level: m.level, Desc: m.desc})
+	}
+	return out
 }
 
 // Satisfied 判定 WHEN 表达式（如 "CPU < 70 AND MEM < 80 AND APP_CPU < 50"）。
@@ -113,20 +145,73 @@ var (
 	lastStat  [2]uint64 // /proc/stat 总 jiffies
 	lastSelf  [2]uint64 // /proc/self utime+stime
 	lastWrite uint64
+	lastDiskSectors uint64 // /proc/diskstats 物理盘 sectors written 合计
 )
 
-func readGlobalCPUPct() float64 {
-	f, err := os.Open("/proc/stat")
+// rePhysDisk 物理盘命名（分区带数字后缀不匹配：sda1 / nvme0n1p2 排除）。
+var rePhysDisk = regexp.MustCompile(`^(sd[a-z]+|vd[a-z]+|xvd[a-z]+|hd[a-z]+|nvme\d+n\d+|mmcblk\d+)$`)
+
+// readGlobalDiskWriteMBps 服务器整机磁盘写速率：/proc/diskstats 物理盘
+// sectors written（字段 10，512B/扇区）采样差值。容器内 /proc/diskstats
+// 仍是宿主机视图，反映的是整机而非容器namespace。
+func readGlobalDiskWriteMBps(iv time.Duration) float64 {
+	b, err := os.ReadFile("/proc/diskstats")
 	if err != nil {
 		return -1
 	}
-	defer f.Close()
-	var line string
-	if _, err := fmt.Fscanln(f, &line); err != nil {
+	var sectors uint64
+	for _, ln := range strings.Split(string(b), "\n") {
+		f := strings.Fields(ln)
+		if len(f) < 10 || !rePhysDisk.MatchString(f[2]) {
+			continue
+		}
+		if sw, err := strconv.ParseUint(f[9], 10, 64); err == nil {
+			sectors += sw
+		}
+	}
+	if lastDiskSectors == 0 {
+		if sectors == 0 {
+			return -1
+		}
+		lastDiskSectors = sectors
+		return -1 // 首采只建基线
+	}
+	mbps := float64(sectors-lastDiskSectors) * 512 / 1024 / 1024 / iv.Seconds()
+	lastDiskSectors = sectors
+	if mbps < 0 { // 计数器回绕
+		return 0
+	}
+	return mbps
+}
+
+func readGlobalCPUPct() float64 {
+	b, err := os.ReadFile("/proc/stat")
+	if err != nil {
 		return -1
 	}
-	var user, nice, sys, idle, iowait, irq, softirq, steal uint64
-	_, _ = fmt.Sscanf(line, "cpu %d %d %d %d %d %d %d %d", &user, &nice, &sys, &idle, &iowait, &irq, &softirq, &steal)
+	// 首行 "cpu  user nice sys idle iowait irq softirq steal ..."（多空格分隔）
+	fields := strings.Fields(strings.SplitN(string(b), "\n", 2)[0])
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return -1
+	}
+	// v1.0.9 修复：此前 Fscanln(&line) 按空白分词只读到 "cpu" 一个词，
+	// 后续 Sscanf 全部解析为 0，CPU 恒为 -1（首采基线无法建立）
+	var vals = make([]uint64, len(fields)-1)
+	for i, f := range fields[1:] {
+		v, err := strconv.ParseUint(f, 10, 64)
+		if err != nil {
+			return -1
+		}
+		vals[i] = v
+	}
+	pick := func(i int) uint64 { // 老内核可能缺 iowait/irq/softirq/steal 尾字段
+		if i < len(vals) {
+			return vals[i]
+		}
+		return 0
+	}
+	user, nice, sys, idle := pick(0), pick(1), pick(2), pick(3)
+	iowait, irq, softirq, steal := pick(4), pick(5), pick(6), pick(7)
 	total := user + nice + sys + idle + iowait + irq + softirq + steal
 	busy := total - idle - iowait
 	if lastStat[1] == 0 {

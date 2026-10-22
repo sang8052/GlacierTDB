@@ -14,7 +14,7 @@
 | [docs/时序数据库.md](docs/时序数据库.md) | 时序冷库设计：存储模型、查询改写、rollup 与压缩路线 |
 | [docs/部署运维.md](docs/部署运维.md) | 部署（Docker/裸机/systemd）、升级、备份恢复、监控、故障排查 |
 
-| [FEATURE.md](FEATURE.md) | 后续功能路线（并行查询 / rollup / 异步查询 / MySQL 兼容 / 多机服务冗余） |
+| [FEATURE.md](FEATURE.md) | 后续功能路线（并行查询 / rollup / 异步查询 / MySQL 兼容） |
 | [CHANGELOG.md](CHANGELOG.md) | 更新日志 |
 
 **一句话**：把 SQLite 变成一台"MySQL 服务器"，让现有的 MySQL 客户端、ORM、运维脚本**不改一行配置**就能通过 TCP 远程读写 SQLite；配合时序冷库设计（见[「❄️ 时序冷库设计」](#️-时序冷库设计glaciertdb-路线)），为历史归档与冷数据提供 InfluxDB 级的查询体验。
@@ -221,7 +221,8 @@ concurrency:
 auth:
   user: glacier             # 固定值，配置其他名字会被忽略
   password: "<密码>"         # mysql_native_password，请自行设置强口令
-  readonly_users: []        # 命中则拒绝一切写操作（返回 1290）
+  readonly_user: glacier_ro     # 只读账号（v1.0.9）：同等认证，仅允许查询与查看
+  readonly_password: "<密码>"   # 只读账号密码（空 = 禁用只读登录）；支持管理面热改
 
 sqlite:
   synchronous: NORMAL       # OFF | NORMAL | FULL | EXTRA（持久化强度）
@@ -243,14 +244,14 @@ log:
 
 | 模块 | 说明 |
 | --- | --- |
-| 握手 + 认证 | `mysql_native_password` 单账号（用户名固定 `glacier`），支持只读账号名单，管理面可热改密码并持久化 |
+| 握手 + 认证 | `mysql_native_password` 双账号：管理账号 `glacier`（用户名固定）+ **只读账号 `glacier_ro`（v1.0.9，同等认证，仅查询/查看，写与变更命令 1290 拒绝）**；管理面可分别热改密码并持久化（`SET PASSWORD` / `SET PASSWORD FOR glacier_ro` / `ALTER USER … IDENTIFIED BY`） |
 | 多库管理 | 一个库 = `db_dir` 下一个 `.db` 文件；`SHOW DATABASES` 列出、`USE` 切换后端文件、`CREATE DATABASE` / `DROP DATABASE` 建删文件（库名仅限 `[A-Za-z0-9_-]`）、`SHOW CREATE DATABASE` |
 | 系统库兼容层 | `information_schema`（21 张常用表）/ `mysql.user` / `performance_schema` / `sys` 由网关直接应答（支持列投影与 WHERE 过滤），不透传报错 |
 | 探活应答表 | `SELECT @@version / @@sql_mode / …`、`SHOW TABLES / COLUMNS / INDEX / CREATE TABLE / TABLE STATUS / VARIABLES / ENGINES / COLLATION / CHARSET / PROCESSLIST / TRIGGERS / PROCEDURE STATUS …`、`SET NAMES / SET SESSION`、`DO 0`、`/* ping */`；**未覆盖的 SHOW 变体一律兜底空结果集** |
-| 方言改写 | `NOW()` / `CURDATE()` / `CURTIME()` / `UNIX_TIMESTAMP()` / `LAST_INSERT_ID()` / `TRUNCATE TABLE` / `FROM_UNIXTIME()` / `NOW() ± INTERVAL n UNIT` / `GROUP BY time(N)` / 日期字符串谓词整数化 / `DESC 表` / `库名.表` 前缀剥除；`LIMIT o,n` / `CONCAT` / `IF` / `RAND` / `UUID` / `INSERT IGNORE`；DDL 类型映射（MySQL 建表直接粘贴） |
+| 方言改写 | `NOW()` / `CURDATE()` / `CURTIME()` / `UNIX_TIMESTAMP()` / `LAST_INSERT_ID()` / `TRUNCATE TABLE` / `FROM_UNIXTIME()` / `NOW() ± INTERVAL n UNIT` / `GROUP BY time(N)` / 日期字符串谓词整数化 / `DESC 表` / `库名.表` 前缀剥除；`LIMIT o,n` / `CONCAT` / `IF` / `RAND` / `UUID` / `INSERT IGNORE`；DDL 类型映射（MySQL 建表直接粘贴）；**MySQL 转义序列反转义（v1.0.9）——驱动层转义的字面量（`\"` `\'` `\\` `\n`）进 SQLite 前统一还原，JSON 等文本不再被 `\` 污染** |
 | MySQL 函数（Go 标量，v1.0.8） | `MD5` / `SHA1` / `SHA2` / `SHA256` / `LEFT` / `RIGHT` / `SUBSTRING_INDEX` / `DATEDIFF` / `TIMESTAMPDIFF` / `DATE_FORMAT`——注册进每个后端连接，SELECT/WHERE/UPDATE 任意表达式可用 |
 | 多核并行查询 | hint `/*+ PARALLEL(n) */` 显式触发 + **自动触发**（估算行数 ≥ `parallel_query.scan_rows`，默认 100 万）；单表可合并聚合分片-并行-合并；`EXPLAIN PARALLEL` 查看拆分计划 |
-| 异步查询引擎 | `SUBMIT QUERY` 秒回 job_id；AT 定时 / WINDOW 每日·周几窗口 / WHEN 资源门槛 / EVERY 周期任务；回调四通道（HTTP+HMAC 签名 / TCP 流 / RabbitMQ / Kafka）；**PARTITION BY ROWS/BYTES 分片回调**；结果 JSONL 落盘分页拉取（详见 docs/异步任务.md） |
+| 异步查询引擎 | `SUBMIT QUERY` 秒回 job_id；AT 定时 / WINDOW 每日·周几窗口 / WHEN 资源门槛 / EVERY 周期任务；回调四通道（HTTP+HMAC 签名 / TCP 流 / RabbitMQ / Kafka）；**PARTITION BY ROWS/BYTES 分片回调**；结果 JSONL 落盘分页拉取；**`SHOW QUERY VARS` 查看监测变量当前值（含服务器级磁盘写速率 `DISK_MBPS`，v1.0.9）**（详见 docs/异步任务.md） |
 | 标准 SQL 透传 | `COM_QUERY` → prepare → 逐行 step → 流式发包，大结果集不整体物化 |
 | 并发模型 | 读并发多线程（`global_threads` + `per_db_read_threads` + 按库覆盖）；写单库互斥锁（多库写入并行）；`BEGIN IMMEDIATE` 持锁至 `COMMIT`/`ROLLBACK`/断开 |
 | 事务 | `BEGIN` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `SET AUTOCOMMIT=0` 惰性隐式事务 |
@@ -282,7 +283,7 @@ bash tests/run_all.sh
 
 附加验证项：`BEGIN … INSERT … ROLLBACK` 数据不落盘、10 万行大结果集内存平稳、BLOB 二进制字段往返无损、中文表名 / 列名（反引号）、`information_schema` / `mysql.user` 系统库兼容层、时序改写与索引命中。
 
-**2026-10-20 实测战果（ALL TESTS PASSED）**：mysql:8 CLI ✅ ｜ PyMySQL ✅（utf8mb4 emoji、BLOB 字节级往返、executemany、多库 CREATE/USE/DROP）｜ SQLAlchemy ✅（inspect 反射、事务提交/回滚）｜ 并发 + 多库模型 ✅（**跨库写并行 0.00s / 同库写排队 1.50s**、三级并发配置热改）｜ 时序 ✅（INTERVAL/日期谓词整数化、time(N) 桶化、索引命中）｜ 管理面 21 项 ✅ ｜ **MySQL 兼容 M1+M2 ✅**（LIMIT 双参/CONCAT/IF/RAND/UUID/DDL 类型映射/INSERT IGNORE + MD5/SHA 族/LEFT/RIGHT/SUBSTRING_INDEX/DATEDIFF/TIMESTAMPDIFF/DATE_FORMAT）｜ **多核并行查询 9 项 ✅**（80 万行聚合对拍一致 + EXPLAIN PARALLEL）｜ **异步查询 ✅**（SUBMIT/AT/窗口/WHEN/EVERY/四通道回调+HMAC/分片回调/JSONL 分页拉取）｜ v1.0.7 周期任务/VACUUM/目录锁/静态加密 ✅ ｜ **v1.0.8 共 37 项新增回归 ✅**（空串回读修复、MD5、分片回调、周窗口）。默认监听 **3309**，对外版本 **8.99.999**，登录用户固定 **glacier**。
+**2026-10-22 实测战果（ALL TESTS PASSED）**：mysql:8 CLI ✅ ｜ PyMySQL ✅（utf8mb4 emoji、BLOB 字节级往返、executemany、多库 CREATE/USE/DROP）｜ SQLAlchemy ✅（inspect 反射、事务提交/回滚）｜ 并发 + 多库模型 ✅（**跨库写并行 0.00s / 同库写排队 1.50s**、三级并发配置热改）｜ 时序 ✅（INTERVAL/日期谓词整数化、time(N) 桶化、索引命中）｜ 管理面 21 项 ✅ ｜ **MySQL 兼容 M1+M2 ✅**（LIMIT 双参/CONCAT/IF/RAND/UUID/DDL 类型映射/INSERT IGNORE + MD5/SHA 族/LEFT/RIGHT/SUBSTRING_INDEX/DATEDIFF/TIMESTAMPDIFF/DATE_FORMAT）｜ **多核并行查询 9 项 ✅**（80 万行聚合对拍一致 + EXPLAIN PARALLEL）｜ **异步查询 ✅**（SUBMIT/AT/窗口/WHEN/EVERY/四通道回调+HMAC/分片回调/JSONL 分页拉取）｜ v1.0.7 周期任务/VACUUM/目录锁/静态加密 ✅ ｜ v1.0.8 共 37 项 ✅（空串回读修复、MD5、分片回调、周窗口）｜ **v1.0.9 共 28 项 ✅**（引号转义反转义修复、只读账号 glacier_ro、SHOW QUERY VARS、DISK_MBPS）。默认监听 **3309**，对外版本 **8.99.999**，登录账号 **glacier（管理）/ glacier_ro（只读）**。
 
 ---
 
@@ -310,7 +311,7 @@ bash tests/run_all.sh
 - 单实例部署，SQLite 文件不可被其他进程并发写入；
 - 数据库所在目录必须可写（WAL 需要 `-wal` / `-shm`）；
 - WAL 文件会增长，依赖 SQLite 自动 checkpoint；长期写入且无读者时，可在空闲期执行 `PRAGMA wal_checkpoint(TRUNCATE)`；归档固化后可执行 `PRAGMA journal_mode=DELETE; VACUUM;` 转为单文件再拷贝；
-- 认证为单账户口令比对，无权限模型、无 TLS，适用于**内网可信环境**，不可直接暴露公网。
+- 认证为双账号（管理 `glacier` / 只读 `glacier_ro`）口令比对，无库表级权限模型、无 TLS，适用于**内网可信环境**，不可直接暴露公网。
 
 ---
 

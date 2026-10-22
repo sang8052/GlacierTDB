@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.0.8.alpha"
+const GlacierVersion = "1.0.9.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -58,9 +58,10 @@ type SecOpts struct {
 }
 
 type Auth struct {
-	User          string   `yaml:"user"`
-	Password      string   `yaml:"password"`
-	ReadOnlyUsers []string `yaml:"readonly_users"`
+	User          string `yaml:"user"`
+	Password      string `yaml:"password"`
+	ReadOnlyUser     string `yaml:"readonly_user"`     // 只读账号名（v1.0.9，与管理账号同等认证；空 = glacier_ro）
+	ReadOnlyPassword string `yaml:"readonly_password"` // 只读账号密码（可管理面热改；空 = 禁用只读登录）
 }
 
 type SQLiteOpts struct {
@@ -105,9 +106,10 @@ func Default() *Config {
 		DefaultDB:     "backup",
 		ServerVersion: "8.99.999",
 		Auth: Auth{
-			User:          "glacier",
-			Password:      "iloveyou~",
-			ReadOnlyUsers: []string{},
+			User:             "glacier",
+			Password:         "iloveyou~",
+			ReadOnlyUser:     "glacier_ro",
+			ReadOnlyPassword: "iloveyou~",
 		},
 		MemoryLimitMB:  0,
 		MaxConnections: 64,
@@ -180,6 +182,9 @@ func (c *Config) Fill() {
 	}
 	// 用户名固定为 glacier（管理面约定），配置不一致时以固定值为准
 	c.Auth.User = "glacier"
+	if c.Auth.ReadOnlyUser == "" {
+		c.Auth.ReadOnlyUser = "glacier_ro"
+	}
 	if c.MaxConnections <= 0 {
 		c.MaxConnections = 64
 	}
@@ -240,12 +245,8 @@ func (o SQLiteOpts) SynchronousLevel() int {
 	}
 }
 
-// IsReadOnlyUser 判断用户是否只读账号。
+// IsReadOnlyUser 判断用户是否只读账号（v1.0.9：只读账号同等认证，
+// 仅允许查询与查看；数据面写语句、事务开启与管理面变更命令一律 1290 拒绝）。
 func (c *Config) IsReadOnlyUser(user string) bool {
-	for _, u := range c.Auth.ReadOnlyUsers {
-		if u == user {
-			return true
-		}
-	}
-	return false
+	return c.Auth.ReadOnlyUser != "" && strings.EqualFold(user, c.Auth.ReadOnlyUser)
 }

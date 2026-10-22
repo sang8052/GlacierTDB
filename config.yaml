@@ -15,7 +15,8 @@ max_connections: 64    # 最大并发客户端连接数（超限直接断开）
 auth:
   user: glacier            # 固定值，配置其他名字会被忽略
   password: "changeme"     # mysql_native_password；管理面 SET PASSWORD 热改后以此文件为重启基线
-  readonly_users: []       # 命中则拒绝一切写操作（返回 1290）
+  readonly_user: glacier_ro     # 只读账号（v1.0.9）：同等认证，仅允许查询与管理面查看
+  readonly_password: "changeme" # 只读账号密码；SET PASSWORD FOR glacier_ro='新密码' 热改；空 = 禁用只读登录
 
 sqlite:
   synchronous: NORMAL      # OFF | NORMAL | FULL | EXTRA（持久化强度）

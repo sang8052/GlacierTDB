@@ -3,7 +3,8 @@
 > GlacierTDB 在标准 SQL 透传之外，提供三类系统级 SQL 能力：
 > **管理面私有 SQL**（`USE GlacierTDB`）、**系统库兼容层**（`information_schema` / `mysql` / …）、**探活与兜底**（`SHOW` 家族 / `DESC` / `glacier_version`）。
 >
-> 登录用户名固定为 `glacier`；连接后默认库为配置的 `default_db`（默认 `backup`）。
+> 登录账号：管理账号固定为 `glacier`；另有只读账号（默认 `glacier_ro`，v1.0.9）——同等认证，
+> 仅允许查询与查看（写语句 / 事务 / 管理面变更命令一律 `1290` 拒绝）。连接后默认库为配置的 `default_db`（默认 `backup`）。
 
 ---
 
@@ -33,10 +34,10 @@ SELECT name FROM server_config WHERE name LIKE 'sqlite.%';
 
 | 键 | 说明 |
 | --- | --- |
-| `glacier_version` | GlacierTDB 自身版本（如 `1.0.8.alpha`） |
+| `glacier_version` | GlacierTDB 自身版本（如 `1.0.9.alpha`） |
 | `server` / `server_version` | 产品名 / 对外模拟的 MySQL 协议版本（`8.99.999`） |
 | `listen` / `db_dir` / `default_db` / `databases` | 监听、库目录、默认库、当前库列表 |
-| `auth.user` | 固定为 `glacier` |
+| `auth.user` / `auth.readonly_user` | 管理账号（固定 `glacier`）/ 只读账号名 |
 | `memory_limit_mb` / `max_connections` / `current_connections` | 内存软上限、连接上限、当前连接数 |
 | `concurrency.global_threads` | 全局并发执行上限（0 = 不限） |
 | `concurrency.per_db_read_threads` | 全局默认：单库读并发上限 |
@@ -83,14 +84,19 @@ KILL QUERY <conn_id>;        -- 等价 CONNECTION（不支持只杀语句）
 ### 1.4 修改密码
 
 ```sql
+-- 管理员密码（缺省目标 = glacier 自己）
 SET PASSWORD = '<新密码>';                          -- 推荐
 SET PASSWORD FOR glacier = '<新密码>';
 ALTER USER 'glacier' IDENTIFIED BY '<新密码>';
+
+-- 只读账号密码（v1.0.9，与管理员同等热改/持久化）
+SET PASSWORD FOR glacier_ro = '<新密码>';
+ALTER USER 'glacier_ro' IDENTIFIED BY '<新密码>';
 ```
 
 - **热生效**：新连接立即用新密码，旧密码被拒（1045）；
-- **持久化**：写入 `<db_dir>/glacier.json`，重启后仍以它为准（优先于配置文件 `password`）；
-- 空密码拒绝（1819）。
+- **持久化**：写入 `<db_dir>/glacier.json`（管理员 `password` / 只读 `readonly_password` 两字段），重启后仍以它为准（优先于配置文件）；
+- 空密码拒绝（1819）；只读账号执行本命令返回 `1290`。
 
 ### 1.5 并发配置热改（重启失效）
 
@@ -242,16 +248,20 @@ Go 标量函数（v1.0.8，注册进每个后端连接，任意表达式位置�
 
 语句改写（v1.0.8 M2）：`INSERT IGNORE INTO` → `INSERT OR IGNORE INTO`；`TIMESTAMPDIFF(MONTH, …)` 单位关键字自动字符串化。
 
+**转义还原（v1.0.9）**：MySQL 协议客户端把参数值按 MySQL 规则转义后拼进 SQL 文本（`"` → `\"`、`'` → `\'`、`\` → `\\`、换行 → `\n`），网关在语句进入 SQLite 前对单引号字面量统一做 MySQL→SQLite 还原，文本值（如 JSON 配置）不再被转义序列污染，`WHERE` 等值比较可正常命中；`\%` / `\_`（LIKE 通配符字面量）保留原样。查询、写语句与异步任务执行路径全部覆盖。
+
 ## 6. 快速速查
 
 ```sql
 -- 日常
-SELECT glacier_version;                          -- 1.0.8.alpha
+SELECT glacier_version;                          -- 1.0.9.alpha
 USE GlacierTDB;                                  -- 进管理面
 SHOW CLIENTS;                                    -- 看连接
 SHOW TRANSACTIONS;                               -- 看事务
 KILL 10086;                                      -- 踢人
 SET PASSWORD = 'new-pass';                       -- 改密（热生效）
+SET PASSWORD FOR glacier_ro = 'ro-pass';         -- 改只读账号密码（v1.0.9）
+SHOW QUERY VARS;                                 -- 异步 WHEN 监测变量当前值（v1.0.9）
 SET GLOBAL_THREADS = 64; SET PER_DB_READ_THREADS = 16;
 USE backup;                                      -- 回业务库
 ```

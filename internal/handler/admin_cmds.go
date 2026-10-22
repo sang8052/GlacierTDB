@@ -21,7 +21,7 @@ var (
 	reAdminShowConfig = regexp.MustCompile(`(?i)^SHOW\s+SERVER\s+CONFIG$`)
 	reAdminShowClient = regexp.MustCompile(`(?i)^SHOW\s+CLIENTS$`)
 	reAdminShowTx     = regexp.MustCompile(`(?i)^SHOW\s+TRANSACTIONS$`)
-	reAdminSetPwd     = regexp.MustCompile(`(?i)^(?:SET\s+PASSWORD(?:\s+FOR\s+\S+)?\s*=\s*|ALTER\s+USER\s+\S+\s+IDENTIFIED\s+BY\s+)'([^']{1,64})'\s*$`)
+	reAdminSetPwd     = regexp.MustCompile(`(?i)^(?:SET\s+PASSWORD(?:\s+FOR\s+(\S+?))?\s*=\s*|ALTER\s+USER\s+(\S+?)\s+IDENTIFIED\s+BY\s+)'([^']{1,64})'\s*$`)
 	reAdminSelect     = regexp.MustCompile("(?i)^SELECT\\s+(.+?)\\s+FROM\\s+(server_config|clients|transactions)(?:\\s+WHERE\\s+(.+?))?(?:\\s+ORDER\\s+BY\\s+.+?)?(?:\\s+LIMIT\\s+\\d+(?:\\s*,\\s*\\d+)?)?\\s*$")
 	reKillConn        = regexp.MustCompile(`(?i)^KILL\s+(?:CONNECTION\s+|QUERY\s+)?(\d+)$`)
 	reUseAdmin        = regexp.MustCompile("(?i)^USE\\s+`?(GlacierTDB|glacier)`?\\s*$") // 管理库别名：glacier 为系统内置名，禁止建库
@@ -44,6 +44,9 @@ func (h *Handler) handleVacuumDB(q string) (*mysql.Result, bool, error) {
 	if m == nil {
 		return nil, false, nil
 	}
+	if h.readonly {
+		return nil, true, roErr()
+	}
 	if h.cfg.Maintenance.NoHotVacuum {
 		return nil, true, mysql.NewError(1149,
 			"hot VACUUM disabled (maintenance.no_hot_vacuum); 请停止服务后使用 CLI: glaciertdb -vacuum -db-dir <dir>")
@@ -57,11 +60,14 @@ func (h *Handler) handleVacuumDB(q string) (*mysql.Result, bool, error) {
 	return res, true, err2
 }
 
-// handleKill 处理 KILL <id>（全局生效，不限管理面）。
+// handleKill 处理 KILL <id>（全局生效，不限管理面；只读账号拒绝）。
 func (h *Handler) handleKill(q string) (handled bool, err error) {
 	m := reKillConn.FindStringSubmatch(q)
 	if m == nil {
 		return false, nil
+	}
+	if h.readonly {
+		return true, roErr()
 	}
 	var id uint64
 	fmt.Sscanf(m[1], "%d", &id)
@@ -106,18 +112,38 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		return res, true, err
 
 	case reAdminSetPwd.MatchString(q):
+		if h.readonly {
+			return nil, true, roErr()
+		}
 		m := reAdminSetPwd.FindStringSubmatch(q)
-		newPwd := m[1]
+		newPwd := m[3]
 		if strings.TrimSpace(newPwd) == "" {
 			return nil, true, mysql.NewError(1819, "Your password does not satisfy the current policy requirements (empty)")
 		}
-		if err := h.backend.SetAuthPassword(newPwd); err != nil {
+		// 目标账号：SET PASSWORD FOR <user> / ALTER USER <user>（缺省 = 管理员自己）；
+		// 命中只读账号名则改只读密码（v1.0.9：与管理员密码同等热改、同一 glacier.json 持久化）
+		target := m[1]
+		if target == "" {
+			target = m[2]
+		}
+		var err error
+		whom := "admin"
+		if target != "" && h.cfg.IsReadOnlyUser(target) {
+			err = h.backend.SetReadonlyPassword(newPwd)
+			whom = target + " (readonly)"
+		} else {
+			err = h.backend.SetAuthPassword(newPwd)
+		}
+		if err != nil {
 			return nil, true, mysql.NewError(1105, "persist password failed: "+err.Error())
 		}
-		logx.Infof("auth password changed via admin command (by conn %d)", h.connID)
+		logx.Infof("auth password changed for %s via admin command (by conn %d)", whom, h.connID)
 		return meta.OKResultPub(), true, nil
 
 	case reAdminSetConc.MatchString(q):
+		if h.readonly {
+			return nil, true, roErr()
+		}
 		// 并发配置热改（仅内存生效，重启失效回到配置文件值）
 		m := reAdminSetConc.FindStringSubmatch(q)
 		val := 0
@@ -194,6 +220,7 @@ func (h *Handler) serverConfigRows() [][]any {
 		{"default_db", cfg.DefaultDB},
 		{"databases", strings.Join(dbNames, ",")},
 		{"auth.user", cfg.Auth.User},
+		{"auth.readonly_user", cfg.Auth.ReadOnlyUser},
 		{"memory_limit_mb", fmt.Sprintf("%d", cfg.MemoryLimitMB)},
 		{"max_connections", fmt.Sprintf("%d", cfg.MaxConnections)},
 		{"current_connections", fmt.Sprintf("%d", h.registry.Count())},
@@ -281,7 +308,7 @@ func (h *Handler) Snapshot() admin.ConnInfo {
 	defer h.mu.Unlock()
 	info := admin.ConnInfo{
 		ID:               h.connID,
-		User:             h.cfg.Auth.User,
+		User:             h.user,
 		Remote:           h.remote,
 		DB:               "GlacierTDB",
 		AdminMode:        h.adminMode,
