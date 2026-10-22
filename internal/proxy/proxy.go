@@ -15,11 +15,12 @@ import (
 	"glaciertdb/internal/handler"
 	"glaciertdb/internal/logx"
 	"glaciertdb/internal/meta"
+	"glaciertdb/internal/s3"
 	"glaciertdb/internal/sqlite"
 )
 
-// Run 阻塞监听并服务连接。
-func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store) error {
+// Run 阻塞监听并服务连接（s3store / s3srv 可为 nil：对象存储模块关闭）。
+func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store *s3.Store, s3srv *s3.Server) error {
 	meta.MapSQLError = handler.MapSQLiteErr
 
 	reg := admin.NewRegistry()
@@ -45,12 +46,12 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store) error {
 			logx.Errorf("accept: %v", err)
 			continue
 		}
-		go handleConn(srv, c, cfg, backend, reg, aq, store)
+		go handleConn(srv, c, cfg, backend, reg, aq, store, s3store, s3srv)
 	}
 }
 
 func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *sqlite.Backend,
-	reg *admin.Registry, aq *asyncq.Engine, store *auth.Store) {
+	reg *admin.Registry, aq *asyncq.Engine, store *auth.Store, s3store *s3.Store, s3srv *s3.Server) {
 	remote := raw.RemoteAddr().String()
 	logx.Debugf("new connection from %s", remote)
 	// 初始握手包的 status 位默认 0（无 AUTOCOMMIT），会导致 pymysql/SQLAlchemy
@@ -64,7 +65,7 @@ func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 		return
 	}
 
-	h, err := handler.New(backend, cfg, remote, cfg.DefaultDB, reg, aq, store)
+	h, err := handler.New(backend, cfg, remote, cfg.DefaultDB, reg, aq, store, s3store, s3srv)
 	if err != nil {
 		logx.Errorf("open sqlite session for %s: %v", remote, err)
 		raw.Close()

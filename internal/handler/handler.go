@@ -22,6 +22,7 @@ import (
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/logx"
 	"glaciertdb/internal/meta"
+	"glaciertdb/internal/s3"
 	"glaciertdb/internal/sqlite"
 )
 
@@ -42,6 +43,8 @@ type Handler struct {
 
 	registry   *admin.Registry
 	async      *asyncq.Engine
+	s3store    *s3.Store  // 对象存储系统库（v1.1.0；nil = 模块关闭）
+	s3srv      *s3.Server // 对象存储服务（证书刷新用）
 	adminMode  bool     // USE GlacierTDB 后进入管理面
 	lastQuery  string   // 最近一条语句（管理面展示）
 	txStartedAt time.Time // 当前事务开启时刻
@@ -56,7 +59,8 @@ var reExplainParallel = regexp.MustCompile(`(?is)^EXPLAIN\s+PARALLEL\s+(.+)$`)
 var _ meta.Querier = (*sqlite.Session)(nil)
 
 // New 创建连接级 handler（连到 defaultDB）。
-func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *admin.Registry, aq *asyncq.Engine, as *auth.Store) (*Handler, error) {
+func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *admin.Registry, aq *asyncq.Engine,
+	as *auth.Store, s3s *s3.Store, s3srv *s3.Server) (*Handler, error) {
 	s, err := b.OpenSession(cfg.Auth.User, remote, defaultDB)
 	if err != nil {
 		return nil, err
@@ -73,6 +77,8 @@ func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *a
 		autocommit: true,
 		registry:   reg,
 		async:      aq,
+		s3store:    s3s,
+		s3srv:      s3srv,
 	}
 	if as != nil {
 		h.userType = as.UserType(cfg.Auth.User)
@@ -364,7 +370,7 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 
 	// 2b) 管理面：未匹配管理命令的普通 SQL 一律拒绝（管理命令已在探活前拦截）
 	if h.adminMode {
-		return nil, mysql.NewError(1064, "GlacierTDB is the admin database; supported: SHOW SERVER CONFIG / SHOW CLIENTS / SHOW TRANSACTIONS / SET PASSWORD[ FOR user]='new' / SET GLOBAL_THREADS=n / SET PER_DB_READ_THREADS=n / SET DB_READ_THREADS db=n / SET QOS ... / SHOW QOS / SHOW QUERY SCHEDULE / SHOW LOGIN ATTEMPTS / SHOW LOCKED / KILL <id>, or USE <db> to exit")
+		return nil, mysql.NewError(1064, "GlacierTDB is the admin database; supported: SHOW SERVER CONFIG / SHOW CLIENTS / SHOW TRANSACTIONS / SET PASSWORD[ FOR user]='new' / SET GLOBAL_THREADS=n / SET PER_DB_READ_THREADS=n / SET DB_READ_THREADS db=n / SET QOS ... / SHOW QOS / SHOW QUERY SCHEDULE / SHOW LOGIN ATTEMPTS / SHOW LOCKED / S3 管理（CREATE BUCKET / CREATE S3 KEY / SHOW S3 ...，详见 docs/系统SQL.md）/ KILL <id>, or USE <db> to exit")
 	}
 
 	// 2c) 权限校验（v1.0.10：普通用户按系统库 user_grants 授权；super/readonly 不走此层）

@@ -2,6 +2,26 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.1.0.alpha] - 2026-10-23
+
+### 新增
+- **兼容 S3 的对象存储（可选模块，`s3.enable: true`）**：AWS Signature **V4** 标准签名鉴权（表头鉴权 + 预签名 URL + `aws-chunked` 流式负载解码，负载哈希 `BadDigest` 校验），独立 HTTP(S) 监听器（默认 `0.0.0.0:9000`，不进 3309 复用）；支持 PUT / GET / HEAD / DELETE 对象、`x-amz-copy-source` 复制、ListObjects V1/V2（prefix / delimiter / 分页）、ListObjectVersions、建桶 / 删桶 / HEAD 桶、GetBucketLocation / GetBucketVersioning / PutBucketVersioning；错误码对齐 AWS XML（`NoSuchKey` / `NoSuchBucket` / `SignatureDoesNotMatch` / `InvalidAccessKeyId` / `AccessDenied` / `BucketNotEmpty` / `EntityTooLarge` / `SlowDown` 等）。
+- **存储模型（一 bucket 一表）**：系统库 `<db_dir>/glacier_s3.db`（不对客户端暴露）——`s3_buckets` / `s3_keys` / `s3_usage` / `s3_lifecycle` / `s3_domains` / `s3_policies` + 每桶一张对象表（元数据 + 内联内容）与分块表（超过 `inline_max_kb` 阈值的内容按 `chunk_kb` 分块）；对象元数据齐全（key / 版本 / ETag(MD5) / Content-Type / Cache-Control / Content-Disposition / `x-amz-meta-*` 自定义元数据）；桶从属用户（`bucket → owner`），命名空间隔离（super 用户跨桶放行）。
+- **AK/SK 密钥体系**：一用户可配多组密钥；**AK 32 位（前缀 `AS`）、SK 48 位（前缀 `SK`）**；`CREATE S3 KEY [FOR u]` 签发 / `RENEW S3 KEY` 轮换 / `DISABLE`·`ENABLE` 禁用启用 / `DROP S3 KEY` 吊销——**SK 明文仅签发 / 轮换时返回一次**，落表存 SHA-256 指纹 + AES-256-GCM 密文（SigV4 需可还原 SK 派生签名密钥；加密主密钥 `<db_dir>/glacier_s3.key` 首启自动生成 0600）。
+- **下载限速**：单连接 bytes/s 限速、单用户并发连接上限、**多线程合并限速**（用户级总带宽令牌桶聚合，多连接合计不超过用户总带宽）；`s3.limits` 全局配置 + `s3.bucket_limits` 按桶覆盖 + 管理面 `ALTER BUCKET <b> LIMIT CONN_BPS|USER_BPS|USER_CONNS = n` 行级热改；超并发返回 503 `SlowDown`。
+- **请求策略条件（参考阿里云 OSS policy）**：密钥级 / 桶级策略 JSON 绑定 **UA / 来源 IP（精确·CIDR·前缀%）/ Referer / 自定义 header / HTTP 方法**条件，AND 语义全部满足才放行，不满足 403 `AccessDenied`；`SET S3 POLICY (KEY <ak>|BUCKET <b>) '<json>'` / `CLEAR S3 POLICY ...` / `SHOW S3 POLICIES`。
+- **上传回调**：对象写入完成后 POST JSON（event / bucket / key / version_id / size / etag / content_type），**HMAC-SHA256 签名**（`X-Glacier-Signature: sha256=...`）+ 退避重试（0/1s/5s/15s）；`SET S3 CALLBACK <bucket> URL '<url>' [SECRET '<s>']` / `CLEAR S3 CALLBACK`。
+- **图片预处理**：GET 查询参数 `x-gimg-crop=左,上,宽,高` / `x-gimg-resize=宽,高`（0=等比）/ `x-gimg-format=jpeg|png` / `x-gimg-quality=n` / `x-gimg=base64`（含 data URL 形式）；**base64 图片直传**（`?x-gimg=base64` 上传解码后二进制落盘）；双线性缩放纯手写、无外部依赖（解码 JPEG/PNG/GIF，编码 JPEG/PNG）。
+- **多版本 / 对象锁 / 生命周期**：桶级 `VERSIONING ON` 版本链（每次 PUT 新版本号、DELETE 打删除标记、`?versionId=` 取历史版本、ListObjectVersions 列版本链）；**对象锁 WORM**——`S3 RETAIN <bucket>/<key> UNTIL '<date>' (COMPLIANCE|GOVERNANCE)`（GOVERNANCE 可用 `x-amz-bypass-governance-retention: true` 旁路，COMPLIANCE 不可）+ `S3 LEGAL_HOLD <bucket>/<key> ON|OFF`，保护期内删除 / 覆盖写一律 403；**生命周期自动删除**（`SET S3 LIFECYCLE <bucket> PREFIX '<p>' DAYS <n>`，按天数 + 前缀到期删除全部版本，后台周期扫描）。
+- **region 与寻址**：`region: '*'` / 空 = 客户端任意 region 或不传均可，具体 region 则签名 scope 必须一致；**virtual-host 模式**（`http(s)://{bucket}[.{region}].{endpoint}`，region 非空时可带 region 段）+ path-style 兼容保留；多 endpoint / 多端口（HTTP 与 HTTPS 独立监听）。
+- **TLS 证书能力**：每 endpoint 一张泛域名证书（SNI 兜底）；**每 bucket 可配自定义域名 + 独立证书**（`ALTER BUCKET <b> ADD DOMAIN '<host>' ISSUE` 自签发接入即用 / `CERT FILE '<pem>' KEY FILE '<key>' 上传证书`，SAN 映射 bucket）；证书**热加载**（文件 mtime 变化即重载，替换即生效）。
+- **计费统计（`s3_usage`）**：按 用户 × bucket 记账——请求数（GET/PUT/LIST/DELETE 分类）、上传 / 下载字节、存储空间占用、对象数；`SELECT * FROM s3_usage WHERE owner='u'` / `SHOW S3 USAGE [FOR u]` SQL 直查；**导出接口**：`EXPORT S3 USAGE [TO '<file>']`（落 `<db_dir>/exports/`）+ HTTP `GET /_glacier/s3/usage?format=json|csv`（SigV4 鉴权，超管可拉全量、普通用户仅自己）。
+- **管理面 SQL（USE GlacierTDB）**：`CREATE BUCKET` / `DROP BUCKET [FORCE]` / `SHOW BUCKETS` / `ALTER BUCKET ...`（VERSIONING / OBJECT_LOCK / OWNER / LIMIT / ADD·DROP DOMAIN）/ `SHOW S3 KEYS|USAGE|LIFECYCLE|DOMAINS|POLICIES|OBJECTS` / `SELECT * FROM s3_usage|s3_buckets|s3_keys|s3_lifecycle|s3_domains`；变更命令仅超级用户；`tests/test_s3.py` 新增 69 项。
+
+### 变更
+- `config.yaml` 新增 `s3` 段（默认 `enable: false` 关闭，其余均可省略走默认）；系统库新增 `glacier_s3.db`（与 `glacier_auth.db` 同样不对客户端暴露、禁 CREATE/DROP）。
+- `tests/run_all.sh` 纳入 `test_s3.py`；全套回归 ALL TESTS PASSED（15 个测试脚本）。
+
 ## [1.0.10.alpha] - 2026-10-22
 
 ### 新增

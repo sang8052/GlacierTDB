@@ -12,6 +12,7 @@ import (
 
 	"glaciertdb/internal/auth"
 	"glaciertdb/internal/dirlock"
+	"glaciertdb/internal/s3"
 	"runtime"
 	"runtime/debug"
 	"syscall"
@@ -131,6 +132,24 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 对象存储（v1.1.0，可选模块）：s3.enable 开启时启动独立 HTTP(S) 监听器
+	//（默认 0.0.0.0:9000，AWS Signature V4；管理面 SQL 同步可用）
+	var s3store *s3.Store
+	var s3srv *s3.Server
+	if cfg.S3.Enable {
+		s3store, err = s3.Open(backend, cfg)
+		if err != nil {
+			logx.Errorf("init s3 store: %v", err)
+			os.Exit(1)
+		}
+		s3srv = s3.NewServer(cfg, s3store, authStore)
+		if err := s3srv.Start(); err != nil {
+			logx.Errorf("start s3 server: %v", err)
+			os.Exit(1)
+		}
+		logx.Infof("s3 object storage enabled: region=%q endpoints=%d", cfg.S3.Region, len(cfg.S3.Endpoints))
+	}
+
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -139,7 +158,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if err := proxy.Run(cfg, backend, authStore); err != nil {
+	if err := proxy.Run(cfg, backend, authStore, s3store, s3srv); err != nil {
 		logx.Errorf("listen %s: %v", cfg.Listen, err)
 		os.Exit(1)
 	}

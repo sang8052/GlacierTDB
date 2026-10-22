@@ -30,6 +30,9 @@ const authMetaFile = "glacier.json"
 // SystemAuthDB 用户权限系统库文件名（v1.0.10：glacier_auth.db，不对客户端暴露）。
 const SystemAuthDB = "glacier_auth"
 
+// SystemS3DB 对象存储系统库文件名（v1.1.0：glacier_s3.db，一 bucket 一表，不对客户端暴露）。
+const SystemS3DB = "glacier_s3"
+
 // 合法库名：字母数字下划线连字符（防路径穿越）
 var reDBName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
@@ -230,7 +233,7 @@ func (b *Backend) ListDatabases() []string {
 		name := e.Name()
 		if strings.HasSuffix(name, ".db") {
 			db := strings.TrimSuffix(name, ".db")
-			if db == SystemAuthDB {
+			if db == SystemAuthDB || db == SystemS3DB {
 				continue
 			}
 			out = append(out, db)
@@ -246,14 +249,31 @@ func (b *Backend) OpenSystemDB() (*sql.DB, error) {
 	return b.openFileRetry(b.fileFor(SystemAuthDB), 2)
 }
 
+// OpenS3DB 打开对象存储系统库（glacier_s3.db，v1.1.0），供 s3 包使用。
+// 对象存储需并发读 + 流式取内容，物理连接池放宽到 4（写仍由 s3.Store 串行化）。
+func (b *Backend) OpenS3DB() (*sql.DB, error) {
+	db, err := b.openFileRetry(b.fileFor(SystemS3DB), 2)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	return db, nil
+}
+
+// isSystemDB 判断是否系统内置库（不对客户端暴露、禁止 CREATE/DROP）。
+func isSystemDB(name string) bool {
+	return name == SystemAuthDB || name == SystemS3DB
+}
+
 // CreateDatabase 创建一个库（空 .db 文件，应用 WAL）。
 // glacier 为系统内置库名（管理面别名），glacier_auth 为系统库，均不允许创建。
 func (b *Backend) CreateDatabase(name string) error {
 	if strings.EqualFold(name, "glacier") {
 		return fmt.Errorf("database name 'glacier' is reserved for the built-in admin database")
 	}
-	if name == SystemAuthDB {
-		return fmt.Errorf("database name '%s' is reserved for the built-in auth database", SystemAuthDB)
+	if isSystemDB(name) {
+		return fmt.Errorf("database name '%s' is reserved for the built-in system database", name)
 	}
 	if !reDBName.MatchString(name) {
 		return fmt.Errorf("invalid database name %q", name)
@@ -280,8 +300,8 @@ func (b *Backend) DropDatabase(name string) error {
 	if !reDBName.MatchString(name) {
 		return fmt.Errorf("invalid database name %q", name)
 	}
-	if name == SystemAuthDB {
-		return fmt.Errorf("database name '%s' is reserved for the built-in auth database", SystemAuthDB)
+	if isSystemDB(name) {
+		return fmt.Errorf("database name '%s' is reserved for the built-in system database", name)
 	}
 	file := b.fileFor(name)
 	for _, f := range []string{file, file + "-wal", file + "-shm"} {

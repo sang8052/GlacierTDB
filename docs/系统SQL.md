@@ -168,6 +168,63 @@ SELECT glacier_version;               -- GlacierTDB 自身版本（≠ @@version
 KILL <conn_id>;                       -- 见 1.3
 ```
 
+### 1.10 S3 对象存储管理（v1.1.0；模块开启 s3.enable 后可用）
+
+详见 [S3对象存储.md](S3对象存储.md)。变更命令仅超级用户（只读 1290 / 普通用户 1142），
+SHOW 与表查询所有管理面用户可看。
+
+```sql
+-- ---- 桶 ----
+CREATE BUCKET <name> [OWNER '<u>'] [REGION '<r>'] [VERSIONING ON|OFF] [OBJECT_LOCK ON|OFF];
+DROP BUCKET <name> [FORCE];           -- 非空拒绝（1051）；FORCE 连内容强删
+SHOW BUCKETS;                         -- bucket/owner/region/versioning/objects/storage_bytes/...
+ALTER BUCKET <b> VERSIONING ON|OFF;
+ALTER BUCKET <b> OBJECT_LOCK ON|OFF;
+ALTER BUCKET <b> OWNER '<u>';
+ALTER BUCKET <b> LIMIT (CONN_BPS|USER_BPS|USER_CONNS) = <n>;   -- 限速热改（0=不限）
+
+-- ---- AK/SK 密钥（SK 明文仅签发/轮换时返回一次）----
+CREATE S3 KEY [FOR '<u>'];            -- 返回 AK(32位 AS 前缀) + SK(48位 SK 前缀)
+RENEW S3 KEY '<ak>';                  -- 轮换 SK
+DISABLE S3 KEY '<ak>';  ENABLE S3 KEY '<ak>';  DROP S3 KEY '<ak>';
+SHOW S3 KEYS [FOR '<u>'];             -- 不含 SK 明文（仅指纹）
+
+-- ---- 请求策略条件（UA / IP / Referer / 自定义 header / 方法，AND 语义）----
+SET S3 POLICY KEY '<ak>' '{"ua":"app/*","ip":["192.168.0.0/16"],"headers":{"x-app":"iot"}}';
+SET S3 POLICY BUCKET '<b>' '<json>';
+CLEAR S3 POLICY KEY '<ak>';  CLEAR S3 POLICY BUCKET '<b>';
+SHOW S3 POLICIES;
+
+-- ---- 上传回调（HMAC 签名 + 退避重试）----
+SET S3 CALLBACK <b> URL 'http://app:8080/hook' [SECRET '<s>'];
+CLEAR S3 CALLBACK <b>;
+
+-- ---- 生命周期（按天数 + 前缀到期删除全部版本）----
+SET S3 LIFECYCLE <b> PREFIX '<p>' DAYS <n>;
+CLEAR S3 LIFECYCLE <b> [PREFIX '<p>'];
+SHOW S3 LIFECYCLE [<b>];
+
+-- ---- 自定义域名 + 独立证书（SNI 分发、热加载）----
+ALTER BUCKET <b> ADD DOMAIN '<host>' ISSUE;                       -- 自签发
+ALTER BUCKET <b> ADD DOMAIN '<host>' CERT FILE '<pem>' KEY FILE '<key>';
+ALTER BUCKET <b> DROP DOMAIN '<host>';
+SHOW S3 DOMAINS;
+
+-- ---- 对象锁（WORM）----
+S3 RETAIN <bucket>/<key> UNTIL '<YYYY-MM-DD[ HH:MM:SS]>' (COMPLIANCE|GOVERNANCE) [VERSION '<v>'];
+S3 LEGAL_HOLD <bucket>/<key> (ON|OFF) [VERSION '<v>'];
+
+-- ---- 用量 / 对象查看 ----
+SHOW S3 USAGE [FOR '<u>'];
+EXPORT S3 USAGE [FOR '<u>'] [TO 'usage.csv'];   -- 落 <db_dir>/exports/（HTTP 导出接口见 S3 手册 §11）
+SHOW S3 OBJECTS <b> [LIKE '<prefix>'] [LIMIT <n>];
+
+-- ---- 表形式（支持 WHERE）----
+SELECT * FROM s3_usage WHERE owner='glacier';
+SELECT * FROM s3_buckets;  SELECT * FROM s3_keys;
+SELECT * FROM s3_lifecycle;  SELECT * FROM s3_domains;
+```
+
 ---
 
 ## 2. 系统库兼容层

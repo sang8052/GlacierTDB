@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.0.10.alpha"
+const GlacierVersion = "1.1.0.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -80,6 +80,38 @@ type LockOpts struct {
 	NotifySecret    string `yaml:"notify_secret"`        // 告警 HMAC 签名密钥（可空）
 }
 
+// S3Endpoint 单个 S3 监听端点（HTTP 或 HTTPS 独立端口，v1.1.0）。
+type S3Endpoint struct {
+	Listen      string   `yaml:"listen"`       // 监听地址，如 0.0.0.0:9000
+	TLS         bool     `yaml:"tls"`          // true = HTTPS（独立 TLS 监听器）
+	CertFile    string   `yaml:"cert_file"`    // 端点泛域名证书（PEM，SNI 兜底证书）
+	KeyFile     string   `yaml:"key_file"`     // 端点证书私钥（PEM）
+	ServerNames []string `yaml:"server_names"` // 客户端访问主机名（virtual-host 后缀，如 s3.example.com）
+}
+
+// S3Limit 限速 / 并发配额（0 = 不限；v1.1.0）。
+type S3Limit struct {
+	PerConnBps   int64 `yaml:"per_conn_bps"`   // 单连接下载限速（bytes/s）
+	PerUserBps   int64 `yaml:"per_user_bps"`   // 单用户总带宽（多连接合并聚合限速）
+	PerUserConns int   `yaml:"per_user_conns"` // 单用户并发连接上限
+}
+
+// S3Opts 兼容 S3 的对象存储（v1.1.0，可选模块）：AWS Signature V4，
+// 独立 HTTP(S) 监听器（不进 3309 复用），一个 bucket 一张表存于系统库。
+type S3Opts struct {
+	Enable    bool           `yaml:"enable"`    // 可选功能开关（默认关）
+	Region    string         `yaml:"region"`    // 空 = 不校验 | 具体 region | '*' = 任意
+	Endpoints []S3Endpoint   `yaml:"endpoints"` // 多 endpoint（默认 0.0.0.0:9000）
+	MaxObjectMB     int      `yaml:"max_object_mb"`          // 单对象字节上限（MB）
+	InlineMaxKB     int      `yaml:"inline_max_kb"`          // 内联存储阈值（超过走分块表）
+	ChunkKB         int      `yaml:"chunk_kb"`               // 分块表块大小
+	DefaultOwner    string   `yaml:"default_owner"`          // 建桶/签发密钥未指定属主时的默认用户
+	Limits          S3Limit  `yaml:"limits"`                 // 全局限速 / 并发
+	BucketLimits    map[string]S3Limit `yaml:"bucket_limits"` // 按 bucket 覆盖（字段非 0 生效）
+	LifecycleIntervalSec int `yaml:"lifecycle_interval_sec"` // 生命周期（自动删除）扫描周期
+	CallbackSecret  string   `yaml:"callback_secret"`        // 上传回调默认 HMAC 签名密钥
+}
+
 // SecOpts 静态加密（adiantum VFS，4KiB 块加密，防外部程序直接读底层文件）。
 type SecOpts struct {
 	Encrypt    bool   `yaml:"encrypt"`    // 首次启用要求空目录或已有加密库
@@ -124,6 +156,7 @@ type Config struct {
 	Security      SecOpts      `yaml:"security"`
 	Qos           QosOpts      `yaml:"qos"`
 	Lock          LockOpts     `yaml:"lock"`
+	S3            S3Opts       `yaml:"s3"`
 
 	Auth   Auth       `yaml:"auth"`
 	SQLite SQLiteOpts `yaml:"sqlite"`
@@ -172,6 +205,12 @@ func Default() *Config {
 			LockSec:         900,
 			LockSecMax:      86400,
 			Firewall:        "auto",
+		},
+		S3: S3Opts{
+			Enable:   false,
+			Region:   "*",
+			Endpoints: []S3Endpoint{{Listen: "0.0.0.0:9000"}},
+			BucketLimits: map[string]S3Limit{},
 		},
 		SQLite: SQLiteOpts{
 			Synchronous:   "NORMAL",
@@ -310,6 +349,41 @@ func (c *Config) Fill() {
 	}
 	if c.Lock.LockSecMax < c.Lock.LockSec {
 		c.Lock.LockSecMax = 86400
+	}
+	// S3 对象存储（v1.1.0）
+	if c.S3.Enable {
+		if len(c.S3.Endpoints) == 0 {
+			c.S3.Endpoints = []S3Endpoint{{Listen: "0.0.0.0:9000"}}
+		}
+		for i := range c.S3.Endpoints {
+			if c.S3.Endpoints[i].Listen == "" {
+				c.S3.Endpoints[i].Listen = "0.0.0.0:9000"
+			}
+		}
+		if c.S3.Region == "" {
+			c.S3.Region = "*" // 默认任意 region（客户端可传可不传）
+		}
+		if c.S3.MaxObjectMB <= 0 {
+			c.S3.MaxObjectMB = 512
+		}
+		if c.S3.InlineMaxKB <= 0 {
+			c.S3.InlineMaxKB = 64
+		}
+		if c.S3.ChunkKB <= 0 {
+			c.S3.ChunkKB = 256
+		}
+		if c.S3.DefaultOwner == "" {
+			c.S3.DefaultOwner = "glacier"
+		}
+		if c.S3.BucketLimits == nil {
+			c.S3.BucketLimits = map[string]S3Limit{}
+		}
+		if c.S3.LifecycleIntervalSec <= 0 {
+			c.S3.LifecycleIntervalSec = 3600
+		}
+		if c.S3.LifecycleIntervalSec < 60 {
+			c.S3.LifecycleIntervalSec = 60
+		}
 	}
 }
 

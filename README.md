@@ -14,6 +14,7 @@
 | [docs/系统SQL.md](docs/系统SQL.md) | 系统 SQL 手册：管理面私有 SQL、系统库兼容层、SHOW 兜底 |
 | [docs/异步任务.md](docs/异步任务.md) | 异步任务手册：SUBMIT 全量语法、任务类型、回调协议、分片与示例 |
 | [docs/时序数据库.md](docs/时序数据库.md) | 时序冷库设计：存储模型、查询改写、rollup 与压缩路线 |
+| [docs/S3对象存储.md](docs/S3对象存储.md) | S3 对象存储手册：SigV4 鉴权、桶/对象/版本/对象锁、限速、策略、证书、计费（v1.1.0） |
 | [docs/部署运维.md](docs/部署运维.md) | 部署（Docker/裸机/systemd）、升级、备份恢复、监控、故障排查 |
 | [FEATURE.md](FEATURE.md) | **版本路线规划**：多中间件一篮子愿景、mode: 端口复用协议、v1.0.10–v1.3.0 路线 |
 | [CHANGELOG.md](CHANGELOG.md) | 更新日志 |
@@ -150,6 +151,26 @@ PRAGMA cache_size   = -256;     -- 每连接 256 KB，控制内存
 为冷查询 / 历史归档设计的时序能力：`series` 维表 + `points` (series_id, ts) 聚簇事实表标准 schema，配合网关改写层——`NOW() - INTERVAL n UNIT` / 日期字符串谓词自动整数化（命中聚簇索引）、`GROUP BY time(N)` InfluxDB 风格桶化、`FROM_UNIXTIME()` 转换；实测 8640 点回填、EXPLAIN 确认无全表扫。
 
 **完整设计（存储模型 / 查询改写 / rollup 路线 / 压缩固化 / 与 InfluxDB 差异）见 [docs/时序数据库.md](docs/时序数据库.md)**，建表脚本见 [schema/timeseries.sql](schema/timeseries.sql)。
+
+---
+
+## 🧊 S3 对象存储（v1.1.0，可选）
+
+`config.yaml` 打开 `s3.enable` 即得一台兼容 **AWS Signature V4** 的对象存储（默认 `0.0.0.0:9000`，
+boto3 / aws-cli / MinIO Client / 各语言 AWS SDK 直连），替代 MinIO / 简单文件服务器：
+
+- **存储**：一个 bucket 一张表（系统库 `glacier_s3.db`），超阈值内容分块；桶从属用户、命名空间隔离；
+- **密钥**：用户多组 AK/SK（**AK 32 位 `AS` 前缀 / SK 48 位 `SK` 前缀**），管理 SQL 签发/轮换/禁用/吊销，
+  SK 明文仅签发时可见一次；
+- **治理**：下载限速（单连接 / 用户总带宽多连接合并 / 并发上限）、UA·IP·Referer·自定义 header
+  请求策略条件、上传回调（HMAC 签名）、多版本、对象锁（WORM/legal hold）、生命周期自动删除；
+- **图片**：裁剪 / 缩放 / 格式转换 / base64 输出与直传；
+- **网络**：region 通配（`'*'`）、virtual-host + path-style、多 endpoint、每 endpoint 泛域名证书 +
+  bucket 自定义域名独立证书（SNI 分发、文件替换热加载）；
+- **计费**：`s3_usage` 按 用户 × 桶记账（请求数 / 传输字节 / 存储占用 / 对象数），SQL 直查 +
+  `EXPORT S3 USAGE` / HTTP `/_glacier/s3/usage` 导出接口。
+
+**完整手册见 [docs/S3对象存储.md](docs/S3对象存储.md)**；管理 SQL 见 [docs/系统SQL.md §1.10](docs/系统SQL.md)。
 
 ---
 
@@ -315,6 +336,7 @@ log:
 | 内存保护 | `memory_limit_mb`（Go 软内存上限）、`max_connections`、单查询行数上限 `max_result_rows` |
 | SQL 审计日志 | `log.sql_log_file` 开启后逐条记录语句/结果(OK\|ERROR)/错误消息/耗时/行数/连接，100MB 自动轮转 |
 | 慢查询日志 | 超过 `slow_query_ms` 的语句记入日志（标注 QoS 排队时长） |
+| S3 对象存储（v1.1.0，可选） | AWS SigV4（表头 + 预签名 URL + aws-chunked）；一 bucket 一表 + 分块；AK/SK 签发/轮换/禁用/吊销；PUT/GET/HEAD/DELETE/COPY、ListObjects V1/V2、ListObjectVersions；下载限速（单连接/用户总带宽合并/并发上限）；UA/IP/Referer/Header 请求策略；上传回调（HMAC）；图片裁剪/缩放/转换/base64；多版本 + 对象锁（WORM）+ 生命周期；virtual-host + 自定义域名独立证书（SNI 热加载）；`s3_usage` 计费 SQL 可查 + 导出接口（详见 docs/S3对象存储.md） |
 
 ---
 
@@ -325,7 +347,7 @@ log:
 | 版本 | 主题 | 亮点 |
 | --- | --- | --- |
 | ✅ v1.0.10 | 运维与查询补强 | **已完成**：查询 QoS（全系统/单库）；每周周期调度 + `SHOW QUERY SCHEDULE` + `PAUSE/RESUME`；**用户权限系统**（账号入库、库/表/IP 权限、MySQL 风格 `CREATE USER`/`GRANT`）+ **防爆破**（IP/账号/混合锁定、可选 ufw/iptables/firewall-cmd 系统层封锁、登录失败 HTTP 告警）；**JSON 复杂查询**；**Geo 字段查询** |
-| v1.1.0 | S3 对象存储 | AWS SigV4 兼容；bucket 一张表、用户多组 AK/SK（AS/SK 前缀）；下载限速（单线程/多线程合并）；UA/IP/Referer/Header 签名鉴权 + 上传回调；图片预处理/base64 直传/多版本/对象锁/生命周期；region 通配、virtual-host、多 endpoint 泛域名证书、bucket 自定义域名；SQL 可查的计费统计 |
+| ✅ v1.1.0 | S3 对象存储 | **已完成**：AWS SigV4 兼容（表头/预签名/aws-chunked）；bucket 一张表、用户多组 AK/SK（AS/SK 前缀，SK 明文仅一次可见）；下载限速（单连接/多线程合并/并发上限）；UA/IP/Referer/Header 请求策略 + 上传回调（HMAC）；图片预处理/base64 直传/多版本/对象锁/生命周期；region 通配、virtual-host、多 endpoint 泛域名证书、bucket 自定义域名（SNI 热加载）；SQL 可查的 `s3_usage` 计费 + 导出接口 |
 | v1.2.0 | Redis 键值/队列 | `mode:redis` 同端口 RESP；key/队列/TTL/自动落盘；每用户独立 namespace；内存上限 + LRU 淘汰 |
 | v1.3.0 | RabbitMQ 队列 | `mode:rabbitmq` 同端口 AMQP 0-9-1；exchange/queue/binding/发布消费；消息持久化、管理面观测 |
 

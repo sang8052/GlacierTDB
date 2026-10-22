@@ -23,7 +23,7 @@ var (
 	reAdminShowClient = regexp.MustCompile(`(?i)^SHOW\s+CLIENTS$`)
 	reAdminShowTx     = regexp.MustCompile(`(?i)^SHOW\s+TRANSACTIONS$`)
 	reAdminSetPwd     = regexp.MustCompile(`(?i)^(?:SET\s+PASSWORD(?:\s+FOR\s+(\S+?))?\s*=\s*|ALTER\s+USER\s+(\S+?)\s+IDENTIFIED\s+BY\s+)'([^']{1,64})'\s*$`)
-	reAdminSelect     = regexp.MustCompile("(?i)^SELECT\\s+(.+?)\\s+FROM\\s+(server_config|clients|transactions|qos_status|users|user_grants|user_hosts|login_attempts|locked)(?:\\s+WHERE\\s+(.+?))?(?:\\s+ORDER\\s+BY\\s+.+?)?(?:\\s+LIMIT\\s+\\d+(?:\\s*,\\s*\\d+)?)?\\s*$")
+	reAdminSelect     = regexp.MustCompile("(?i)^SELECT\\s+(.+?)\\s+FROM\\s+(server_config|clients|transactions|qos_status|users|user_grants|user_hosts|login_attempts|locked|s3_usage|s3_buckets|s3_keys|s3_lifecycle|s3_domains)(?:\\s+WHERE\\s+(.+?))?(?:\\s+ORDER\\s+BY\\s+.+?)?(?:\\s+LIMIT\\s+\\d+(?:\\s*,\\s*\\d+)?)?\\s*$")
 	reKillConn        = regexp.MustCompile(`(?i)^KILL\s+(?:CONNECTION\s+|QUERY\s+)?(\d+)$`)
 	reUseAdmin        = regexp.MustCompile("(?i)^USE\\s+`?(GlacierTDB|glacier)`?\\s*$") // 管理库别名：glacier 为系统内置名，禁止建库
 	reAdminSetConc    = regexp.MustCompile(`(?i)^SET\s+(GLOBAL_THREADS|PER_DB_READ_THREADS|DB_READ_THREADS)\s*(?:([A-Za-z0-9_-]+)\s*)?=\s*(\d+)\s*$`)
@@ -108,6 +108,11 @@ func (h *Handler) handleKill(q string) (handled bool, err error) {
 // handleAdmin 管理面命令分发；handled=false 表示不是管理命令。
 // 仅在 adminMode 下调用（透传 SQL 前拦截）。
 func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
+	// 对象存储管理命令（v1.1.0：桶 / 密钥 / 策略 / 生命周期 / 域名证书 / 用量）
+	if res, handled, err := h.handleS3Admin(q); handled || err != nil {
+		return res, true, err
+	}
+
 	switch {
 	case reAdminShowConfig.MatchString(q):
 		rows := h.serverConfigRows()
@@ -418,6 +423,23 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		case "locked":
 			cols = []string{"LockKey", "LockType", "LockedAt", "Until", "FailCount", "Level"}
 			rows = h.lockRows()
+		case "s3_usage":
+			cols = []string{"owner", "bucket", "get_count", "put_count", "list_count", "delete_count",
+				"bytes_in", "bytes_out", "storage_bytes", "object_count", "updated"}
+			rows = h.s3UsageRows("")
+		case "s3_buckets":
+			cols = []string{"bucket", "owner", "region", "versioning", "object_lock",
+				"objects", "storage_bytes", "callback_url", "created"}
+			rows = h.s3BucketRows()
+		case "s3_keys":
+			cols = []string{"access_key", "owner", "status", "sk_fingerprint", "policy", "created", "last_used"}
+			rows = h.s3KeyRows()
+		case "s3_lifecycle":
+			cols = []string{"bucket", "prefix", "days", "enabled"}
+			rows = h.s3LifecycleRows()
+		case "s3_domains":
+			cols = []string{"host", "bucket", "cert_file", "key_file", "created"}
+			rows = h.s3DomainRows()
 		}
 		rows = filterAdminRows(cols, rows, where)
 		res, err := meta.SimpleRS(cols, rows)
