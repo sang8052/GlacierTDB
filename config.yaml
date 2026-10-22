@@ -55,6 +55,30 @@ async_query:
 maintenance:
   no_hot_vacuum: false
 
+# 查询 QoS（v1.0.10）：全系统 + 单库两级配额，读/写/异步任务执行统一记账
+# 管理面热改（重启失效）：SET QOS GLOBAL QPS=500 / SET QOS DB backup QPS=100 / SET QOS DB backup CLEAR
+qos:
+  on_exceed: wait          # wait = 排队等待（默认）| reject = 立即拒绝（1040）
+  global:
+    qps: 0                 # 每秒查询数（令牌桶，0 = 不限）
+    concurrency: 0         # 并发执行上限
+    rows_per_sec: 0        # 扫描行吞吐上限
+  databases: {}            # 单库覆盖，如 backup: { qps: 500, concurrency: 16 }
+
+# 防爆破（v1.0.10）：登录失败计数 → 自动锁 IP / 账号（持久化，重启不解除）
+lock:
+  enable: true
+  mode: mixed              # ip_only | account_only | mixed（独立锁 IP 或账号，任一触发即拒）
+  window_sec: 300          # 失败计数窗口
+  max_failures: 5          # 窗口内失败阈值（通用/账号）
+  max_failures_ip: 30      # 按 IP 阈值（更宽防误杀；账号独立计数）
+  max_failures_account: 5  # 按账号阈值
+  lock_sec: 900            # 基础锁定时长（重复触发指数升级）
+  lock_sec_max: 86400
+  firewall: auto           # off | auto | ufw | iptables | firewall-cmd（系统层封锁，尽力而为）
+  notify_url: ""           # 登录失败/锁定事件 HTTP 异步告警（空=关闭）
+  notify_secret: ""        # 告警 HMAC 签名密钥
+
 # 静态加密（adiantum，防外部程序直接读 .db 文件）；首次启用要求空目录或已加密库
 security:
   encrypt: false

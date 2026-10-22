@@ -74,7 +74,10 @@ type Job struct {
 	ScriptOut   string     `json:"script_output,omitempty"`
 	WhenExpr    string     `json:"when,omitempty"` // WHEN 资源门槛表达式
 	EverySec    int        `json:"every_sec,omitempty"`    // 周期秒（0=一次性）
-	EveryAt     string     `json:"every_at,omitempty"`     // EVERY DAY AT 'HH:MM' 的每日时刻
+	EveryAt     string     `json:"every_at,omitempty"`     // EVERY DAY/WEEK AT 'HH:MM' 的时刻
+	EveryWd     int        `json:"every_weekday,omitempty"` // 每周调度周几（0=非每周，1..7=周一..周日，v1.0.10）
+	EveryWeeks  int        `json:"every_weeks,omitempty"`   // 每 N 周（v1.0.10，默认 1）
+	QosWaitMs   int64      `json:"qos_wait_ms,omitempty"`   // 本次执行的 QoS 排队毫秒（v1.0.10）
 	RecurGroup  string     `json:"recur_group,omitempty"`  // 周期链 ID；CANCEL 取消整链
 	CancelCh    chan struct{} `json:"-"`
 }
@@ -91,6 +94,8 @@ type Engine struct {
 	samp    *Sampler // WHEN 资源采样器
 	cgrpMu  sync.Mutex
 	cgrp    map[string]bool // 已取消的周期链
+	pauseMu sync.RWMutex
+	paused  map[string]bool // 已暂停的周期链/任务（PAUSE QUERY，v1.0.10）
 }
 
 // NewEngine 创建引擎并启动调度循环。
@@ -103,6 +108,7 @@ func NewEngine(b *sqlite.Backend, cfg *config.Config) *Engine {
 		jobsDir: cfg.AsyncQuery.JobsDir,
 		samp:    NewSampler(cfg.AsyncQuery.MetricsIntervalSec),
 		cgrp:    make(map[string]bool),
+		paused:  make(map[string]bool),
 	}
 	if e.jobsDir == "" {
 		e.jobsDir = filepath.Join(cfg.DBDir, "jobs")
@@ -124,10 +130,15 @@ func (e *Engine) Submit(j *Job) string {
 	j.State = StatePending
 	j.SubmitTS = time.Now()
 	j.CancelCh = make(chan struct{})
-	if j.EverySec > 0 || j.EveryAt != "" {
+	if j.EverySec > 0 || j.EveryAt != "" || j.EveryWd > 0 {
 		if j.RecurGroup == "" {
 			j.RecurGroup = fmt.Sprintf("g_%s_%04d", time.Now().Format("20060102_150405"), time.Now().UnixNano()%10000)
 		}
+	}
+	// 每周调度：首次执行排到下一个周几时刻（不立即执行）
+	if j.EveryWd > 0 && j.At == nil {
+		t := nextWeekOccurrence(time.Now(), j.EveryWd, j.EveryAt)
+		j.At = &t
 	}
 	ttl := time.Duration(e.cfg.AsyncQuery.ResultRetainSec) * time.Second
 	if j.RetainSec > 0 {
@@ -175,6 +186,17 @@ func (e *Engine) runWhenDue(j *Job) {
 		e.mu.Unlock()
 
 		now := time.Now()
+		// PAUSE：挂起排期（冻结超时倒计时，不丢链）
+		if e.isPaused(j) {
+			deadline = deadline.Add(time.Second)
+			select {
+			case <-j.CancelCh:
+				e.finish(j, StateCancelled, "cancelled")
+				return
+			case <-time.After(time.Second):
+			}
+			continue
+		}
 		if now.After(deadline) {
 			e.finish(j, StateExpired, "timeout before execution (window/resource not satisfied)")
 			return
@@ -233,6 +255,7 @@ func (e *Engine) execute(j *Job) {
 		e.finish(j, StateError, err.Error())
 		return
 	}
+	j.QosWaitMs = s.QoSWaitMs() // QoS 排队时长（query_jobs.qos_wait_ms）
 
 	// 流式写 JSONL
 	f, err := os.Create(e.resultPath(j.ID))
@@ -290,9 +313,19 @@ func (e *Engine) finish(j *Job, st State, errMsg string) {
 			next.ID = ""
 			next.State = StatePending
 			next.Rows, next.Bytes, next.Error = 0, 0, ""
+			next.QosWaitMs = 0
 			next.SubmitTS = time.Now()
 			next.CancelCh = make(chan struct{})
-			if j.EveryAt != "" {
+			if j.EveryWd > 0 {
+				// 每周（每 N 周）调度：下一周几时刻（N>1 再推 (N-1) 周）
+				t := nextWeekOccurrence(time.Now(), j.EveryWd, j.EveryAt)
+				if j.EveryWeeks > 1 {
+					t = t.Add(time.Duration(j.EveryWeeks-1) * 7 * 24 * time.Hour)
+				}
+				next.At = &t
+				next.Window = [2]string{}
+				next.WindowWd = 0
+			} else if j.EveryAt != "" {
 				var h, m int
 				fmt.Sscanf(j.EveryAt, "%d:%d", &h, &m)
 				now := time.Now()
@@ -596,3 +629,167 @@ func (e *Engine) SubmitClone(j *Job) string {
 	_ = id
 	return id
 }
+
+// ---------------------------------------------------------------------------
+// 周期调度增强（v1.0.10）：PAUSE/RESUME / 周几调度 / 周期配置查询
+// ---------------------------------------------------------------------------
+
+// pauseKey 暂停键：周期链优先，单任务兜底。
+func pauseKey(j *Job) string {
+	if j.RecurGroup != "" {
+		return j.RecurGroup
+	}
+	return j.ID
+}
+
+// Pause 暂停周期链/任务排期（不丢链；TIMEOUT 倒计时冻结）。
+func (e *Engine) Pause(id string) error {
+	j, ok := e.Get(id)
+	if !ok {
+		return fmt.Errorf("unknown job '%s'", id)
+	}
+	e.pauseMu.Lock()
+	e.paused[pauseKey(&j)] = true
+	e.pauseMu.Unlock()
+	return nil
+}
+
+// Resume 恢复周期链/任务排期。
+func (e *Engine) Resume(id string) error {
+	j, ok := e.Get(id)
+	if !ok {
+		return fmt.Errorf("unknown job '%s'", id)
+	}
+	e.pauseMu.Lock()
+	delete(e.paused, pauseKey(&j))
+	e.pauseMu.Unlock()
+	return nil
+}
+
+func (e *Engine) isPaused(j *Job) bool {
+	e.pauseMu.RLock()
+	defer e.pauseMu.RUnlock()
+	return e.paused[pauseKey(j)]
+}
+
+// nextWeekOccurrence 计算下一个「周几 + 时刻」（wd: 1..7=周一..周日；at 为空用 now 的时刻）。
+func nextWeekOccurrence(now time.Time, wd int, at string) time.Time {
+	goWd := wd % 7 // 周一=1..周日=7 → Go Weekday: Mon=1..Sun=0
+	h, m := now.Hour(), now.Minute()
+	if hh, mm, ok := parseHM(at); ok {
+		h, m = hh, mm
+	}
+	for i := 0; i < 8; i++ {
+		day := now.AddDate(0, 0, i)
+		if int(day.Weekday()) != goWd {
+			continue
+		}
+		t := time.Date(day.Year(), day.Month(), day.Day(), h, m, 0, 0, now.Location())
+		if t.After(now) {
+			return t
+		}
+	}
+	return now.Add(7 * 24 * time.Hour) // 兜底
+}
+
+// ScheduleRow 周期配置行（SHOW QUERY SCHEDULE / query_schedule）。
+type ScheduleRow struct {
+	RecurGroup string
+	JobID      string
+	SQL        string
+	Schedule   string
+	Window     string
+	When       string
+	NextRun    string
+	LastRun    string
+	LastState  string
+	Paused     bool
+}
+
+// Schedule 返回全部周期链配置（每链一行，取最新任务为链头）。
+func (e *Engine) Schedule() []ScheduleRow {
+	jobs := e.List() // 新→旧
+	seen := map[string]bool{}
+	var out []ScheduleRow
+	for i := range jobs {
+		j := jobs[i]
+		if j.RecurGroup == "" || seen[j.RecurGroup] {
+			continue
+		}
+		seen[j.RecurGroup] = true
+		row := ScheduleRow{
+			RecurGroup: j.RecurGroup,
+			JobID:      j.ID,
+			SQL:        j.SQL,
+			Schedule:   scheduleExpr(&j),
+			When:       j.WhenExpr,
+			Paused:     e.isPaused(&j),
+		}
+		if j.Window[0] != "" {
+			row.Window = j.Window[0] + "-" + j.Window[1]
+			if j.WindowWd > 0 {
+				row.Window = wdCN(j.WindowWd) + " " + row.Window
+			}
+		}
+		if j.At != nil {
+			row.NextRun = j.At.Format("2006-01-02 15:04:05")
+		}
+		for k := i + 1; k < len(jobs); k++ {
+			if jobs[k].RecurGroup == j.RecurGroup {
+				if !jobs[k].EndTS.IsZero() {
+					row.LastRun = jobs[k].EndTS.Format("2006-01-02 15:04:05")
+				} else {
+					row.LastRun = jobs[k].SubmitTS.Format("2006-01-02 15:04:05")
+				}
+				row.LastState = string(jobs[k].State)
+				break
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// scheduleExpr 生成人类可读周期表达。
+func scheduleExpr(j *Job) string {
+	switch {
+	case j.EveryWd > 0:
+		s := "EVERY "
+		if j.EveryWeeks > 1 {
+			s += fmt.Sprintf("%d WEEKS", j.EveryWeeks)
+		} else {
+			s += "WEEK"
+		}
+		s += " ON " + wdCN(j.EveryWd)
+		if j.EveryAt != "" {
+			s += " AT " + j.EveryAt
+		}
+		return s
+	case j.EveryAt != "":
+		return "EVERY DAY AT " + j.EveryAt
+	case j.EverySec > 0:
+		switch {
+		case j.EverySec%86400 == 0:
+			return fmt.Sprintf("EVERY %d DAYS", j.EverySec/86400)
+		case j.EverySec%3600 == 0:
+			return fmt.Sprintf("EVERY %d HOURS", j.EverySec/3600)
+		case j.EverySec%60 == 0:
+			return fmt.Sprintf("EVERY %d MINUTES", j.EverySec/60)
+		default:
+			return fmt.Sprintf("EVERY %d SECONDS", j.EverySec)
+		}
+	}
+	return ""
+}
+
+// wdCN 1..7 → 周一..周日。
+func wdCN(wd int) string {
+	names := []string{"", "周一", "周二", "周三", "周四", "周五", "周六", "周日"}
+	if wd >= 1 && wd <= 7 {
+		return names[wd]
+	}
+	return fmt.Sprintf("周%d", wd)
+}
+
+// ScheduleExpr 人类可读周期表达（query_jobs.schedule 列）。
+func (j *Job) ScheduleExpr() string { return scheduleExpr(j) }

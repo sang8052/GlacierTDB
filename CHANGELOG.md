@@ -2,6 +2,27 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.0.10.alpha] - 2026-10-22
+
+### 新增
+- **查询 QoS 查询 / 限制（全系统 · 单库）**：`qos` 配置段（`qps` 令牌桶 / `concurrency` / `rows_per_sec` 三维配额，`on_exceed: wait|reject`），全系统默认 + 单库覆盖两级；读 / 写 / 异步任务执行统一记账；管理面热改 `SET QOS GLOBAL QPS=500` / `SET QOS DB backup QPS=100` / `SET QOS DB backup CLEAR`（重启失效）；`SHOW QOS` / `SELECT * FROM qos_status` 查配置与实时统计（通过 / 排队 / 拒绝 / 当前并发 / 平均排队毫秒）；`query_jobs` 新增 `qos_wait_ms` 列；慢查询日志标注 QoS 排队时长；超限拒绝返回 1040。
+- **异步周期调度增强**：`EVERY WEEK [ON 周五] [AT '02:00']` / `EVERY n WEEKS [ON 周一] [AT '03:00']` 每周/每 N 周调度（首次执行自动排到下一周期时刻）；`PAUSE QUERY '<id>'` / `RESUME QUERY '<id>'` 链级启停（暂停冻结 TIMEOUT 倒计时、不丢链）；`SHOW QUERY SCHEDULE` / `query_schedule` 表查询周期配置（recur_group / schedule / window / when / next_run / last_run / last_state / paused）；`query_jobs` 新增 `schedule` 人类可读周期表达列。
+- **用户权限系统（MySQL 风格，账号入库）**：不再用配置文件存用户——系统库 `<db_dir>/glacier_auth.db` 五张表（`users` / `user_grants` / `user_hosts` / `login_attempts` / `lock_state`）；首次启动**自动迁移旧版策略**（config auth 段 + glacier.json → 系统表，旧 glacier / glacier_ro 等价落表，`glacier` 仍为默认超级用户）；SQL 接口：`CREATE USER 'u'@'host' IDENTIFIED BY 'pwd' [SUPER|READONLY|USER]` / `ALTER USER` / `DROP USER` / `RENAME USER` / `SET PASSWORD [FOR u]` / `GRANT privs ON db.tbl TO 'u'` / `REVOKE` / `SHOW GRANTS [FOR 'u']`；**库级 + 表级 + IP 授权**（host 支持 `%` / `192.168.1.%` / 精确 IP / CIDR），权限校验在网关层按语句目标表执行（SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/INDEX），拒绝返回 1044/1142 族错误；账号类型 super / readonly / user 三档（`ALTER USER u READONLY` 热切换）；`users` / `user_grants` / `user_hosts` 表可 SQL 查询（不含密码）。
+- **防爆破（自动锁异常 IP / 账号）**：登录失败窗口计数（`lock.enable` / `lock.window_sec` / `lock.max_failures`，IP 与账号维度阈值独立，IP 默认 30 次防误杀）；三种锁定模式 `lock.mode: ip_only | account_only | mixed`（独立锁 IP / 独立锁账号 / 混合，任一触发即拒）；锁定时长指数升级（`lock_sec` ×2 至 `lock_sec_max`）；**锁定持久化**（重启不解除）；被锁账号/IP 拒绝登录（3119）；**可选系统层封锁**：`lock.firewall: auto|ufw|iptables|firewall-cmd|off`（不指定自动识别，IP 锁定时下发防火墙 DROP 规则、TTL 到期自动解封，容器内/无权限自动降级为网关层软锁）；**登录失败/锁定事件 HTTP 异步告警**（`lock.notify_url` + HMAC 签名、退避重试）；管理面 `SHOW LOGIN ATTEMPTS [LIMIT n]` / `SHOW LOCKED` / `UNLOCK ACCOUNT u` / `UNLOCK IP x.x.x.x` / `UNLOCK ALL`。
+- **JSON 复杂查询**：`->` / `->>` MySQL JSON 运算符自动改写为 SQLite JSON1 等价形式（`->` 保留 JSON 值形态：字符串加引号；支持链式 `a->'$.x'->>'$.y'`）；`JSON_LENGTH` / `JSON_CONTAINS` / `JSON_KEYS` / `JSON_SEARCH`（% / _ 通配）/ `JSON_MERGE_PATCH`（RFC 7386）Go 实现注册进每个后端连接（`JSON_EXTRACT` / `JSON_SET` 等 SQLite JSON1 原生直通）；`json_extract` 表达式索引可用（EXPLAIN 确认命中）。
+- **Geo 格式字段查询**：`ST_*` 函数族（Go 标量，与 MD5/SHA 族同机制）——`ST_GeomFromText` / `ST_AsText` / `ST_GeomFromGeoJSON` / `ST_AsGeoJSON` / `ST_MakePoint` / `ST_X` / `ST_Y` / `ST_Longitude` / `ST_Latitude` / `ST_Distance`（平面）/ `ST_Distance_Sphere`（haversine 米）/ `ST_Within` / `ST_Contains` / `ST_Intersects` / `ST_Equals`；WKT / WKB / GeoJSON 三种输入自动识别互转；`POINT` / `GEOMETRY` 等建表类型直通 SQLite（WKT 文本存储）。
+
+### 修复
+- **中文周几解析恒失败（存量）**：`parseWeekday` 用 `t[0:1] == "周"` 比较单字节与三字节汉字永远不等——`WINDOW '周五 17:00-20:00'` 与新 `EVERY WEEK ON 周五` 的中文周几写法此前一律解析失败（v1.0.8 引入，测试未覆盖中文形式）。
+- **管理面语句被库名前缀剥除误伤（存量）**：`RewriteDBPrefix` 会把管理面 `GRANT ... ON backup.t` 改写成 `ON t` 导致命令失配——管理面语句现跳过前缀剥除。
+- 账号类型（`ALTER USER u READONLY|SUPER|USER`）热改后会话内实时生效（此前用连接建立时的快照）。
+
+### 变更
+- 认证改走用户权限系统：`glacier.json` 降级为迁移源与 legacy 镜像（改密仍同步写入，便于回退旧版），账号的权威存储为 `glacier_auth.db`；`users` 表为空时自动升级旧版用户策略；
+- 管理面变更命令（SET PASSWORD / SET QOS / SET *_THREADS / KILL / VACUUM / CREATE USER / GRANT / REVOKE / UNLOCK）仅超级用户可执行（只读 1290、普通用户 1142）；
+- `config.yaml` 新增 `qos` 与 `lock` 段（均可省略走默认）；
+- `tests/test_v110.py` 新增 51 项；全套回归 ALL TESTS PASSED（15 个测试脚本）。
+
 ## [1.0.9.alpha] - 2026-10-22
 
 ### 修复

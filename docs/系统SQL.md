@@ -34,7 +34,7 @@ SELECT name FROM server_config WHERE name LIKE 'sqlite.%';
 
 | 键 | 说明 |
 | --- | --- |
-| `glacier_version` | GlacierTDB 自身版本（如 `1.0.9.alpha`） |
+| `glacier_version` | GlacierTDB 自身版本（如 `1.0.10.alpha`） |
 | `server` / `server_version` | 产品名 / 对外模拟的 MySQL 协议版本（`8.99.999`） |
 | `listen` / `db_dir` / `default_db` / `databases` | 监听、库目录、默认库、当前库列表 |
 | `auth.user` / `auth.readonly_user` | 管理账号（固定 `glacier`）/ 只读账号名 |
@@ -109,7 +109,57 @@ SET DB_READ_THREADS backup = 0;       -- 0 = 删除覆盖，回到全局默认
 
 即时生效，可在压测间动态调节；**重启后回到 `config.yaml` 中 `concurrency` 的值**。当前值通过 `server_config` 查看（见 1.1）。
 
-### 1.6 管理面外的全局命令
+### 1.6 用户权限管理（v1.0.10，仅超级用户）
+
+账号入库（`glacier_auth.db` 系统表），MySQL 风格语法：
+
+```sql
+CREATE USER 'u1'@'%' IDENTIFIED BY 'pwd';          -- host 省略 = '%'；可加 SUPER/READONLY/USER
+CREATE USER 'u2'@'192.168.1.%' IDENTIFIED BY 'pwd' READONLY;
+ALTER USER 'u1' IDENTIFIED BY 'newpwd';            -- 改密（= SET PASSWORD FOR 'u1'）
+ALTER USER 'u1' READONLY;                          -- 账号类型热切换 SUPER/READONLY/USER
+RENAME USER 'u1' TO 'u3';
+GRANT SELECT, INSERT ON backup.* TO 'u1';          -- 库级（* 通配）
+GRANT SELECT ON backup.t1 TO 'u1' WITH GRANT OPTION;  -- 表级
+REVOKE INSERT ON backup.* FROM 'u1';               -- REVOKE ALL PRIVILEGES FROM 'u1'
+SHOW GRANTS FOR 'u1';                              -- MySQL 风格授权清单
+DROP USER 'u1';
+```
+
+- **权限语义**：`super` 全部；`readonly` 仅 SELECT（写 1290）；`user` 按 `user_grants` 逐语句校验
+  （SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/INDEX，库级+表级），拒绝返回 1142；
+- **IP 授权**：`'u'@'host'` 的 host 支持 `%` / `192.168.1.%` / 精确 IP / CIDR（`192.168.0.0/24`），
+  未命中 host 的登录拒绝（1045）；
+- **视图**：`SELECT * FROM users`（不含密码）/ `user_grants` / `user_hosts`；
+- 旧版配置（config auth 段 + `glacier.json`）首次启动自动迁移；`glacier` 保持默认超级用户。
+
+### 1.7 防爆破审计与解锁（v1.0.10，仅超级用户）
+
+```sql
+SHOW LOGIN ATTEMPTS LIMIT 50;     -- 登录审计：Id/Time/IP/Remote/User/Success/Reason
+SHOW LOCKED;                      -- 锁定列表：LockKey(ip:xx|acct:xx)/LockType/LockedAt/Until/FailCount/Level
+UNLOCK ACCOUNT u1;                -- 解锁账号（手动锁 + 自动锁 + 失败计数）
+UNLOCK IP 10.0.0.9;               -- 解锁 IP（含防火墙解封）
+UNLOCK ALL;                       -- 全部解锁
+```
+
+失败计数、锁定模式（ip_only/account_only/mixed）、系统层防火墙封锁与 HTTP 告警见 [配置说明.md §2.9](配置说明.md)。
+
+### 1.8 查询 QoS（v1.0.10，仅超级用户）
+
+```sql
+SET QOS GLOBAL QPS = 500;                 -- 全系统每秒查询数（令牌桶）
+SET QOS GLOBAL CONCURRENCY = 32;
+SET QOS GLOBAL ROWS_PER_SEC = 2000000;
+SET QOS DB backup QPS = 100;              -- 单库覆盖
+SET QOS DB backup CLEAR;                  -- 清除覆盖
+SHOW QOS;                                 -- scope/qps/concurrency/rows_per_sec/passed/queued/rejected/waiting/avg_wait_ms
+SELECT * FROM qos_status;                 -- 表形式（支持 WHERE）
+```
+
+热改仅运行时生效（重启回到 `config.yaml` 的 `qos` 段）；`on_exceed: reject` 时超限返回 1040。
+
+### 1.9 管理面外的全局命令
 
 以下命令在**任意库**下均有效，无需进入管理面：
 
@@ -250,18 +300,37 @@ Go 标量函数（v1.0.8，注册进每个后端连接，任意表达式位置�
 
 **转义还原（v1.0.9）**：MySQL 协议客户端把参数值按 MySQL 规则转义后拼进 SQL 文本（`"` → `\"`、`'` → `\'`、`\` → `\\`、换行 → `\n`），网关在语句进入 SQLite 前对单引号字面量统一做 MySQL→SQLite 还原，文本值（如 JSON 配置）不再被转义序列污染，`WHERE` 等值比较可正常命中；`\%` / `\_`（LIKE 通配符字面量）保留原样。查询、写语句与异步任务执行路径全部覆盖。
 
+**JSON 查询（v1.0.10）**：`->` / `->>` 运算符自动改写为 SQLite JSON1 等价形式（`->` 保留 JSON 值形态、字符串加引号，支持链式 `a->'$.x'->>'$.y'`）；`JSON_LENGTH` / `JSON_CONTAINS` / `JSON_KEYS` / `JSON_SEARCH`（% / _ 通配）/ `JSON_MERGE_PATCH`（RFC 7386）为 Go 实现；`JSON_EXTRACT` / `JSON_SET` / `JSON_REPLACE` / `JSON_REMOVE` / `JSON_TYPE` / `json_each` 等 SQLite JSON1 原生直通；`json_extract` 表达式索引可用。
+
+**Geo 查询（v1.0.10）**：`ST_*` 函数族（WKT / WKB / GeoJSON 三种输入自动识别）：
+
+| 函数 | 说明 |
+| --- | --- |
+| `ST_GeomFromText(wkt)` / `ST_AsText(g)` | WKT 解析 / 规范 WKT 输出 |
+| `ST_GeomFromGeoJSON(gj)` / `ST_AsGeoJSON(g)` | GeoJSON ↔ WKT |
+| `ST_MakePoint(x,y)` / `ST_X(g)` / `ST_Y(g)` / `ST_Longitude(g)` / `ST_Latitude(g)` | 构造与坐标提取 |
+| `ST_Distance(a,b)` | 平面欧氏距离（单位=坐标单位） |
+| `ST_Distance_Sphere(a,b)` | 球面距离（米，haversine） |
+| `ST_Within(a,b)` / `ST_Contains(a,b)` | 点在面/点在点/点在线判定（含边界） |
+| `ST_Intersects(a,b)` / `ST_Equals(a,b)` | 相交（包围盒预筛 + 具体判定）/ 规范 WKT 相等 |
+
+`POINT` / `GEOMETRY` / `LINESTRING` / `POLYGON` 等建表类型直通 SQLite（WKT 文本存储）。
+
 ## 6. 快速速查
 
 ```sql
 -- 日常
-SELECT glacier_version;                          -- 1.0.9.alpha
+SELECT glacier_version;                          -- 1.0.10.alpha
 USE GlacierTDB;                                  -- 进管理面
 SHOW CLIENTS;                                    -- 看连接
 SHOW TRANSACTIONS;                               -- 看事务
 KILL 10086;                                      -- 踢人
 SET PASSWORD = 'new-pass';                       -- 改密（热生效）
-SET PASSWORD FOR glacier_ro = 'ro-pass';         -- 改只读账号密码（v1.0.9）
-SHOW QUERY VARS;                                 -- 异步 WHEN 监测变量当前值（v1.0.9）
+CREATE USER 'u1'@'%' IDENTIFIED BY 'pwd';        -- 建用户（v1.0.10）
+GRANT SELECT ON backup.* TO 'u1';                -- 授权
+SHOW LOGIN ATTEMPTS LIMIT 20;                    -- 登录审计（v1.0.10）
+SHOW QOS;                                        -- QoS 统计（v1.0.10）
+SHOW QUERY VARS;                                 -- 异步 WHEN 监测变量当前值
 SET GLOBAL_THREADS = 64; SET PER_DB_READ_THREADS = 16;
 USE backup;                                      -- 回业务库
 ```

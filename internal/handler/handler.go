@@ -17,6 +17,7 @@ import (
 	sqlite3 "github.com/ncruces/go-sqlite3"
 
 	"glaciertdb/internal/admin"
+	"glaciertdb/internal/auth"
 	"glaciertdb/internal/asyncq"
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/logx"
@@ -31,7 +32,9 @@ type Handler struct {
 	session   *sqlite.Session
 	remote    string
 	readonly  bool
-	user      string // 握手成功后的真实登录账号（glacier / 只读账号）
+	user      string // 握手成功后的真实登录账号
+	userType  string // super | readonly | user（v1.0.10 用户权限系统）
+	auths     *auth.Store
 	connID     uint64
 	startedAt  time.Time
 	mc         *server.Conn
@@ -53,34 +56,44 @@ var reExplainParallel = regexp.MustCompile(`(?is)^EXPLAIN\s+PARALLEL\s+(.+)$`)
 var _ meta.Querier = (*sqlite.Session)(nil)
 
 // New 创建连接级 handler（连到 defaultDB）。
-func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *admin.Registry, aq *asyncq.Engine) (*Handler, error) {
+func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *admin.Registry, aq *asyncq.Engine, as *auth.Store) (*Handler, error) {
 	s, err := b.OpenSession(cfg.Auth.User, remote, defaultDB)
 	if err != nil {
 		return nil, err
 	}
-	return &Handler{
+	h := &Handler{
 		cfg:        cfg,
 		backend:    b,
 		session:    s,
 		remote:     remote,
 		readonly:   cfg.IsReadOnlyUser(cfg.Auth.User),
 		user:       cfg.Auth.User,
+		auths:      as,
 		startedAt:  time.Now(),
 		autocommit: true,
 		registry:   reg,
 		async:      aq,
-	}, nil
+	}
+	if as != nil {
+		h.userType = as.UserType(cfg.Auth.User)
+	} else {
+		h.userType = auth.TypeSuper
+	}
+	return h, nil
 }
 
 // BindConn 在 go-mysql 握手完成后回填连接并声明 autocommit 状态位
 //（真 MySQL 每个 OK/EOF 都带 SERVER_STATUS_AUTOCOMMIT，客户端据此判断事务态）。
-// 握手成功后同时回填真实登录账号：只读账号据此进入只读语义（v1.0.9）。
+// 握手成功后同时回填真实登录账号与类型（v1.0.9/v1.0.10）。
 func (h *Handler) BindConn(mc *server.Conn) {
 	h.mc = mc
 	h.connID = uint64(mc.ConnectionID())
 	if u := mc.GetUser(); u != "" {
 		h.user = u
-		h.readonly = h.cfg.IsReadOnlyUser(u)
+		if h.auths != nil {
+			h.userType = h.auths.UserType(u)
+		}
+		h.readonly = h.cfg.IsReadOnlyUser(u) || h.userType == auth.TypeReadonly
 		if h.session != nil {
 			h.session.User = u
 		}
@@ -109,6 +122,9 @@ func MapSQLiteErr(err error) error {
 	var me *mysql.MyError
 	if errors.As(err, &me) {
 		return err
+	}
+	if sqlite.IsQoSReject(err) {
+		return mysql.NewError(1040, err.Error()) // QoS 超限拒绝（v1.0.10）
 	}
 	var se *sqlite3.Error
 	if errors.As(err, &se) {
@@ -226,8 +242,19 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 	h.lastQuery = truncate(query, 200)
 	h.mu.Unlock()
 	s := meta.StripComments(query)
-	// 剥掉「当前库名.表」前缀（客户端工具常发 backup.tbl / `backup`.`tbl`）
-	s = meta.RewriteDBPrefix(s, h.session.CurrentDB())
+	// 刷新账号类型与只读语义（ALTER USER 可热改 account_type，v1.0.10 权限须实时）
+	if h.auths != nil {
+		h.userType = h.auths.UserType(h.user)
+		h.readonly = h.cfg.IsReadOnlyUser(h.user) || h.userType == auth.TypeReadonly
+	}
+	// 剥掉「当前库名.表」前缀（客户端工具常发 backup.tbl / `backup`.`tbl`）；
+	// 管理面语句不剥——GRANT/REVOKE 的 ON db.table 目标必须保留（v1.0.10）
+	h.mu.Lock()
+	adminPre := h.adminMode
+	h.mu.Unlock()
+	if !adminPre {
+		s = meta.RewriteDBPrefix(s, h.session.CurrentDB())
+	}
 
 	// 异步查询命令（SUBMIT/SHOW QUERY JOBS/FETCH/CANCEL/DROP，私有语法，先于探活）
 	if res, ok, err := h.handleAsyncQ(s); ok || err != nil {
@@ -337,7 +364,12 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 
 	// 2b) 管理面：未匹配管理命令的普通 SQL 一律拒绝（管理命令已在探活前拦截）
 	if h.adminMode {
-		return nil, mysql.NewError(1064, "GlacierTDB is the admin database; supported: SHOW SERVER CONFIG / SHOW CLIENTS / SHOW TRANSACTIONS / SET PASSWORD[ FOR user]='new' / SET GLOBAL_THREADS=n / SET PER_DB_READ_THREADS=n / SET DB_READ_THREADS db=n / KILL <id>, or USE <db> to exit")
+		return nil, mysql.NewError(1064, "GlacierTDB is the admin database; supported: SHOW SERVER CONFIG / SHOW CLIENTS / SHOW TRANSACTIONS / SET PASSWORD[ FOR user]='new' / SET GLOBAL_THREADS=n / SET PER_DB_READ_THREADS=n / SET DB_READ_THREADS db=n / SET QOS ... / SHOW QOS / SHOW QUERY SCHEDULE / SHOW LOGIN ATTEMPTS / SHOW LOCKED / KILL <id>, or USE <db> to exit")
+	}
+
+	// 2c) 权限校验（v1.0.10：普通用户按系统库 user_grants 授权；super/readonly 不走此层）
+	if err := h.checkPrivilege(s); err != nil {
+		return nil, err
 	}
 
 	// 3) 方言改写（先把 MySQL 转义序列的字面量还原为 SQLite 语义——
@@ -522,6 +554,10 @@ func (h *Handler) HandleOtherCommand(cmd byte, data []byte) error {
 
 func (h *Handler) slow(start time.Time, q string) {
 	if ms := time.Since(start).Milliseconds(); ms >= h.session.SlowMs() {
+		if qw := h.session.QoSWaitMs(); qw > 0 {
+			logx.Infof("slow query (%d ms, qos_wait %d ms) [conn %d]: %s", ms, qw, h.connID, truncate(q, 300))
+			return
+		}
 		logx.Infof("slow query (%d ms) [conn %d]: %s", ms, h.connID, truncate(q, 300))
 	}
 }

@@ -151,6 +151,7 @@ echo "---- test_async.py ----"; python /tests/test_async.py || rc=1
 echo "---- test_v107.py ----"; python /tests/test_v107.py || rc=1
 echo "---- test_v108.py ----"; python /tests/test_v108.py || rc=1
 echo "---- test_v109.py ----"; python /tests/test_v109.py || rc=1
+echo "---- test_v110.py ----"; python /tests/test_v110.py || rc=1
 exit $rc
 EOF
 )

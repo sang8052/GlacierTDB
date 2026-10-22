@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.0.9.alpha"
+const GlacierVersion = "1.0.10.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -49,6 +49,35 @@ type AsyncOpts struct {
 // MaintOpts 维护策略：VACUUM（执行期间锁该库全部写入）。
 type MaintOpts struct {
 	NoHotVacuum bool `yaml:"no_hot_vacuum"` // true = 禁止运行中 VACUUM（仅 CLI，服务停止时）
+}
+
+// QosLimit 单级 QoS 配额（v1.0.10）：0 = 不限。
+type QosLimit struct {
+	Qps         int   `yaml:"qps"`          // 每秒查询数（令牌桶）
+	Concurrency int   `yaml:"concurrency"`  // 并发执行上限
+	RowsPerSec  int64 `yaml:"rows_per_sec"` // 扫描行吞吐上限
+}
+
+// QosOpts 查询 QoS（全系统 + 单库两级；读/写/异步任务执行统一记账）。
+type QosOpts struct {
+	OnExceed  string              `yaml:"on_exceed"`  // wait = 排队等待（默认）| reject = 立即拒绝
+	Global    QosLimit            `yaml:"global"`
+	Databases map[string]QosLimit `yaml:"databases"`
+}
+
+// LockOpts 防爆破（v1.0.10）：登录失败计数、锁定与告警。
+type LockOpts struct {
+	Enable          bool   `yaml:"enable"`               // false = 关闭防爆破
+	Mode            string `yaml:"mode"`                 // ip_only | account_only | mixed（默认）
+	WindowSec       int    `yaml:"window_sec"`           // 失败计数窗口（默认 300）
+	MaxFailures     int    `yaml:"max_failures"`         // 窗口内失败阈值（默认 5）
+	MaxFailuresIP   int    `yaml:"max_failures_ip"`      // 按 IP 阈值（0 = 用 MaxFailures）
+	MaxFailuresAcct int    `yaml:"max_failures_account"` // 按账号阈值（0 = 用 MaxFailures）
+	LockSec         int    `yaml:"lock_sec"`             // 基础锁定时长（默认 900）
+	LockSecMax      int    `yaml:"lock_sec_max"`         // 锁定时长上限（指数升级，默认 86400）
+	Firewall        string `yaml:"firewall"`             // off | auto | ufw | iptables | firewall-cmd（默认 auto）
+	NotifyURL       string `yaml:"notify_url"`           // 登录失败/锁定事件 HTTP 告警（空=关闭）
+	NotifySecret    string `yaml:"notify_secret"`        // 告警 HMAC 签名密钥（可空）
 }
 
 // SecOpts 静态加密（adiantum VFS，4KiB 块加密，防外部程序直接读底层文件）。
@@ -93,6 +122,8 @@ type Config struct {
 	AsyncQuery    AsyncOpts    `yaml:"async_query"`
 	Maintenance   MaintOpts    `yaml:"maintenance"`
 	Security      SecOpts      `yaml:"security"`
+	Qos           QosOpts      `yaml:"qos"`
+	Lock          LockOpts     `yaml:"lock"`
 
 	Auth   Auth       `yaml:"auth"`
 	SQLite SQLiteOpts `yaml:"sqlite"`
@@ -126,6 +157,21 @@ func Default() *Config {
 			GlobalThreads:            0,
 			PerDBReadThreads:         0,
 			PerDBReadThreadsOverride: map[string]int{},
+		},
+		Qos: QosOpts{
+			OnExceed:  "wait",
+			Databases: map[string]QosLimit{},
+		},
+		Lock: LockOpts{
+			Enable:          true,
+			Mode:            "mixed",
+			WindowSec:       300,
+			MaxFailures:     5,
+			MaxFailuresIP:   30, // IP 维度阈值默认更宽：避免运维探测/多账号共用 IP 误锁
+			MaxFailuresAcct: 5,
+			LockSec:         900,
+			LockSecMax:      86400,
+			Firewall:        "auto",
 		},
 		SQLite: SQLiteOpts{
 			Synchronous:   "NORMAL",
@@ -228,6 +274,42 @@ func (c *Config) Fill() {
 	}
 	if c.Log.SlowQueryMs <= 0 {
 		c.Log.SlowQueryMs = 200
+	}
+	// QoS（v1.0.10）
+	if c.Qos.OnExceed != "reject" {
+		c.Qos.OnExceed = "wait"
+	}
+	if c.Qos.Databases == nil {
+		c.Qos.Databases = map[string]QosLimit{}
+	}
+	// 防爆破（v1.0.10）
+	switch c.Lock.Mode {
+	case "ip_only", "account_only", "mixed":
+	default:
+		c.Lock.Mode = "mixed"
+	}
+	switch c.Lock.Firewall {
+	case "off", "auto", "ufw", "iptables", "firewall-cmd":
+	default:
+		c.Lock.Firewall = "auto"
+	}
+	if c.Lock.WindowSec <= 0 {
+		c.Lock.WindowSec = 300
+	}
+	if c.Lock.MaxFailures <= 0 {
+		c.Lock.MaxFailures = 5
+	}
+	if c.Lock.MaxFailuresIP <= 0 {
+		c.Lock.MaxFailuresIP = 30
+	}
+	if c.Lock.MaxFailuresAcct <= 0 {
+		c.Lock.MaxFailuresAcct = c.Lock.MaxFailures
+	}
+	if c.Lock.LockSec <= 0 {
+		c.Lock.LockSec = 900
+	}
+	if c.Lock.LockSecMax < c.Lock.LockSec {
+		c.Lock.LockSecMax = 86400
 	}
 }
 

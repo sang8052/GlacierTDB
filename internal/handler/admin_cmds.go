@@ -9,6 +9,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 
 	"glaciertdb/internal/admin"
+	"glaciertdb/internal/auth"
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/logx"
 	"glaciertdb/internal/meta"
@@ -22,10 +23,30 @@ var (
 	reAdminShowClient = regexp.MustCompile(`(?i)^SHOW\s+CLIENTS$`)
 	reAdminShowTx     = regexp.MustCompile(`(?i)^SHOW\s+TRANSACTIONS$`)
 	reAdminSetPwd     = regexp.MustCompile(`(?i)^(?:SET\s+PASSWORD(?:\s+FOR\s+(\S+?))?\s*=\s*|ALTER\s+USER\s+(\S+?)\s+IDENTIFIED\s+BY\s+)'([^']{1,64})'\s*$`)
-	reAdminSelect     = regexp.MustCompile("(?i)^SELECT\\s+(.+?)\\s+FROM\\s+(server_config|clients|transactions)(?:\\s+WHERE\\s+(.+?))?(?:\\s+ORDER\\s+BY\\s+.+?)?(?:\\s+LIMIT\\s+\\d+(?:\\s*,\\s*\\d+)?)?\\s*$")
+	reAdminSelect     = regexp.MustCompile("(?i)^SELECT\\s+(.+?)\\s+FROM\\s+(server_config|clients|transactions|qos_status|users|user_grants|user_hosts|login_attempts|locked)(?:\\s+WHERE\\s+(.+?))?(?:\\s+ORDER\\s+BY\\s+.+?)?(?:\\s+LIMIT\\s+\\d+(?:\\s*,\\s*\\d+)?)?\\s*$")
 	reKillConn        = regexp.MustCompile(`(?i)^KILL\s+(?:CONNECTION\s+|QUERY\s+)?(\d+)$`)
 	reUseAdmin        = regexp.MustCompile("(?i)^USE\\s+`?(GlacierTDB|glacier)`?\\s*$") // 管理库别名：glacier 为系统内置名，禁止建库
 	reAdminSetConc    = regexp.MustCompile(`(?i)^SET\s+(GLOBAL_THREADS|PER_DB_READ_THREADS|DB_READ_THREADS)\s*(?:([A-Za-z0-9_-]+)\s*)?=\s*(\d+)\s*$`)
+
+	// ---- QoS 热改 / 查询（v1.0.10）----
+	reAdminSetQos   = regexp.MustCompile(`(?i)^SET\s+QOS\s+(GLOBAL|DB\s+([A-Za-z0-9_-]+))\s+(QPS|CONCURRENCY|ROWS_PER_SEC)\s*=\s*(\d+)\s*$`)
+	reAdminQosClear = regexp.MustCompile(`(?i)^SET\s+QOS\s+(GLOBAL|DB\s+([A-Za-z0-9_-]+))\s+CLEAR\s*$`)
+	reAdminShowQos  = regexp.MustCompile(`(?i)^SHOW\s+QOS\s*$`)
+
+	// ---- 用户权限管理（v1.0.10）----
+	reAdminCreateUser = regexp.MustCompile(`(?i)^CREATE\s+USER\s+'([^']{1,64})'(?:\s*@\s*'([^']{1,64})')?\s+IDENTIFIED\s+BY\s+'([^']{1,64})'(?:\s+(SUPER|READONLY|USER))?\s*$`)
+	reAdminDropUser   = regexp.MustCompile(`(?i)^DROP\s+USER\s+'([^']{1,64})'(?:\s*@\s*'[^']*')?\s*$`)
+	reAdminRenameUser = regexp.MustCompile(`(?i)^RENAME\s+USER\s+'([^']{1,64})'\s+TO\s+'([^']{1,64})'\s*$`)
+	reAdminAlterType  = regexp.MustCompile(`(?i)^ALTER\s+USER\s+'([^']{1,64})'\s+(SUPER|READONLY|USER)\s*$`)
+	reAdminGrant      = regexp.MustCompile(`(?i)^GRANT\s+(.+?)\s+ON\s+([^\s.]+)\s*\.\s*([^\s]+)\s+TO\s+'([^']{1,64})'(?:\s+IDENTIFIED\s+BY\s+'([^']{1,64})')?(?:\s+WITH\s+GRANT\s+OPTION)?\s*$`)
+	reAdminRevoke     = regexp.MustCompile(`(?i)^REVOKE\s+(.+?)\s+ON\s+([^\s.]+)\s*\.\s*([^\s]+)\s+FROM\s+'([^']{1,64})'\s*$`)
+	reAdminRevokeAll  = regexp.MustCompile(`(?i)^REVOKE\s+ALL\s+PRIVILEGES(?:\s*,\s*GRANT\s+OPTION)?\s+FROM\s+'([^']{1,64})'\s*$`)
+	reAdminShowGrants = regexp.MustCompile(`(?i)^SHOW\s+GRANTS(?:\s+FOR\s+'([^']+)')?\s*$`)
+
+	// ---- 防爆破审计 / 解锁（v1.0.10）----
+	reAdminShowAtt  = regexp.MustCompile(`(?i)^SHOW\s+LOGIN\s+ATTEMPTS(?:\s+LIMIT\s+(\d+))?\s*$`)
+	reAdminShowLock = regexp.MustCompile(`(?i)^SHOW\s+LOCKED\s*$`)
+	reAdminUnlock   = regexp.MustCompile(`(?i)^UNLOCK\s+(ACCOUNT\s+(\S+)|IP\s+(\S+)|ALL)\s*$`)
 )
 
 // IsAdminUse 判断是否进入/退出管理库的 USE 语句（handler 在探活层之前拦截）。
@@ -47,6 +68,9 @@ func (h *Handler) handleVacuumDB(q string) (*mysql.Result, bool, error) {
 	if h.readonly {
 		return nil, true, roErr()
 	}
+	if h.userType != auth.TypeSuper {
+		return nil, true, mysql.NewError(1142, "command denied to user '"+h.user+"' (VACUUM requires super user)")
+	}
 	if h.cfg.Maintenance.NoHotVacuum {
 		return nil, true, mysql.NewError(1149,
 			"hot VACUUM disabled (maintenance.no_hot_vacuum); 请停止服务后使用 CLI: glaciertdb -vacuum -db-dir <dir>")
@@ -60,7 +84,7 @@ func (h *Handler) handleVacuumDB(q string) (*mysql.Result, bool, error) {
 	return res, true, err2
 }
 
-// handleKill 处理 KILL <id>（全局生效，不限管理面；只读账号拒绝）。
+// handleKill 处理 KILL <id>（全局生效，不限管理面；只读/普通用户拒绝）。
 func (h *Handler) handleKill(q string) (handled bool, err error) {
 	m := reKillConn.FindStringSubmatch(q)
 	if m == nil {
@@ -68,6 +92,9 @@ func (h *Handler) handleKill(q string) (handled bool, err error) {
 	}
 	if h.readonly {
 		return true, roErr()
+	}
+	if h.userType != auth.TypeSuper {
+		return true, mysql.NewError(1142, "command denied to user '"+h.user+"' (KILL requires super user)")
 	}
 	var id uint64
 	fmt.Sscanf(m[1], "%d", &id)
@@ -115,29 +142,32 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		if h.readonly {
 			return nil, true, roErr()
 		}
+		if h.userType != auth.TypeSuper {
+			return nil, true, mysql.NewError(1142, "command denied to user '"+h.user+"' (SET PASSWORD requires super user)")
+		}
 		m := reAdminSetPwd.FindStringSubmatch(q)
 		newPwd := m[3]
 		if strings.TrimSpace(newPwd) == "" {
 			return nil, true, mysql.NewError(1819, "Your password does not satisfy the current policy requirements (empty)")
 		}
 		// 目标账号：SET PASSWORD FOR <user> / ALTER USER <user>（缺省 = 管理员自己）；
-		// 命中只读账号名则改只读密码（v1.0.9：与管理员密码同等热改、同一 glacier.json 持久化）
-		target := m[1]
+		// 用户系统为主（glacier_auth.db），同时镜像 legacy glacier.json（兼容旧版策略）
+		target := strings.Trim(strings.TrimSpace(m[1]+m[2]), "`\"'")
 		if target == "" {
-			target = m[2]
+			target = h.cfg.Auth.User
 		}
-		var err error
-		whom := "admin"
-		if target != "" && h.cfg.IsReadOnlyUser(target) {
-			err = h.backend.SetReadonlyPassword(newPwd)
-			whom = target + " (readonly)"
-		} else {
-			err = h.backend.SetAuthPassword(newPwd)
+		if h.auths != nil {
+			if err := h.auths.SetPassword(target, newPwd); err != nil {
+				return nil, true, mysql.NewError(1105, err.Error())
+			}
 		}
-		if err != nil {
-			return nil, true, mysql.NewError(1105, "persist password failed: "+err.Error())
+		// legacy 镜像（仅两个内置账号有对应字段）
+		if target == h.cfg.Auth.User {
+			_ = h.backend.SetAuthPassword(newPwd)
+		} else if h.cfg.Auth.ReadOnlyUser != "" && strings.EqualFold(target, h.cfg.Auth.ReadOnlyUser) {
+			_ = h.backend.SetReadonlyPassword(newPwd)
 		}
-		logx.Infof("auth password changed for %s via admin command (by conn %d)", whom, h.connID)
+		logx.Infof("auth password changed for %s via admin command (by conn %d)", target, h.connID)
 		return meta.OKResultPub(), true, nil
 
 	case reAdminSetConc.MatchString(q):
@@ -162,6 +192,183 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		}
 		logx.Infof("concurrency %s[%s] set to %d via admin command (runtime only, by conn %d)",
 			strings.ToUpper(m[1]), db, val, h.connID)
+		return meta.OKResultPub(), true, nil
+
+	// ---- QoS（v1.0.10）----
+	case reAdminSetQos.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminSetQos.FindStringSubmatch(q)
+		val := 0
+		fmt.Sscanf(m[4], "%d", &val)
+		lim := h.qosLimitFor(m[1], m[2])
+		switch strings.ToUpper(m[3]) {
+		case "QPS":
+			lim.Qps = val
+		case "CONCURRENCY":
+			lim.Concurrency = val
+		case "ROWS_PER_SEC":
+			lim.RowsPerSec = int64(val)
+		}
+		if strings.EqualFold(m[1], "GLOBAL") {
+			h.backend.SetQosGlobal(lim)
+		} else {
+			h.backend.SetQosDB(m[2], lim)
+		}
+		logx.Infof("qos %s %s set to %d via admin command (runtime only, by conn %d)", m[1], m[3], val, h.connID)
+		return meta.OKResultPub(), true, nil
+
+	case reAdminQosClear.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminQosClear.FindStringSubmatch(q)
+		if strings.EqualFold(m[1], "GLOBAL") {
+			h.backend.SetQosGlobal(sqliteQosLimitZero())
+		} else {
+			h.backend.ClearQosDB(m[2])
+		}
+		return meta.OKResultPub(), true, nil
+
+	case reAdminShowQos.MatchString(q):
+		rows := h.qosRows()
+		res, err := meta.SimpleRS([]string{"scope", "qps", "concurrency", "rows_per_sec", "passed", "queued", "rejected", "waiting", "avg_wait_ms"}, rows)
+		return res, true, err
+
+	// ---- 用户权限管理（v1.0.10）----
+	case reAdminCreateUser.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminCreateUser.FindStringSubmatch(q)
+		typ := auth.TypeUser
+		if m[4] != "" {
+			switch strings.ToUpper(m[4]) {
+			case "SUPER":
+				typ = auth.TypeSuper
+			case "READONLY":
+				typ = auth.TypeReadonly
+			}
+		}
+		if err := h.auths.CreateUser(m[1], m[3], m[2], typ); err != nil {
+			return nil, true, mysql.NewError(1396, "create user failed: "+err.Error())
+		}
+		logx.Infof("user %s@%s created (type=%s) by conn %d", m[1], m[2], typ, h.connID)
+		return meta.OKResultPub(), true, nil
+
+	case reAdminDropUser.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminDropUser.FindStringSubmatch(q)
+		if err := h.auths.DropUser(m[1]); err != nil {
+			return nil, true, mysql.NewError(1105, err.Error())
+		}
+		logx.Infof("user %s dropped by conn %d", m[1], h.connID)
+		return meta.OKResultPub(), true, nil
+
+	case reAdminRenameUser.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminRenameUser.FindStringSubmatch(q)
+		if err := h.auths.RenameUser(m[1], m[2]); err != nil {
+			return nil, true, mysql.NewError(1105, err.Error())
+		}
+		return meta.OKResultPub(), true, nil
+
+	case reAdminAlterType.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminAlterType.FindStringSubmatch(q)
+		if err := h.auths.SetAccountType(m[1], strings.ToLower(m[2])); err != nil {
+			return nil, true, mysql.NewError(1105, err.Error())
+		}
+		logx.Infof("user %s account_type set to %s by conn %d", m[1], m[2], h.connID)
+		return meta.OKResultPub(), true, nil
+
+	case reAdminGrant.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminGrant.FindStringSubmatch(q)
+		if err := h.auths.Grant(m[4], unquoteGrantIdent(m[2]), unquoteGrantIdent(m[3]), m[1],
+			strings.Contains(strings.ToUpper(q), "GRANT OPTION")); err != nil {
+			return nil, true, mysql.NewError(1105, err.Error())
+		}
+		if m[5] != "" {
+			_ = h.auths.SetPassword(m[4], m[5])
+		}
+		logx.Infof("granted %s ON %s.%s TO %s by conn %d", m[1], m[2], m[3], m[4], h.connID)
+		return meta.OKResultPub(), true, nil
+
+	case reAdminRevoke.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminRevoke.FindStringSubmatch(q)
+		if err := h.auths.Revoke(m[4], unquoteGrantIdent(m[2]), unquoteGrantIdent(m[3]), m[1]); err != nil {
+			return nil, true, mysql.NewError(1105, err.Error())
+		}
+		return meta.OKResultPub(), true, nil
+
+	case reAdminRevokeAll.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminRevokeAll.FindStringSubmatch(q)
+		if err := h.auths.Revoke(m[1], "*", "*", ""); err != nil {
+			return nil, true, mysql.NewError(1105, err.Error())
+		}
+		return meta.OKResultPub(), true, nil
+
+	case reAdminShowGrants.MatchString(q):
+		m := reAdminShowGrants.FindStringSubmatch(q)
+		who := m[1]
+		if who == "" {
+			who = h.user
+		}
+		rows := h.grantRows(who)
+		res, err := meta.SimpleRS([]string{"Grants for " + who + "@%"}, rows)
+		return res, true, err
+
+	// ---- 防爆破审计 / 解锁（v1.0.10）----
+	case reAdminShowAtt.MatchString(q):
+		limit := 100
+		if m := reAdminShowAtt.FindStringSubmatch(q); m != nil && m[1] != "" {
+			fmt.Sscanf(m[1], "%d", &limit)
+		}
+		rows := h.attemptRows(limit)
+		res, err := meta.SimpleRS([]string{"Id", "Time", "IP", "Remote", "User", "Success", "Reason"}, rows)
+		return res, true, err
+
+	case reAdminShowLock.MatchString(q):
+		rows := h.lockRows()
+		res, err := meta.SimpleRS([]string{"LockKey", "LockType", "LockedAt", "Until", "FailCount", "Level"}, rows)
+		return res, true, err
+
+	case reAdminUnlock.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminUnlock.FindStringSubmatch(q)
+		switch {
+		case m[2] != "":
+			_ = h.auths.UnlockAccount(strings.Trim(m[2], "`\"'"))
+		case m[3] != "":
+			_ = h.auths.UnlockIP(strings.Trim(m[3], "`\"'"))
+		default:
+			for _, r := range h.auths.Locks() {
+				if r.LockType == "ip" {
+					_ = h.auths.UnlockIP(strings.TrimPrefix(r.LockKey, "ip:"))
+				} else {
+					_ = h.auths.UnlockAccount(strings.TrimPrefix(r.LockKey, "acct:"))
+				}
+			}
+		}
+		logx.Infof("unlock executed by conn %d: %s", h.connID, q)
 		return meta.OKResultPub(), true, nil
 	}
 
@@ -193,6 +400,24 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 					})
 				}
 			}
+		case "qos_status":
+			cols = []string{"scope", "qps", "concurrency", "rows_per_sec", "passed", "queued", "rejected", "waiting", "avg_wait_ms"}
+			rows = h.qosRows()
+		case "users":
+			cols = []string{"username", "account_type", "default_db", "locked", "locked_until"}
+			rows = h.userRows()
+		case "user_grants":
+			cols = []string{"username", "db_name", "table_name", "privs", "grant_option"}
+			rows = h.userGrantRows()
+		case "user_hosts":
+			cols = []string{"username", "host_pattern"}
+			rows = h.userHostRows()
+		case "login_attempts":
+			cols = []string{"Id", "Time", "IP", "Remote", "User", "Success", "Reason"}
+			rows = h.attemptRows(200)
+		case "locked":
+			cols = []string{"LockKey", "LockType", "LockedAt", "Until", "FailCount", "Level"}
+			rows = h.lockRows()
 		}
 		rows = filterAdminRows(cols, rows, where)
 		res, err := meta.SimpleRS(cols, rows)
@@ -333,4 +558,128 @@ func (h *Handler) Kill() {
 	if h.mc != nil {
 		h.mc.Close()
 	}
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.10 辅助：管理命令权限门 / QoS / 用户权限视图
+// ---------------------------------------------------------------------------
+
+// adminMutateGate 管理面变更命令统一权限门：只读 1290，普通用户 1142，仅 super 放行。
+func (h *Handler) adminMutateGate() error {
+	if h.readonly {
+		return roErr()
+	}
+	if h.userType != auth.TypeSuper {
+		return mysql.NewError(1142, "command denied to user '"+h.user+"' (admin mutate requires super user)")
+	}
+	if h.auths == nil {
+		return mysql.NewError(1105, "auth store unavailable")
+	}
+	return nil
+}
+
+// sqliteQosLimitZero 全零配额（SET QOS GLOBAL CLEAR = 不限）。
+func sqliteQosLimitZero() config.QosLimit {
+	return config.QosLimit{}
+}
+
+// qosLimitFor 取当前生效的某级配额（供 SET QOS 单项改写）。
+func (h *Handler) qosLimitFor(scope, db string) config.QosLimit {
+	for _, r := range h.backend.QoSInfo() {
+		if strings.EqualFold(r.Scope, scope) || (scope != "GLOBAL" && strings.EqualFold(r.Scope, db)) {
+			return config.QosLimit{Qps: r.Lim.Qps, Concurrency: r.Lim.Concurrency, RowsPerSec: r.Lim.RowsPerSec}
+		}
+	}
+	return config.QosLimit{}
+}
+
+// qosRows SHOW QOS / qos_status 输出。
+func (h *Handler) qosRows() [][]any {
+	var rows [][]any
+	for _, r := range h.backend.QoSInfo() {
+		rows = append(rows, []any{r.Scope, r.Lim.Qps, r.Lim.Concurrency, r.Lim.RowsPerSec,
+			r.Passed, r.Queued, r.Rejected, r.Waiting, r.AvgWaitMs})
+	}
+	return rows
+}
+
+// userRows users 表（不含密码）。
+func (h *Handler) userRows() [][]any {
+	var rows [][]any
+	for _, u := range h.auths.Users() {
+		rows = append(rows, []any{u.Username, u.Type, u.DefaultDB, b2s(u.Locked), u.LockedTo})
+	}
+	return rows
+}
+
+// userGrantRows user_grants 表。
+func (h *Handler) userGrantRows() [][]any {
+	var rows [][]any
+	for _, g := range h.auths.GrantsFor("") {
+		rows = append(rows, []any{g.Username, g.DB, g.Table, g.Privs, b2s(g.GrantOption)})
+	}
+	return rows
+}
+
+// userHostRows user_hosts 表。
+func (h *Handler) userHostRows() [][]any {
+	var rows [][]any
+	for _, hh := range h.auths.Hosts() {
+		rows = append(rows, []any{hh.Username, hh.HostPattern})
+	}
+	return rows
+}
+
+// grantRows SHOW GRANTS 输出（生成 MySQL 风格 GRANT 语句）。
+func (h *Handler) grantRows(username string) [][]any {
+	u, ok, _ := h.auths.Lookup(username)
+	if !ok {
+		return [][]any{{fmt.Sprintf("There is no such grant defined for user '%s'", username)}}
+	}
+	var rows [][]any
+	switch u.Type {
+	case auth.TypeSuper:
+		rows = append(rows, []any{fmt.Sprintf("GRANT ALL PRIVILEGES ON *.* TO '%s'@'%%' WITH GRANT OPTION", username)})
+	case auth.TypeReadonly:
+		rows = append(rows, []any{fmt.Sprintf("GRANT SELECT ON *.* TO '%s'@'%%'", username)})
+	default:
+		if gs := h.auths.GrantsFor(username); len(gs) == 0 {
+			rows = append(rows, []any{fmt.Sprintf("GRANT USAGE ON *.* TO '%s'@'%%'", username)})
+		}
+		for _, g := range h.auths.GrantsFor(username) {
+			line := fmt.Sprintf("GRANT %s ON %s.%s TO '%s'@'%%'", g.Privs, g.DB, g.Table, username)
+			if g.GrantOption {
+				line += " WITH GRANT OPTION"
+			}
+			rows = append(rows, []any{line})
+		}
+	}
+	return rows
+}
+
+// attemptRows SHOW LOGIN ATTEMPTS 输出。
+func (h *Handler) attemptRows(limit int) [][]any {
+	var rows [][]any
+	for _, a := range h.auths.Attempts(limit) {
+		rows = append(rows, []any{a.ID, a.TS, a.IP, a.Remote, a.Username, b2s(a.Success), a.Reason})
+	}
+	return rows
+}
+
+// lockRows SHOW LOCKED 输出。
+func (h *Handler) lockRows() [][]any {
+	var rows [][]any
+	for _, r := range h.auths.Locks() {
+		rows = append(rows, []any{r.LockKey, r.LockType, r.LockedAt, r.UntilTS, int64(r.FailCount), int64(r.Level)})
+	}
+	return rows
+}
+
+// unquoteGrantIdent 去掉 GRANT/REVOKE 目标标识符引号（* 原样）。
+func unquoteGrantIdent(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "*" {
+		return s
+	}
+	return strings.Trim(s, "`\"'[]")
 }

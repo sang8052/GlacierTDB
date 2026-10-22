@@ -197,6 +197,8 @@ func RewriteLastInsertID(q string) string { return reLastInsertIDCall.ReplaceAll
 
 // RewriteDialect 少量 MySQL 函数改写。
 func RewriteDialect(q string) string {
+	// ---- JSON 运算符（v1.0.10）----
+	q = RewriteJSONOps(q) // -> / ->> → json_extract 等价形式
 	// ---- 时序改写 ----
 	q = expandInterval(q) // NOW() ± INTERVAL n UNIT → epoch ms 整数表达式（防 ts 列全表扫）
 	if reDatePred.MatchString(q) { // ts >= 'YYYY-MM-DD ...' → 整数化（INTEGER 列与 TEXT 字面量比较会静默恒真/恒假）

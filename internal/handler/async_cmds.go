@@ -22,13 +22,17 @@ var (
 	reQResultFn  = regexp.MustCompile(`(?is)^SELECT\s+\*\s+FROM\s+query_result\s*\(\s*'([^']+)'\s*\)\s*(?:LIMIT\s+(\d+))?\s*(?:OFFSET\s+(\d+))?\s*$`)
 	reCancelJob  = regexp.MustCompile(`(?i)^CANCEL\s+QUERY\s+'?([A-Za-z0-9_]+)'?\s*$`)
 	reDropJob    = regexp.MustCompile(`(?i)^DROP\s+QUERY\s+RESULT\s+'?([A-Za-z0-9_]+)'?\s*$`)
+	rePauseJob   = regexp.MustCompile(`(?i)^PAUSE\s+QUERY\s+'?([A-Za-z0-9_]+)'?\s*$`)
+	reResumeJob  = regexp.MustCompile(`(?i)^RESUME\s+QUERY\s+'?([A-Za-z0-9_]+)'?\s*$`)
 	reShowJobs   = regexp.MustCompile(`(?i)^SHOW\s+QUERY\s+JOBS\s*$`)
 	reShowQVars  = regexp.MustCompile(`(?i)^SHOW\s+QUERY\s+VARS\s*$`)
+	reShowSched  = regexp.MustCompile(`(?i)^SHOW\s+QUERY\s+SCHEDULE\s*$`)
+	reSchedTable = regexp.MustCompile(`(?is)^SELECT\s+(.+?)\s+FROM\s+query_schedule(?:\s+WHERE\s+(.+?))?(?:\s+ORDER\s+BY\s+.+?)?(?:\s+LIMIT\s+\d+(?:\s*,\s*\d+)?)?\s*$`)
 	reJobsTable  = regexp.MustCompile(`(?is)^SELECT\s+(.+?)\s+FROM\s+query_jobs(?:\s+WHERE\s+(.+?))?(?:\s+ORDER\s+BY\s+.+?)?(?:\s+LIMIT\s+\d+(?:\s*,\s*\d+)?)?\s*$`)
 )
 
 // parseSubmitOpts 解析 SUBMIT 之后的选项段。
-func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time.Time, win [2]string, weekWd int, when, part, partBytes, script, scriptOut string, retainSec, everySec int, everyAt string, err error) {
+func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time.Time, win [2]string, weekWd int, when, part, partBytes, script, scriptOut string, retainSec, everySec int, everyAt string, everyWd, everyWeeks int, err error) {
 	s := strings.TrimSpace(rest)
 	// WHEN 到 PARTITION/SCRIPT 前的整段。v1.0.9 修复：WHEN 作为首个选项
 	// （紧跟 SQL 引号）时，旧正则要求 WHEN 前必须有空白，导致报 unknown SUBMIT
@@ -142,6 +146,22 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 		case "EVERY":
 			v := strings.ToUpper(next())
 			i++
+			// parseOnAt 解析可选的 ON <周几> 与 AT 'HH:MM' 后缀（EVERY WEEK/WEEKS 用）。
+			parseOnAt := func() error {
+				if i+1 < len(toks) && strings.EqualFold(toks[i+1], "ON") {
+					if d, ok := parseWeekday(strings.Trim(toks[i+2], "'")); ok {
+						everyWd = d
+						i += 2
+					} else {
+						return fmt.Errorf("invalid EVERY ... ON %q (expect 周一..周日 / MON..SUN)", toks[i+2])
+					}
+				}
+				if i+1 < len(toks) && strings.ToUpper(toks[i+1]) == "AT" {
+					everyAt = strings.Trim(toks[i+2], "'")
+					i += 2
+				}
+				return nil
+			}
 			switch v {
 			case "DAY":
 				everySec = 86400
@@ -149,6 +169,14 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 				if i+1 < len(toks) && strings.ToUpper(toks[i+1]) == "AT" {
 					everyAt = strings.Trim(toks[i+2], "'")
 					i += 2
+				}
+			case "WEEK", "WEEKS":
+				// EVERY WEEK [ON 周X] [AT 'HH:MM']（v1.0.10；缺省周几 = 提交日）
+				everyWeeks = 1
+				everyWd = todayWeekdayCN()
+				if e := parseOnAt(); e != nil {
+					err = e
+					return
 				}
 			case "HOUR":
 				everySec = 3600
@@ -159,7 +187,7 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 			default:
 				var n int
 				if _, e := fmt.Sscanf(v, "%d", &n); e != nil || n <= 0 {
-					err = fmt.Errorf("invalid EVERY %q (expect DAY [AT 'HH:MM'] / HOUR / MINUTE / SECOND / n SECONDS|MINUTES|HOURS)", v)
+					err = fmt.Errorf("invalid EVERY %q (expect DAY [AT 'HH:MM'] / WEEK [ON 周X] [AT 'HH:MM'] / HOUR / MINUTE / SECOND / n SECONDS|MINUTES|HOURS|WEEKS)", v)
 					return
 				}
 				u := strings.ToUpper(next())
@@ -171,6 +199,14 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 					everySec = n * 60
 				case "HOUR", "HOURS":
 					everySec = n * 3600
+				case "WEEK", "WEEKS":
+					// EVERY n WEEKS [ON 周X] [AT 'HH:MM']（v1.0.10）
+					everyWeeks = n
+					everyWd = todayWeekdayCN()
+					if e := parseOnAt(); e != nil {
+						err = e
+						return
+					}
 				default:
 					err = fmt.Errorf("invalid EVERY unit %q", u)
 					return
@@ -241,9 +277,11 @@ func parseAtTime(s string) (time.Time, error) {
 }
 
 // parseWeekday 解析周几：周一..周日 / 周1..周7 / MON..SUN → 1..7（周一=1，周日=7）。
+// v1.0.10 修复：原 t[0:1] == "周" 取的是首字节，与三字节汉字永远不等，
+// 中文周几写法（周五 等）此前解析恒失败。
 func parseWeekday(s string) (int, bool) {
 	t := strings.ToUpper(strings.TrimSpace(s))
-	if len(t) >= 2 && (t[0:1] == "周" || strings.HasPrefix(t, "星期")) {
+	if strings.HasPrefix(t, "周") || strings.HasPrefix(t, "星期") {
 		num := strings.TrimPrefix(strings.TrimPrefix(t, "星期"), "周")
 		switch num {
 		case "一", "1":
@@ -293,7 +331,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			return nil, true, roErr()
 		}
 		sqlText := strings.ReplaceAll(m[1], "''", "'")
-		cb, cbOpt, sign, timeout, at, win, weekWd, when, part, partBytes, script, scriptOut, retainSec, everySec, everyAt, perr := parseSubmitOpts(m[2])
+		cb, cbOpt, sign, timeout, at, win, weekWd, when, part, partBytes, script, scriptOut, retainSec, everySec, everyAt, everyWd, everyWeeks, perr := parseSubmitOpts(m[2])
 		if perr != nil {
 			return nil, true, mysql.NewError(1064, perr.Error())
 		}
@@ -314,7 +352,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			SQL: sqlText, CallbackURL: cb, SignSecret: sign, TimeoutSec: timeout,
 			At: at, Window: win, WindowWd: weekWd, WhenExpr: when, PartRows: partRows, PartBytes: partBytesN,
 			Script: script, ScriptOut: scriptOut, RetainSec: retainSec,
-			EverySec: everySec, EveryAt: everyAt,
+			EverySec: everySec, EveryAt: everyAt, EveryWd: everyWd, EveryWeeks: everyWeeks,
 		}
 		// 回调通道解析：http(s):// | tcp://host:port | amqp://… | kafka://broker
 		lcb := strings.ToLower(cb)
@@ -429,11 +467,97 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		}
 		return meta.OKResultPub(), true, nil
 	}
+	// PAUSE QUERY 'id' / RESUME QUERY 'id'（v1.0.10：周期链排期挂起/恢复）
+	if m := rePauseJob.FindStringSubmatch(s); m != nil {
+		if h.async == nil {
+			return nil, true, mysql.NewError(1235, "async query is disabled")
+		}
+		if h.readonly {
+			return nil, true, roErr()
+		}
+		if err := h.async.Pause(m[1]); err != nil {
+			return nil, true, mysql.NewError(1105, err.Error())
+		}
+		return meta.OKResultPub(), true, nil
+	}
+	if m := reResumeJob.FindStringSubmatch(s); m != nil {
+		if h.async == nil {
+			return nil, true, mysql.NewError(1235, "async query is disabled")
+		}
+		if h.readonly {
+			return nil, true, roErr()
+		}
+		if err := h.async.Resume(m[1]); err != nil {
+			return nil, true, mysql.NewError(1105, err.Error())
+		}
+		return meta.OKResultPub(), true, nil
+	}
+
+	// SHOW QUERY SCHEDULE / query_schedule 表（v1.0.10：周期配置查询）
+	if reShowSched.MatchString(s) || reSchedTable.MatchString(s) {
+		if h.async == nil {
+			return nil, true, mysql.NewError(1235, "async query is disabled")
+		}
+		cols := schedCols
+		var rows [][]any
+		for _, r := range h.async.Schedule() {
+			rows = append(rows, []any{r.RecurGroup, r.JobID, r.SQL, r.Schedule, r.Window, r.When,
+				r.NextRun, r.LastRun, r.LastState, b2s(r.Paused)})
+		}
+		where := ""
+		if m := reSchedTable.FindStringSubmatch(s); m != nil {
+			where = m[2]
+			names := splitCols(m[1])
+			if strings.TrimSpace(m[1]) != "*" && len(names) > 0 {
+				out := projectRows(cols, filterRowsByCols(cols, rows, where), names)
+				res, err := meta.SimpleRS(names, out)
+				return res, true, err
+			}
+		}
+		res, err := meta.SimpleRS(cols, filterRowsByCols(cols, rows, where))
+		return res, true, err
+	}
 	return nil, false, nil
 }
 
+// schedCols query_schedule 列。
+var schedCols = []string{"recur_group", "job_id", "sql", "schedule", "window", "when", "next_run", "last_run", "last_state", "paused"}
+
+// todayWeekdayCN 今天是周几（1..7=周一..周日）。
+func todayWeekdayCN() int {
+	d := int(time.Now().Weekday())
+	if d == 0 {
+		return 7
+	}
+	return d
+}
+
+// projectRows 按列名投影（未知列补 NULL）。
+func projectRows(cols []string, rows [][]any, names []string) [][]any {
+	idxm := func(name string) int {
+		for i, c := range cols {
+			if strings.EqualFold(c, name) {
+				return i
+			}
+		}
+		return -1
+	}
+	var out [][]any
+	for _, r := range rows {
+		row := make([]any, len(names))
+		for j, n := range names {
+			if i := idxm(n); i >= 0 && i < len(r) {
+				row[j] = r[i]
+			}
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
 var asyncJobCols = []string{"job_id", "state", "sql", "submit_ts", "elapsed_ms", "rows", "bytes",
-	"error", "callback_url", "at", "window", "when", "every_sec", "recur_group", "partition_rows", "partition_bytes"}
+	"error", "callback_url", "at", "window", "when", "every_sec", "recur_group", "partition_rows", "partition_bytes",
+	"qos_wait_ms", "schedule"}
 
 func jobsRows(jobs []asyncq.Job) [][]any {
 	var out [][]any
@@ -452,7 +576,8 @@ func jobsRows(jobs []asyncq.Job) [][]any {
 		}
 		out = append(out, []any{j.ID, string(j.State), j.SQL,
 			j.SubmitTS.Format("2006-01-02 15:04:05"), j.ElapsedMs, j.Rows, j.Bytes,
-			j.Error, j.CallbackURL, at, win, j.WhenExpr, j.EverySec, j.RecurGroup, j.PartRows, j.PartBytes})
+			j.Error, j.CallbackURL, at, win, j.WhenExpr, j.EverySec, j.RecurGroup, j.PartRows, j.PartBytes,
+			j.QosWaitMs, j.ScheduleExpr()})
 	}
 	return out
 }
@@ -466,8 +591,13 @@ func weekdayCN(wd int) string {
 	return fmt.Sprintf("周%d", wd)
 }
 
-// filterAsyncRows 支持 col = 'v' / col LIKE 'p' / col IN (...) AND 组合。
+// filterAsyncRows 支持 col = 'v' / col LIKE 'p' / col IN (...) AND 组合（query_jobs 列）。
 func filterAsyncRows(rows [][]any, where string) [][]any {
+	return filterRowsByCols(asyncJobCols, rows, where)
+}
+
+// filterRowsByCols 泛化版 WHERE 过滤（= / LIKE / IN 的 AND 组合，NOW() 求值）。
+func filterRowsByCols(cols []string, rows [][]any, where string) [][]any {
 	where = strings.TrimSpace(where)
 	if where == "" {
 		return rows
@@ -494,7 +624,7 @@ func filterAsyncRows(rows [][]any, where string) [][]any {
 		ok := true
 		for _, c := range conds {
 			idx := -1
-			for i, name := range asyncJobCols {
+			for i, name := range cols {
 				if strings.EqualFold(name, c.col) {
 					idx = i
 					break

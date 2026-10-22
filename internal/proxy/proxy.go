@@ -9,6 +9,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/server"
 
 	"glaciertdb/internal/admin"
+	"glaciertdb/internal/auth"
 	"glaciertdb/internal/asyncq"
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/handler"
@@ -18,7 +19,7 @@ import (
 )
 
 // Run 阻塞监听并服务连接。
-func Run(cfg *config.Config, backend *sqlite.Backend) error {
+func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store) error {
 	meta.MapSQLError = handler.MapSQLiteErr
 
 	reg := admin.NewRegistry()
@@ -44,11 +45,12 @@ func Run(cfg *config.Config, backend *sqlite.Backend) error {
 			logx.Errorf("accept: %v", err)
 			continue
 		}
-		go handleConn(srv, c, cfg, backend, reg, aq)
+		go handleConn(srv, c, cfg, backend, reg, aq, store)
 	}
 }
 
-func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *sqlite.Backend, reg *admin.Registry, aq *asyncq.Engine) {
+func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *sqlite.Backend,
+	reg *admin.Registry, aq *asyncq.Engine, store *auth.Store) {
 	remote := raw.RemoteAddr().String()
 	logx.Debugf("new connection from %s", remote)
 	// 初始握手包的 status 位默认 0（无 AUTOCOMMIT），会导致 pymysql/SQLAlchemy
@@ -62,7 +64,7 @@ func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 		return
 	}
 
-	h, err := handler.New(backend, cfg, remote, cfg.DefaultDB, reg, aq)
+	h, err := handler.New(backend, cfg, remote, cfg.DefaultDB, reg, aq, store)
 	if err != nil {
 		logx.Errorf("open sqlite session for %s: %v", remote, err)
 		raw.Close()
@@ -70,22 +72,9 @@ func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 	}
 	defer h.Close()
 
-	// 显式使用 mysql_native_password（NewConn 的默认 handler 会强制 caching_sha2）
-	authHandler := server.NewInMemoryAuthenticationHandler(mysql.AUTH_NATIVE_PASSWORD)
-	if err := authHandler.AddUser(cfg.Auth.User, backend.GetAuthPassword()); err != nil {
-		logx.Errorf("add auth user: %v", err)
-		raw.Close()
-		return
-	}
-	// 只读账号（v1.0.9）与管理账号同等认证：密码可配置/热改（glacier.json）；
-	// readonly_password 为空 = 禁用只读登录
-	if cfg.Auth.ReadOnlyUser != "" && backend.GetReadonlyPassword() != "" {
-		if err := authHandler.AddUser(cfg.Auth.ReadOnlyUser, backend.GetReadonlyPassword()); err != nil {
-			logx.Errorf("add readonly auth user %s: %v", cfg.Auth.ReadOnlyUser, err)
-			raw.Close()
-			return
-		}
-	}
+	// 认证走用户权限系统（v1.0.10）：每连接一个 Handler（捕获来源 IP），
+	// GetCredential 阶段完成 IP/账号锁定与 host 授权检查，失败/成功落审计并防爆破计数
+	authHandler := auth.NewHandler(store, remote)
 	mc, err := srv.NewCustomizedConn(c, authHandler, h)
 	if err != nil {
 		logx.Debugf("handshake with %s failed: %v", remote, err)

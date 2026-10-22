@@ -18,7 +18,8 @@ import (
 	sqlite3 "github.com/ncruces/go-sqlite3"
 )
 
-// registerCompatFuncs 在新物理连接上注册 MySQL 兼容标量函数。
+// registerCompatFuncs 在新物理连接上注册 MySQL 兼容标量函数
+// （MD5/SHA 族 + JSON 函数 + Geo/ST 函数，v1.0.8/v1.0.10）。
 func registerCompatFuncs(c *sqlite3.Conn) error {
 	reg := func(name string, nArg int, fn sqlite3.ScalarFunction) error {
 		return c.CreateFunction(name, nArg, sqlite3.DETERMINISTIC, fn)
@@ -31,7 +32,7 @@ func registerCompatFuncs(c *sqlite3.Conn) error {
 		}
 		return nil
 	}
-	return must(
+	if err := must(
 		// 哈希族：入参 NULL → NULL，否则 32/40/64 位小写 hex
 		reg("md5", 1, func(ctx sqlite3.Context, arg ...sqlite3.Value) {
 			if arg[0].Type() == sqlite3.NULL {
@@ -235,7 +236,18 @@ func registerCompatFuncs(c *sqlite3.Conn) error {
 			}
 			ctx.ResultText(mysqlDateFormat(t, arg[1].Text()))
 		}),
-	)
+	); err != nil {
+		return err
+	}
+	if err := must(
+		// JSON 兼容函数（v1.0.10：json_length/contains/keys/search/merge_patch）
+		registerJSONFuncs(c),
+		// Geo/ST 函数族（v1.0.10：WKT/WKB/GeoJSON 自动识别）
+		registerGeoFuncs(c),
+	); err != nil {
+		return err
+	}
+	return nil
 }
 
 // strIntArgs 取 (text, int) 参数对；任一为 NULL → 结果 NULL 返回 false。

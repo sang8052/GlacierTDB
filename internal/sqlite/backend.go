@@ -27,6 +27,9 @@ import (
 // authMetaFile 管理面改密的持久化文件（位于 db 目录）。
 const authMetaFile = "glacier.json"
 
+// SystemAuthDB 用户权限系统库文件名（v1.0.10：glacier_auth.db，不对客户端暴露）。
+const SystemAuthDB = "glacier_auth"
+
 // 合法库名：字母数字下划线连字符（防路径穿越）
 var reDBName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
@@ -55,6 +58,8 @@ type Backend struct {
 
 	encrypt    bool
 	passphrase string
+
+	qos *qosManager // 查询 QoS（v1.0.10：全系统 + 单库两级）
 }
 
 // Session 是一个客户端连接专属的 SQLite 会话（独占一个物理连接，绑定当前库）。
@@ -69,6 +74,7 @@ type Session struct {
 	holdsLock bool      // 当前持有本库写锁
 	writeMu   *sync.Mutex // AcquireWrite 时记录的锁对象
 	startedAt time.Time
+	qosWaitMs int64 // 最近一次执行的 QoS 排队毫秒
 }
 
 // NewBackend 创建后端并自检（目录存在/可写、默认库可用）。
@@ -84,6 +90,7 @@ func NewBackend(cfg *config.Config) (*Backend, error) {
 		readGlobal:   newDynSem(cfg.Concurrency.PerDBReadThreads),
 		readSemTab:   make(map[string]*dynSem),
 		readOv:       make(map[string]int),
+		qos:          newQoSManager(cfg.Qos),
 	}
 	for db, n := range cfg.Concurrency.PerDBReadThreadsOverride {
 		b.readOv[db] = n
@@ -212,7 +219,7 @@ func (s *Session) CreateDatabase(name string) error { return s.backend.CreateDat
 // DropDatabase 删除库。
 func (s *Session) DropDatabase(name string) error { return s.backend.DropDatabase(name) }
 
-// ListDatabases 列出目录下所有库（.db 文件名）。
+// ListDatabases 列出目录下所有库（.db 文件名；系统库 glacier_auth 不对客户端暴露）。
 func (b *Backend) ListDatabases() []string {
 	entries, err := os.ReadDir(b.dir)
 	if err != nil {
@@ -222,18 +229,31 @@ func (b *Backend) ListDatabases() []string {
 	for _, e := range entries {
 		name := e.Name()
 		if strings.HasSuffix(name, ".db") {
-			out = append(out, strings.TrimSuffix(name, ".db"))
+			db := strings.TrimSuffix(name, ".db")
+			if db == SystemAuthDB {
+				continue
+			}
+			out = append(out, db)
 		}
 	}
 	sort.Strings(out)
 	return out
 }
 
+// OpenSystemDB 打开系统库（glacier_auth.db，用户权限系统），供 auth 包使用。
+// 与业务库同一 DSN 语义（含加密 VFS）；每连接固定 1 物理连接。
+func (b *Backend) OpenSystemDB() (*sql.DB, error) {
+	return b.openFileRetry(b.fileFor(SystemAuthDB), 2)
+}
+
 // CreateDatabase 创建一个库（空 .db 文件，应用 WAL）。
-// glacier 为系统内置库名（管理面别名），不允许创建。
+// glacier 为系统内置库名（管理面别名），glacier_auth 为系统库，均不允许创建。
 func (b *Backend) CreateDatabase(name string) error {
 	if strings.EqualFold(name, "glacier") {
 		return fmt.Errorf("database name 'glacier' is reserved for the built-in admin database")
+	}
+	if name == SystemAuthDB {
+		return fmt.Errorf("database name '%s' is reserved for the built-in auth database", SystemAuthDB)
 	}
 	if !reDBName.MatchString(name) {
 		return fmt.Errorf("invalid database name %q", name)
@@ -259,6 +279,9 @@ func (b *Backend) CreateDatabase(name string) error {
 func (b *Backend) DropDatabase(name string) error {
 	if !reDBName.MatchString(name) {
 		return fmt.Errorf("invalid database name %q", name)
+	}
+	if name == SystemAuthDB {
+		return fmt.Errorf("database name '%s' is reserved for the built-in auth database", SystemAuthDB)
 	}
 	file := b.fileFor(name)
 	for _, f := range []string{file, file + "-wal", file + "-shm"} {
@@ -301,8 +324,14 @@ func (s *Session) Use(dbName string) error {
 // 查询执行
 // ---------------------------------------------------------------------------
 
-// Query 执行只读查询（受 全局闸门 + 本库读并发 限流，maxRows 行数保护）。
+// Query 执行只读查询（受 全局闸门 + 本库读并发 + QoS 限流，maxRows 行数保护）。
 func (s *Session) Query(q string) ([]string, [][]any, error) {
+	qwait, qrelease, err := s.backend.qos.acquire(s.currentDB)
+	if err != nil {
+		return nil, nil, err
+	}
+	s.qosWaitMs = qwait
+	defer qrelease()
 	s.backend.globalSem.Acquire()
 	defer s.backend.globalSem.Release()
 	rs := s.backend.readSemFor(s.currentDB)
@@ -318,6 +347,7 @@ func (s *Session) Query(q string) ([]string, [][]any, error) {
 		return nil, nil, err
 	}
 	var out [][]any
+	n := 0
 	for rows.Next() {
 		vals := make([]any, len(cols))
 		ptrs := make([]any, len(cols))
@@ -328,6 +358,10 @@ func (s *Session) Query(q string) ([]string, [][]any, error) {
 			return nil, nil, err
 		}
 		out = append(out, vals)
+		n++
+		if n%256 == 0 {
+			s.backend.qos.paceRows(s.currentDB, 256) // 行吞吐节流（rows_per_sec）
+		}
 		if int64(len(out)) > s.backend.maxRows {
 			return nil, nil, fmt.Errorf("result exceeds max_result_rows(%d); add LIMIT or raise sqlite.max_result_rows", s.backend.maxRows)
 		}
@@ -338,8 +372,14 @@ func (s *Session) Query(q string) ([]string, [][]any, error) {
 	return cols, out, nil
 }
 
-// Exec 执行写语句（全局闸门限流；库级写锁由调用方管理），返回 lastInsertID / affectedRows。
+// Exec 执行写语句（全局闸门 + QoS 限流；库级写锁由调用方管理），返回 lastInsertID / affectedRows。
 func (s *Session) Exec(q string) (int64, int64, error) {
+	qwait, qrelease, err := s.backend.qos.acquire(s.currentDB)
+	if err != nil {
+		return 0, 0, err
+	}
+	s.qosWaitMs = qwait
+	defer qrelease()
 	s.backend.globalSem.Acquire()
 	defer s.backend.globalSem.Release()
 	res, err := s.db.Exec(q)
@@ -350,6 +390,9 @@ func (s *Session) Exec(q string) (int64, int64, error) {
 	affected, _ := res.RowsAffected()
 	return lastID, affected, nil
 }
+
+// QoSWaitMs 返回最近一次 Query/Exec 的 QoS 排队毫秒（异步任务 qos_wait_ms 列用）。
+func (s *Session) QoSWaitMs() int64 { return s.qosWaitMs }
 
 // AcquireWrite 获取当前库的写锁（单库单线程；多库写入并行）。
 func (s *Session) AcquireWrite() {
@@ -573,6 +616,18 @@ func (b *Backend) ConcurrencyInfo() map[string]string {
 	b.readOvMu.RUnlock()
 	return out
 }
+
+// QoSInfo 返回 QoS 配置与实时统计（SHOW QOS / qos_status）。
+func (b *Backend) QoSInfo() []QoSRow { return b.qos.Info() }
+
+// SetQosGlobal 热改全局 QoS 配额（重启失效）。
+func (b *Backend) SetQosGlobal(lim config.QosLimit) { b.qos.SetGlobal(lim) }
+
+// SetQosDB 热改单库 QoS 配额。
+func (b *Backend) SetQosDB(db string, lim config.QosLimit) { b.qos.SetDB(db, lim) }
+
+// ClearQosDB 清除单库 QoS 覆盖。
+func (b *Backend) ClearQosDB(db string) { b.qos.ClearDB(db) }
 
 // openFileRetry 打开库文件（撞上活动写锁时退避重试）。
 func (b *Backend) openFileRetry(file string, attempts int) (*sql.DB, error) {

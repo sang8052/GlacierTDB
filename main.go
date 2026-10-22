@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"glaciertdb/internal/auth"
 	"glaciertdb/internal/dirlock"
 	"runtime"
 	"runtime/debug"
@@ -113,6 +114,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 用户权限系统（v1.0.10）：系统库表存用户，首次启动自动迁移旧版配置/glacier.json 策略
+	authDB, err := backend.OpenSystemDB()
+	if err != nil {
+		logx.Errorf("open auth system db: %v", err)
+		os.Exit(1)
+	}
+	authStore, err := auth.Open(authDB, auth.Bootstrap{
+		AdminUser:          cfg.Auth.User,
+		AdminPassword:      backend.GetAuthPassword(),
+		ReadonlyUser:       cfg.Auth.ReadOnlyUser,
+		ReadonlyPassword:   backend.GetReadonlyPassword(),
+	}, cfg.Lock)
+	if err != nil {
+		logx.Errorf("init auth store: %v", err)
+		os.Exit(1)
+	}
+
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -121,7 +139,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if err := proxy.Run(cfg, backend); err != nil {
+	if err := proxy.Run(cfg, backend, authStore); err != nil {
 		logx.Errorf("listen %s: %v", cfg.Listen, err)
 		os.Exit(1)
 	}
