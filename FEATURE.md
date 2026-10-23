@@ -187,17 +187,17 @@ qos:
 
 ---
 
-## 5. 存量路线余项（v1.0.x 小版本穿插消化）
+## 5. 存量路线余项（v1.0.x 小版本穿插消化） ✅（已随 v1.1.1.alpha 全部完成，2026-10-23）
 
-> v1.0.8 前遗留的长范围查询短板与兼容余项，优先级仍在，按小版本穿插：
+> v1.0.8 前遗留的长范围查询短板与兼容余项，五项均已落地（实现口径见 CHANGELOG 1.1.1）：
 
 | 项 | 说明 | 优先级 |
 | --- | --- | --- |
-| rollup 多粒度预聚合 | 回填同遍落 raw + m1/h1/d1 汇总表，网关按时间范围自动路由最粗可用粒度（InfluxDB 长范围快的本质） | P0，并入 v1.0.10 后首个小版本 |
-| GROUP BY 分片并行 | `GROUP BY series_id, time(N)` 按 series_id 取模分片、Go 侧按桶合并 | P1 |
-| 明细导出并行（方案 B） | 按 rowid 区间并行 scan，行包并行读、顺序发送 | P1 |
-| JS 后处理管道（SCRIPT） | 结果以 JSONL 流入 nodejs 子进程，产物落 `jobs/<id>.<output>`（语法位已预留） | P1 |
-| MySQL 兼容 M3 | `VALUES(col)` / `ON DUPLICATE KEY UPDATE` / `FOR UPDATE` 剥离 / `SET FOREIGN_KEY_CHECKS` / `CONCAT_WS` / `LPAD` / `RPAD` / `DATE_FORMAT` 周编号族 | P2，按需 |
+| ✅ rollup 多粒度预聚合 | 回填同遍落 raw + m1/h1/d1 汇总表（INSERT 触发器），网关按时间范围自动路由最粗可用粒度，边缘桶回退原始行保证精确；`REBUILD ROLLUP <db>` 存量回填 | P0，v1.1.1.alpha |
+| ✅ GROUP BY 分片并行 | `GROUP BY series_id, time(N)` 按 series_id 取模分片、Go 侧按桶合并 | P1，v1.1.1.alpha |
+| ✅ 明细导出并行（方案 B） | 按 rowid 区间并行 scan，行包并行读、顺序发送 | P1，v1.1.1.alpha |
+| ✅ JS 后处理管道（SCRIPT） | 结果以 JSONL 流入 nodejs/python 子进程，产物落 `jobs/<id>.<output>`（script_dir 白名单） | P1，v1.1.1.alpha |
+| ✅ MySQL 兼容 M3 | `VALUES(col)` / `ON DUPLICATE KEY UPDATE` / `FOR UPDATE` 剥离 / `SET FOREIGN_KEY_CHECKS` / `CONCAT_WS` / `LPAD` / `RPAD` / `DATE_FORMAT` 周编号族 | P2，v1.1.1.alpha |
 
 ---
 

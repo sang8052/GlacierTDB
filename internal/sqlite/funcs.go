@@ -236,6 +236,29 @@ func registerCompatFuncs(c *sqlite3.Conn) error {
 			}
 			ctx.ResultText(mysqlDateFormat(t, arg[1].Text()))
 		}),
+		// CONCAT_WS(sep, ...)：以 sep 连接非 NULL 参数（M3；sep 为 NULL → 结果 NULL）
+		reg("concat_ws", -1, func(ctx sqlite3.Context, arg ...sqlite3.Value) {
+			if len(arg) == 0 || arg[0].Type() == sqlite3.NULL {
+				ctx.ResultNull()
+				return
+			}
+			sep := arg[0].Text()
+			parts := make([]string, 0, len(arg)-1)
+			for _, a := range arg[1:] {
+				if a.Type() == sqlite3.NULL {
+					continue
+				}
+				parts = append(parts, a.Text())
+			}
+			ctx.ResultText(strings.Join(parts, sep))
+		}),
+		// LPAD(str, len, pad) / RPAD(str, len, pad)：按字符（UTF-8 安全）补齐/截断（M3）
+		reg("lpad", 3, func(ctx sqlite3.Context, arg ...sqlite3.Value) {
+			ctx.ResultText(mysqlPad(arg, true))
+		}),
+		reg("rpad", 3, func(ctx sqlite3.Context, arg ...sqlite3.Value) {
+			ctx.ResultText(mysqlPad(arg, false))
+		}),
 	); err != nil {
 		return err
 	}
@@ -381,6 +404,18 @@ func mysqlDateFormat(t time.Time, format string) string {
 			fmt.Fprintf(&sb, "%03d", t.YearDay())
 		case 'w':
 			fmt.Fprintf(&sb, "%d", int(t.Weekday()))
+		case 'U': // 周编号（周日为一周首日，00-53）
+			fmt.Fprintf(&sb, "%02d", weekNum(t, false))
+		case 'u': // 周编号（周一为一周首日，00-53）
+			fmt.Fprintf(&sb, "%02d", weekNum(t, true))
+		case 'V': // 周编号（周日首日，01-53，配 %X）
+			fmt.Fprintf(&sb, "%02d", isoWeekOn(t.AddDate(0, 0, 1)))
+		case 'v': // 周编号（周一首日 ISO，01-53，配 %x）
+			fmt.Fprintf(&sb, "%02d", isoWeekOn(t))
+		case 'X': // %V 对应的年份（4 位）
+			fmt.Fprintf(&sb, "%04d", isoYearOn(t.AddDate(0, 0, 1)))
+		case 'x': // %v 对应的年份（4 位）
+			fmt.Fprintf(&sb, "%04d", isoYearOn(t))
 		case '%':
 			sb.WriteByte('%')
 		default:
@@ -397,6 +432,60 @@ func hour12(t time.Time) int {
 		h = 12
 	}
 	return h
+}
+
+// weekNum MySQL %U/%u 周编号（00-53）：含当年首个首日（周日/周一）的那周为第 1 周，
+// 之前的天数计入第 0 周。
+func weekNum(t time.Time, mondayFirst bool) int {
+	off := int(t.Weekday()) // 0=周日
+	if mondayFirst {
+		off = (off + 6) % 7 // 距本周一的天数
+	}
+	start := t.AddDate(0, 0, -off) // 本周首日
+	doy := start.YearDay()
+	if start.Year() < t.Year() {
+		doy = 0 // 本周首日在上一年 → 第 0 周
+	}
+	return (doy + 6) / 7
+}
+
+// isoWeekOn / isoYearOn ISO 周编号与对应年份（%v/%x；%V/%X 用 +1 天的周日首日变体）。
+func isoWeekOn(t time.Time) int {
+	_, w := t.ISOWeek()
+	return w
+}
+
+func isoYearOn(t time.Time) int {
+	y, _ := t.ISOWeek()
+	return y
+}
+
+// mysqlPad LPAD/RPAD 实现（按字符补齐；len <= 0 返回空；pad 空返回空串，与 MySQL 一致）。
+func mysqlPad(arg []sqlite3.Value, left bool) string {
+	if anyNull(arg) {
+		return ""
+	}
+	s := []rune(arg[0].Text())
+	n := valueInt(arg[1])
+	pad := []rune(arg[2].Text())
+	if n <= 0 {
+		return ""
+	}
+	if int64(len(s)) >= n {
+		return string(s[:n])
+	}
+	if len(pad) == 0 {
+		return ""
+	}
+	fill := make([]rune, 0, n-int64(len(s)))
+	for int64(len(fill)) < n-int64(len(s)) {
+		fill = append(fill, pad...)
+	}
+	fill = fill[:n-int64(len(s))]
+	if left {
+		return string(fill) + string(s)
+	}
+	return string(s) + string(fill)
 }
 
 func ampm(t time.Time) string {

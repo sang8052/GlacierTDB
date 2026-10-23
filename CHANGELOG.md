@@ -2,6 +2,26 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.1.1.alpha] - 2026-10-23
+
+### 新增
+- **rollup 多粒度预聚合（存量路线 P0）**：时序标准 schema `points(series_id, ts, val)` 写入**同遍落** `points_m1` / `points_h1` / `points_d1` 汇总表（1 分钟 / 1 小时 / 1 天桶，cnt/cntv/sum/min/max，INSERT 触发器驱动、首次写入自动建表建触发器）；网关**自动路由**——带时间范围的聚合查询（COUNT/SUM/MIN/MAX/AVG）改走「汇总表满桶 + 原始表边缘桶」UNION，选取可用的最粗粒度（桶宽整除 GROUP BY 桶宽），**结果与全量扫原始表精确一致**（边缘桶回退原始行，无近似）；`REBUILD ROLLUP <db>` 存量回填（超级用户，写锁长持）；`rollup.disable: true` 可整体关闭。⚠️ 对既有数据启用 rollup 后请执行一次 `REBUILD ROLLUP` 补齐历史。
+- **GROUP BY 分片并行（存量路线 P1）**：`GROUP BY <series列>, (ts/N*N)`（含 `time(N)` 原始形态）按 series 列**取模分片**并行执行、Go 侧按 (series, 桶) 键合并部分聚合（COUNT/SUM/MIN/MAX/AVG）；`/*+ PARALLEL(n) */` 显式触发或按 `scan_rows` 阈值自动触发；`EXPLAIN PARALLEL` 展示 `group-shard` 计划。
+- **明细导出并行·方案 B（存量路线 P1）**：单表明细 SELECT 按 rowid（或单列主键）**区间并行 scan、行包并行读、按分片顺序顺序发送**；支持 WHERE 过滤、`ORDER BY 分片键`、LIMIT、`*` 列展开（真实列名）；与串行结果完全一致。
+- **SCRIPT 后处理管道（存量路线 P1）**：`SUBMIT QUERY '…' SCRIPT 'pipe.js' OUTPUT done`——结果 JSONL 经 stdin 流入脚本（`.js` → `async_query.nodejs_path`、`.py` → `async_query.python_path`，空=禁用），产物落 `jobs/<id>.<OUTPUT>`；脚本强制位于 `async_query.script_dir` 白名单目录内（防任意路径执行）；TIMEOUT 超时中断、CANCEL 可杀、stderr 摘要进错误消息；状态机新增 SCRIPT 阶段。
+- **MySQL 兼容 M3（存量路线 P2）**：`INSERT … ON DUPLICATE KEY UPDATE` → SQLite upsert（子句内 `VALUES(col)` → `excluded.col`）；`SELECT … FOR UPDATE` / `FOR SHARE` / `LOCK IN SHARE MODE` 行锁子句剥离；`SET FOREIGN_KEY_CHECKS` 会话设置接受（探活层）；`CONCAT_WS`（跳过 NULL 参数）/ `LPAD` / `RPAD`（UTF-8 字符补齐）Go 标量函数；`DATE_FORMAT` 周编号族 `%U %u %V %v %X %x`。
+- **caching_sha2_password 登录算法（MySQL 8 默认）**：`auth.auth_plugin` 配置握手默认算法（`mysql_native_password`（默认）/ `caching_sha2_password` / `sha256_password`）；账号级 `CREATE USER 'u' IDENTIFIED WITH caching_sha2_password BY 'pwd'` / `ALTER USER 'u' IDENTIFIED WITH <plugin> [BY 'pwd']`——与客户端算法不一致时自动 AuthSwitch，支持 fast-auth 缓存与 RSA 全认证（非 TLS 密码交换，RSA 密钥 `<db_dir>/glacier_rsa.pem` 首启自动生成 2048 位）；**改密自动失效登录缓存**（`SET PASSWORD` / `ALTER USER` / `GRANT … IDENTIFIED BY` 后旧密码立即失效）。
+
+### 修复
+- 读语句判定容忍前置优化器 hint（`/*+ … */ SELECT …` 不再被误判为写语句返回 OK 包）。
+- rollup 懒建缓存失效问题：库被 DROP/CREATE 重建（或汇总表被删）后缓存命中不再跳过建表（命中后 sqlite_master 验证，缺失自动重建）。
+
+### 已知问题
+- **PyMySQL 2.x（2.2.8）客户端缺陷**：`caching_sha2_password` RSA 全认证路径函数缺少 return（隐式返回 None），**首次登录（缓存未命中）任何 MySQL 8 服务端都会崩溃**——非本项目问题；规避：使用 `mysql` CLI / JDBC / Go 驱动等客户端、或 `pip install 'PyMySQL<2'`；`tests/test_v111.py` 内置外科手术式修补（仅测试生效）。fast-auth（缓存命中）路径不受影响。
+
+### 变更
+- `config.yaml` 新增 `rollup` 段（默认开启，`disable: true` 关闭）与 `auth.auth_plugin`；`tests/test_v111.py` 新增 37 项；全套回归 ALL TESTS PASSED（16 个测试脚本）。
+
 ## [1.1.0.alpha] - 2026-10-23
 
 ### 新增

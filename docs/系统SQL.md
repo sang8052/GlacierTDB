@@ -168,6 +168,14 @@ SELECT glacier_version;               -- GlacierTDB 自身版本（≠ @@version
 KILL <conn_id>;                       -- 见 1.3
 ```
 
+### 1.9a rollup 与登录算法（v1.1.1）
+
+```sql
+REBUILD ROLLUP <db>;                      -- 从原始 points 回填 m1/h1/d1 汇总表（超级用户，写锁长持）
+CREATE USER 'u'@'%' IDENTIFIED WITH caching_sha2_password BY 'pwd';   -- MySQL 8 登录算法
+ALTER USER 'u' IDENTIFIED WITH mysql_native_password [BY 'pwd'];      -- 切换登录算法
+```
+
 ### 1.10 S3 对象存储管理（v1.1.0；模块开启 s3.enable 后可用）
 
 详见 [S3对象存储.md](S3对象存储.md)。变更命令仅超级用户（只读 1290 / 普通用户 1142），

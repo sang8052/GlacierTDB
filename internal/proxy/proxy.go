@@ -4,6 +4,7 @@ package proxy
 import (
 	"net"
 	"runtime/debug"
+	"sync"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
@@ -19,6 +20,30 @@ import (
 	"glaciertdb/internal/sqlite"
 )
 
+// localAddrSeen 已观察到的服务端本地地址（caching_sha2 缓存 key 的 host 部分）。
+var localAddrSeen sync.Map
+
+// newMySQLServer 构造 go-mysql 服务端：握手默认登录算法取配置（v1.1.1 支持
+// caching_sha2_password / sha256_password），并加载 RSA 密钥供非 TLS 密码交换。
+func newMySQLServer(cfg *config.Config) *server.Server {
+	plugin := cfg.Auth.AuthPlugin
+	if plugin == "" {
+		plugin = mysql.AUTH_NATIVE_PASSWORD
+	}
+	rsaKey, err := auth.LoadOrGenerateRSAKey(cfg.DBDir)
+	if err != nil {
+		logx.Warnf("load rsa key failed: %v（caching_sha2/sha256 非 TLS 登录将不可用，已回退 native）", err)
+		plugin = mysql.AUTH_NATIVE_PASSWORD
+	}
+	if rsaKey == nil && plugin != mysql.AUTH_NATIVE_PASSWORD {
+		logx.Warnf("no rsa key available: fallback to %s", mysql.AUTH_NATIVE_PASSWORD)
+		plugin = mysql.AUTH_NATIVE_PASSWORD
+	}
+	srv := server.NewServer(cfg.ServerVersion, mysql.DEFAULT_COLLATION_ID, plugin, rsaKey, nil)
+	logx.Infof("mysql auth plugin (handshake default): %s", plugin)
+	return srv
+}
+
 // Run 阻塞监听并服务连接（s3store / s3srv 可为 nil：对象存储模块关闭）。
 func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store *s3.Store, s3srv *s3.Server) error {
 	meta.MapSQLError = handler.MapSQLiteErr
@@ -31,7 +56,7 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 			cfg.AsyncQuery.MetricsIntervalSec, cfg.AsyncQuery.ResultTTLHours)
 	}
 
-	srv := server.NewServer(cfg.ServerVersion, mysql.DEFAULT_COLLATION_ID, mysql.AUTH_NATIVE_PASSWORD, nil, nil)
+	srv := newMySQLServer(cfg)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
@@ -72,6 +97,17 @@ func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 		return
 	}
 	defer h.Close()
+
+	// caching_sha2_password 缓存失效钩子：改密后按（user@LocalAddr）精确失效
+	//（go-mysql 缓存 key 含连接本地地址，需遍历已观察到的地址）
+	localAddr := raw.LocalAddr().String()
+	localAddrSeen.Store(localAddr, struct{}{})
+	h.SetAuthCacheInvalidator(func(u string) {
+		localAddrSeen.Range(func(k, _ any) bool {
+			srv.InvalidateCache(u, k.(string))
+			return true
+		})
+	})
 
 	// 认证走用户权限系统（v1.0.10）：每连接一个 Handler（捕获来源 IP），
 	// GetCredential 阶段完成 IP/账号锁定与 host 授权检查，失败/成功落审计并防爆破计数

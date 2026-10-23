@@ -49,6 +49,8 @@ type Handler struct {
 	lastQuery  string   // 最近一条语句（管理面展示）
 	txStartedAt time.Time // 当前事务开启时刻
 	mu         sync.Mutex // 保护 lastQuery/adminMode/txStartedAt 的跨连接读
+
+	authCacheInv func(user string) // caching_sha2_password 缓存失效钩子（改密后调用）
 }
 
 var reSetAutocommit = regexp.MustCompile(`(?i)^SET\s+(?:@@?[A-Za-z_]*\.)?AUTOCOMMIT\s*=\s*([01])`)
@@ -120,6 +122,16 @@ func (h *Handler) Close() {
 	}
 }
 
+// SetAuthCacheInvalidator 注入 caching_sha2_password 缓存失效钩子（proxy 每连接调用）。
+func (h *Handler) SetAuthCacheInvalidator(fn func(user string)) { h.authCacheInv = fn }
+
+// invalidateAuthCache 改密后失效登录缓存（否则旧密码在缓存有效期内仍可登录）。
+func (h *Handler) invalidateAuthCache(user string) {
+	if h.authCacheInv != nil {
+		h.authCacheInv(user)
+	}
+}
+
 // MapSQLiteErr 把 SQLite 错误包装为 MySQL 协议错误。
 func MapSQLiteErr(err error) error {
 	if err == nil {
@@ -182,7 +194,7 @@ func (h *Handler) UseDB(dbName string) error {
 	return nil
 }
 
-var reReadWord = regexp.MustCompile(`(?i)^(SELECT|WITH|EXPLAIN|VALUES|TABLE)\b`)
+var reReadWord = regexp.MustCompile("(?is)^(?:/\\*\\+.*?\\*/\\s*)*(SELECT|WITH|EXPLAIN|VALUES|TABLE)\\b")
 
 func isReadStmt(q string) bool { return reReadWord.MatchString(q) }
 
@@ -285,6 +297,11 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 		return res, err
 	}
 
+	// REBUILD ROLLUP <db>（时序汇总表回填，v1.1.1）
+	if res, ok, err := h.handleRebuildRollup(s); ok || err != nil {
+		return res, err
+	}
+
 	// KILL <id>（全局生效）
 	if handled, err := h.handleKill(s); handled || err != nil {
 		if err != nil {
@@ -378,6 +395,12 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 		return nil, err
 	}
 
+	// 2d) 时序 rollup 自动路由（v1.1.1）：长范围聚合优先走 m1/h1/d1 汇总表（精确等价）
+	if res, ok, err := h.tryRollup(s); ok || err != nil {
+		h.slow(start, s)
+		return res, err
+	}
+
 	// 3) 方言改写（先把 MySQL 转义序列的字面量还原为 SQLite 语义——
 	//    pymysql 等客户端把 " 转义为 \" 发送，SQLite 不处理反斜杠会原样落盘）
 	sq := meta.RewriteDialect(meta.RewriteLastInsertID(meta.UnescapeLiterals(s)))
@@ -458,8 +481,16 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 			if res, ok, err := h.tryParallel(clean, deg, true); ok || err != nil {
 				return res, err
 			}
+			if res, ok, err := h.tryGroupShard(clean, deg, true); ok || err != nil {
+				return res, err
+			}
+			if res, ok, err := h.tryDetailParallel(clean, deg, true); ok || err != nil {
+				return res, err
+			}
 			sq = clean
 		} else if res, ok, err := h.maybeAutoParallel(sq); ok || err != nil {
+			return res, err
+		} else if res, ok, err := h.maybeAutoParallelShard(sq); ok || err != nil {
 			return res, err
 		}
 		cols, rows, err := h.session.Query(sq)
@@ -478,6 +509,10 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 	// 写语句
 	if h.readonly {
 		return nil, roErr()
+	}
+	// rollup 汇总表/触发器懒建（v1.1.1）：首次写 points 前就位（同遍落保证从第一行开始）
+	if reRollInsert.MatchString(sq) {
+		h.ensureRollupTables()
 	}
 	if !h.session.InTx {
 		if h.autocommit {

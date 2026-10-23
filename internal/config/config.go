@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.1.0.alpha"
+const GlacierVersion = "1.1.1.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -49,6 +49,13 @@ type AsyncOpts struct {
 // MaintOpts 维护策略：VACUUM（执行期间锁该库全部写入）。
 type MaintOpts struct {
 	NoHotVacuum bool `yaml:"no_hot_vacuum"` // true = 禁止运行中 VACUUM（仅 CLI，服务停止时）
+}
+
+// RollupOpts 时序 rollup 多粒度预聚合（v1.1.1）：points 表 INSERT 同遍落
+// m1/h1/d1 汇总表，长范围聚合查询自动路由最粗可用粒度。
+// 用 Disable 而非 Enable 以便省略时默认开启。
+type RollupOpts struct {
+	Disable bool `yaml:"disable"` // true = 关闭自动汇总触发器与查询路由
 }
 
 // QosLimit 单级 QoS 配额（v1.0.10）：0 = 不限。
@@ -123,6 +130,7 @@ type Auth struct {
 	Password      string `yaml:"password"`
 	ReadOnlyUser     string `yaml:"readonly_user"`     // 只读账号名（v1.0.9，与管理账号同等认证；空 = glacier_ro）
 	ReadOnlyPassword string `yaml:"readonly_password"` // 只读账号密码（可管理面热改；空 = 禁用只读登录）
+	AuthPlugin       string `yaml:"auth_plugin"`       // 握手默认登录算法（v1.1.1）：mysql_native_password | caching_sha2_password | sha256_password
 }
 
 type SQLiteOpts struct {
@@ -151,6 +159,7 @@ type Config struct {
 
 	Concurrency ConcurrencyOpts `yaml:"concurrency"`
 	ParallelQuery ParallelOpts `yaml:"parallel_query"`
+	Rollup        RollupOpts   `yaml:"rollup"`
 	AsyncQuery    AsyncOpts    `yaml:"async_query"`
 	Maintenance   MaintOpts    `yaml:"maintenance"`
 	Security      SecOpts      `yaml:"security"`
@@ -269,6 +278,11 @@ func (c *Config) Fill() {
 	c.Auth.User = "glacier"
 	if c.Auth.ReadOnlyUser == "" {
 		c.Auth.ReadOnlyUser = "glacier_ro"
+	}
+	switch c.Auth.AuthPlugin {
+	case "mysql_native_password", "caching_sha2_password", "sha256_password":
+	default:
+		c.Auth.AuthPlugin = "mysql_native_password"
 	}
 	if c.MaxConnections <= 0 {
 		c.MaxConnections = 64

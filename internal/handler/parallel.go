@@ -320,18 +320,33 @@ func (h *Handler) runParallelPlan(p *parallelPlan) (*mysql.Result, bool, error) 
 
 // explainParallel 生成 EXPLAIN PARALLEL <query> 的拆分计划说明。
 func (h *Handler) explainParallel(sq string, deg int) (*mysql.Result, error) {
-	p, reason := h.buildParallelPlan(sq, deg)
-	if p == nil {
-		return meta.SimpleRS([]string{"table", "shard_col", "est_rows", "degree", "strategy"},
-			[][]any{{"(not eligible)", "", int64(0), int64(0), reason}})
+	if deg <= 0 {
+		deg = 4 // 仅作计划展示
 	}
-	aggs := make([]string, len(p.cols))
-	for i, c := range p.cols {
-		aggs[i] = c.raw
+	p, reason := h.buildParallelPlan(sq, deg)
+	if p != nil {
+		aggs := make([]string, len(p.cols))
+		for i, c := range p.cols {
+			aggs[i] = c.raw
+		}
+		return meta.SimpleRS([]string{"table", "shard_col", "est_rows", "degree", "strategy"},
+			[][]any{{p.table, p.shardCol, p.estRows, int64(p.deg),
+				"shard range scan; " + strings.Join(aggs, ", ")}})
+	}
+	// GROUP BY 分片并行（v1.1.1）
+	if g := h.buildGroupShardPlan(sq, deg); g != nil {
+		return meta.SimpleRS([]string{"table", "shard_col", "est_rows", "degree", "strategy"},
+			[][]any{{g.table, g.seriesCol, g.estRows, int64(g.deg),
+				fmt.Sprintf("group-shard: series %% %d modulo, bucket %dms, Go-side merge", g.deg, g.bucketN)}})
+	}
+	// 明细导出并行（方案 B，v1.1.1）
+	if d := h.buildDetailPlan(sq, deg); d != nil {
+		return meta.SimpleRS([]string{"table", "shard_col", "est_rows", "degree", "strategy"},
+			[][]any{{d.table, d.shardCol, int64(d.estRows), int64(d.deg),
+				"detail shard scan (parallel read, in-order send)"}})
 	}
 	return meta.SimpleRS([]string{"table", "shard_col", "est_rows", "degree", "strategy"},
-		[][]any{{p.table, p.shardCol, p.estRows, int64(p.deg),
-			"shard range scan; " + strings.Join(aggs, ", ")}})
+		[][]any{{"(not eligible)", "", int64(0), int64(0), reason}})
 }
 
 func colNames(cols []aggCol) []string {

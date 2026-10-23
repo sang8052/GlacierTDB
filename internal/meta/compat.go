@@ -19,6 +19,13 @@ var (
 	reTsDiffUnit = regexp.MustCompile(`(?i)\bTIMESTAMPDIFF\s*\(\s*(MICROSECOND|SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|QUARTER|YEAR)\s*,`)
 	reIsDDL      = regexp.MustCompile(`(?i)^\s*(CREATE\s+(?:TEMP\s+|UNIQUE\s+)?(?:TABLE|INDEX|VIEW)|ALTER\s+TABLE)\b`)
 
+	// ---- MySQL 兼容 M3（v1.1.1）----
+	reOnDuplicate = regexp.MustCompile(`(?i)\bON\s+DUPLICATE\s+KEY\s+UPDATE\s+`)
+	reIsInsert    = regexp.MustCompile(`(?i)^\s*(INSERT\s+INTO|REPLACE\s+INTO)\b`)
+	reIsSelectish = regexp.MustCompile(`(?i)^\s*(SELECT|TABLE|WITH)\b`)
+	reForUpdate   = regexp.MustCompile(`(?i)\s+(FOR\s+UPDATE|FOR\s+SHARE|LOCK\s+IN\s+SHARE\s+MODE)\s*;?\s*$`)
+	reValuesCol   = regexp.MustCompile("(?i)\\bVALUES\\s*\\(\\s*(`[^`]+`|[A-Za-z0-9_\\x{4e00}-\\x{9fa5}]+)\\s*\\)")
+
 	// DDL 词法映射（MySQL → SQLite）；带括号形式在前、裸词在后（词边界防 INTEGER 误伤）
 	ddlTypeRules = []struct {
 		re   *regexp.Regexp
@@ -63,6 +70,19 @@ func RewriteMySQLCompat(q string) string {
 	// INSERT IGNORE INTO → INSERT OR IGNORE INTO（M2）
 	if reInsertIgn.MatchString(q) {
 		q = reInsertIgn.ReplaceAllString(q, "${1}OR IGNORE${2}")
+	}
+	// ON DUPLICATE KEY UPDATE → ON CONFLICT DO UPDATE SET（M3，仅 INSERT/REPLACE）；
+	// 子句内 VALUES(col) → excluded.col（「将要写入的值」语义等价）
+	if reIsInsert.MatchString(q) && reOnDuplicate.MatchString(q) {
+		if loc := reOnDuplicate.FindStringIndex(q); loc != nil {
+			tail := reValuesCol.ReplaceAllString(q[loc[1]:], "excluded.$1")
+			q = q[:loc[0]] + "ON CONFLICT DO UPDATE SET " + tail
+		}
+	}
+	// SELECT ... FOR UPDATE / FOR SHARE / LOCK IN SHARE MODE 行锁子句剥离
+	//（SQLite 无行锁语义；网关每库写锁已兜底单写者）
+	if reIsSelectish.MatchString(q) {
+		q = reForUpdate.ReplaceAllString(q, "")
 	}
 	// TIMESTAMPDIFF 单位关键字字符串化（M2；Go 函数实现见 internal/sqlite/funcs.go）
 	if reTsDiffUnit.MatchString(q) {

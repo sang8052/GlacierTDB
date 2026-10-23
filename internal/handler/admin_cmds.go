@@ -34,10 +34,12 @@ var (
 	reAdminShowQos  = regexp.MustCompile(`(?i)^SHOW\s+QOS\s*$`)
 
 	// ---- 用户权限管理（v1.0.10）----
-	reAdminCreateUser = regexp.MustCompile(`(?i)^CREATE\s+USER\s+'([^']{1,64})'(?:\s*@\s*'([^']{1,64})')?\s+IDENTIFIED\s+BY\s+'([^']{1,64})'(?:\s+(SUPER|READONLY|USER))?\s*$`)
+	reAdminCreateUser = regexp.MustCompile(`(?i)^CREATE\s+USER\s+'([^']{1,64})'(?:\s*@\s*'([^']{1,64})')?\s+IDENTIFIED\s+(?:WITH\s+([A-Za-z0-9_]+)\s+)?BY\s+'([^']{1,64})'(?:\s+(SUPER|READONLY|USER))?\s*$`)
 	reAdminDropUser   = regexp.MustCompile(`(?i)^DROP\s+USER\s+'([^']{1,64})'(?:\s*@\s*'[^']*')?\s*$`)
 	reAdminRenameUser = regexp.MustCompile(`(?i)^RENAME\s+USER\s+'([^']{1,64})'\s+TO\s+'([^']{1,64})'\s*$`)
 	reAdminAlterType  = regexp.MustCompile(`(?i)^ALTER\s+USER\s+'([^']{1,64})'\s+(SUPER|READONLY|USER)\s*$`)
+	// ALTER USER ... IDENTIFIED WITH <plugin> [BY 'pwd']（v1.1.1：caching_sha2_password 等登录算法）
+	reAdminAlterPlugin = regexp.MustCompile(`(?i)^ALTER\s+USER\s+'([^']{1,64})'\s+IDENTIFIED\s+WITH\s+([A-Za-z0-9_]+)(?:\s+BY\s+'([^']{1,64})')?\s*$`)
 	reAdminGrant      = regexp.MustCompile(`(?i)^GRANT\s+(.+?)\s+ON\s+([^\s.]+)\s*\.\s*([^\s]+)\s+TO\s+'([^']{1,64})'(?:\s+IDENTIFIED\s+BY\s+'([^']{1,64})')?(?:\s+WITH\s+GRANT\s+OPTION)?\s*$`)
 	reAdminRevoke     = regexp.MustCompile(`(?i)^REVOKE\s+(.+?)\s+ON\s+([^\s.]+)\s*\.\s*([^\s]+)\s+FROM\s+'([^']{1,64})'\s*$`)
 	reAdminRevokeAll  = regexp.MustCompile(`(?i)^REVOKE\s+ALL\s+PRIVILEGES(?:\s*,\s*GRANT\s+OPTION)?\s+FROM\s+'([^']{1,64})'\s*$`)
@@ -58,6 +60,41 @@ func IsAdminUse(q string) (adminMode bool, ok bool) {
 }
 
 var reVacuumDB = regexp.MustCompile("(?i)^VACUUM\\s+DATABASE\\s+`?([A-Za-z0-9_-]+)`?\\s*$")
+
+var reRebuildRollup = regexp.MustCompile("(?i)^REBUILD\\s+ROLLUP\\s+`?([A-Za-z0-9_-]+)`?\\s*$")
+
+// handleRebuildRollup REBUILD ROLLUP <db>：从原始 points 回填 m1/h1/d1 汇总表（v1.1.1）。
+// 回填期间该库写入持写锁；触发器保证后续写入同遍落。
+func (h *Handler) handleRebuildRollup(q string) (*mysql.Result, bool, error) {
+	m := reRebuildRollup.FindStringSubmatch(q)
+	if m == nil {
+		return nil, false, nil
+	}
+	if h.readonly {
+		return nil, true, roErr()
+	}
+	if h.userType != auth.TypeSuper {
+		return nil, true, mysql.NewError(1142, "command denied to user '"+h.user+"' (REBUILD ROLLUP requires super user)")
+	}
+	if h.session.InTx {
+		return nil, true, mysql.NewError(1192, "can't execute REBUILD ROLLUP with active transaction")
+	}
+	db := m[1]
+	old := h.session.CurrentDB()
+	if err := h.session.Use(db); err != nil {
+		return nil, true, mysql.NewError(mysql.ER_BAD_DB_ERROR, err.Error())
+	}
+	defer func() { _ = h.session.Use(old) }()
+	h.session.AcquireWrite()
+	defer h.session.ReleaseWrite()
+	cols, rows, err := h.rebuildRollup()
+	if err != nil {
+		return nil, true, mysql.NewError(1105, err.Error())
+	}
+	logx.Infof("rollup rebuilt for db %s by conn %d", db, h.connID)
+	res, err2 := meta.SimpleRS(cols, rows)
+	return res, true, err2
+}
 
 // handleVacuumDB 管理面 VACUUM —— ⚠️ 执行期间该库全部写入被阻塞（写锁长持）。
 func (h *Handler) handleVacuumDB(q string) (*mysql.Result, bool, error) {
@@ -166,6 +203,7 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 				return nil, true, mysql.NewError(1105, err.Error())
 			}
 		}
+		h.invalidateAuthCache(target) // caching_sha2_password 缓存失效（防旧密码仍可登录）
 		// legacy 镜像（仅两个内置账号有对应字段）
 		if target == h.cfg.Auth.User {
 			_ = h.backend.SetAuthPassword(newPwd)
@@ -248,18 +286,18 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		}
 		m := reAdminCreateUser.FindStringSubmatch(q)
 		typ := auth.TypeUser
-		if m[4] != "" {
-			switch strings.ToUpper(m[4]) {
+		if m[5] != "" {
+			switch strings.ToUpper(m[5]) {
 			case "SUPER":
 				typ = auth.TypeSuper
 			case "READONLY":
 				typ = auth.TypeReadonly
 			}
 		}
-		if err := h.auths.CreateUser(m[1], m[3], m[2], typ); err != nil {
+		if err := h.auths.CreateUser(m[1], m[4], m[2], typ, m[3]); err != nil {
 			return nil, true, mysql.NewError(1396, "create user failed: "+err.Error())
 		}
-		logx.Infof("user %s@%s created (type=%s) by conn %d", m[1], m[2], typ, h.connID)
+		logx.Infof("user %s@%s created (type=%s, plugin=%s) by conn %d", m[1], m[2], typ, m[3], h.connID)
 		return meta.OKResultPub(), true, nil
 
 	case reAdminDropUser.MatchString(q):
@@ -294,6 +332,23 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		logx.Infof("user %s account_type set to %s by conn %d", m[1], m[2], h.connID)
 		return meta.OKResultPub(), true, nil
 
+	case reAdminAlterPlugin.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminAlterPlugin.FindStringSubmatch(q)
+		if err := h.auths.SetPlugin(m[1], m[2]); err != nil {
+			return nil, true, mysql.NewError(1105, err.Error())
+		}
+		if m[3] != "" {
+			if err := h.auths.SetPassword(m[1], m[3]); err != nil {
+				return nil, true, mysql.NewError(1105, err.Error())
+			}
+		}
+		h.invalidateAuthCache(m[1])
+		logx.Infof("user %s auth plugin set to %s by conn %d", m[1], m[2], h.connID)
+		return meta.OKResultPub(), true, nil
+
 	case reAdminGrant.MatchString(q):
 		if err := h.adminMutateGate(); err != nil {
 			return nil, true, err
@@ -305,6 +360,7 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		}
 		if m[5] != "" {
 			_ = h.auths.SetPassword(m[4], m[5])
+			h.invalidateAuthCache(m[4])
 		}
 		logx.Infof("granted %s ON %s.%s TO %s by conn %d", m[1], m[2], m[3], m[4], h.connID)
 		return meta.OKResultPub(), true, nil

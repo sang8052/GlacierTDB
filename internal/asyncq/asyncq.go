@@ -292,6 +292,17 @@ func (e *Engine) execute(j *Job) {
 	}
 	f.Close()
 
+	// SCRIPT 后处理管道（v1.1.1）：结果 JSONL → 脚本 stdin → 产物落 jobs/<id>.<output>
+	if j.Script != "" {
+		e.mu.Lock()
+		j.State = StateScript
+		e.mu.Unlock()
+		if err := e.runScript(j); err != nil {
+			e.finish(j, StateError, err.Error())
+			return
+		}
+	}
+
 	e.finish(j, StateDone, "")
 }
 

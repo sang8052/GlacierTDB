@@ -38,6 +38,7 @@ type User struct {
 	Username  string
 	Password  string
 	Type      string
+	Plugin    string // 登录算法：mysql_native_password | caching_sha2_password | sha256_password
 	DefaultDB string
 	Locked    bool
 	LockedTo  string // 自动锁定到期（空 = 无）
@@ -112,6 +113,7 @@ CREATE TABLE IF NOT EXISTS users (
   username   TEXT PRIMARY KEY,
   password   TEXT NOT NULL,
   account_type TEXT NOT NULL DEFAULT 'user',
+  auth_plugin TEXT NOT NULL DEFAULT 'mysql_native_password',
   default_db TEXT NOT NULL DEFAULT '',
   locked     INTEGER NOT NULL DEFAULT 0,
   locked_until TEXT NOT NULL DEFAULT '',
@@ -150,6 +152,8 @@ CREATE TABLE IF NOT EXISTS lock_state (
 );`); err != nil {
 		return nil, fmt.Errorf("init auth schema: %w", err)
 	}
+	// 旧库迁移：users 表补 auth_plugin 列（v1.1.1，缓存列已存在时忽略报错）
+	_, _ = db.Exec(`ALTER TABLE users ADD COLUMN auth_plugin TEXT NOT NULL DEFAULT 'mysql_native_password'`)
 	if err := s.migrate(); err != nil {
 		return nil, err
 	}
@@ -209,8 +213,8 @@ func (s *Store) Lookup(username string) (User, bool, error) {
 	var u User
 	var locked int
 	var lockedUntil string
-	err := s.db.QueryRow(`SELECT username,password,account_type,default_db,locked,locked_until FROM users WHERE username=?`,
-		username).Scan(&u.Username, &u.Password, &u.Type, &u.DefaultDB, &locked, &lockedUntil)
+	err := s.db.QueryRow(`SELECT username,password,account_type,COALESCE(auth_plugin,''),default_db,locked,locked_until FROM users WHERE username=?`,
+		username).Scan(&u.Username, &u.Password, &u.Type, &u.Plugin, &u.DefaultDB, &locked, &lockedUntil)
 	if err == sql.ErrNoRows {
 		return User{}, false, nil
 	}
@@ -590,8 +594,8 @@ func (s *Store) Locks() []LockRow {
 // 账号/权限管理（管理面 SQL 调用）
 // ---------------------------------------------------------------------------
 
-// CreateUser 创建账户（默认 host '%'）。
-func (s *Store) CreateUser(username, password, host, typ string) error {
+// CreateUser 创建账户（默认 host '%'；plugin 空 = mysql_native_password）。
+func (s *Store) CreateUser(username, password, host, typ, plugin string) error {
 	if username == "" || strings.ContainsAny(username, "'\"`") {
 		return fmt.Errorf("invalid user name %q", username)
 	}
@@ -600,16 +604,61 @@ func (s *Store) CreateUser(username, password, host, typ string) error {
 	default:
 		return fmt.Errorf("invalid account type %q", typ)
 	}
+	plugin, err := NormalizePlugin(plugin)
+	if err != nil {
+		return err
+	}
 	now := time.Now().Format("2006-01-02 15:04:05")
 	if host == "" {
 		host = "%"
 	}
-	if _, err := s.db.Exec(`INSERT INTO users(username,password,account_type,default_db,created_ts,updated_ts) VALUES(?,?,?,?,?,?)`,
-		username, password, typ, "", now, now); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO users(username,password,account_type,auth_plugin,default_db,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?)`,
+		username, password, typ, plugin, "", now, now); err != nil {
 		return err
 	}
-	_, err := s.db.Exec(`INSERT OR IGNORE INTO user_hosts(username,host_pattern) VALUES(?,?)`, username, host)
+	_, err = s.db.Exec(`INSERT OR IGNORE INTO user_hosts(username,host_pattern) VALUES(?,?)`, username, host)
 	return err
+}
+
+// NormalizePlugin 登录算法名规范化（空 = native；非法报错）。
+func NormalizePlugin(plugin string) (string, error) {
+	p := strings.ToLower(strings.TrimSpace(plugin))
+	p = strings.ReplaceAll(p, "`", "")
+	switch p {
+	case "", "mysql_native_password":
+		return "mysql_native_password", nil
+	case "caching_sha2_password":
+		return "caching_sha2_password", nil
+	case "sha256_password":
+		return "sha256_password", nil
+	}
+	return "", fmt.Errorf("unsupported auth plugin %q (mysql_native_password|caching_sha2_password|sha256_password)", plugin)
+}
+
+// SetPlugin 修改账号登录算法（ALTER USER ... IDENTIFIED WITH ...）。
+func (s *Store) SetPlugin(username, plugin string) error {
+	plugin, err := NormalizePlugin(plugin)
+	if err != nil {
+		return err
+	}
+	res, err := s.db.Exec(`UPDATE users SET auth_plugin=?, updated_ts=? WHERE username=?`,
+		plugin, time.Now().Format("2006-01-02 15:04:05"), username)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("there is no such account %q defined", username)
+	}
+	return nil
+}
+
+// PluginFor 返回账号登录算法（未知 = mysql_native_password）。
+func (s *Store) PluginFor(username string) string {
+	u, ok, err := s.Lookup(username)
+	if err != nil || !ok || u.Plugin == "" {
+		return "mysql_native_password"
+	}
+	return u.Plugin
 }
 
 // SetPassword 改密（管理面 SET PASSWORD / ALTER USER）。
@@ -855,8 +904,16 @@ func (h *Handler) GetCredential(username string) (server.Credential, bool, error
 	}
 	return server.Credential{
 		Passwords:      []string{u.Password},
-		AuthPluginName: mysql.AUTH_NATIVE_PASSWORD,
+		AuthPluginName: pluginOrDefault(u.Plugin),
 	}, true, nil
+}
+
+// pluginOrDefault 空插件回退 mysql_native_password。
+func pluginOrDefault(p string) string {
+	if p == "" {
+		return "mysql_native_password"
+	}
+	return p
 }
 
 // OnAuthSuccess 实现 server.AuthenticationHandler：成功审计。

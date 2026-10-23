@@ -336,6 +336,10 @@ log:
 | 内存保护 | `memory_limit_mb`（Go 软内存上限）、`max_connections`、单查询行数上限 `max_result_rows` |
 | SQL 审计日志 | `log.sql_log_file` 开启后逐条记录语句/结果(OK\|ERROR)/错误消息/耗时/行数/连接，100MB 自动轮转 |
 | 慢查询日志 | 超过 `slow_query_ms` 的语句记入日志（标注 QoS 排队时长） |
+| rollup 预聚合（v1.1.1） | 时序 points 写入同遍落 m1/h1/d1 汇总表（INSERT 触发器）；长范围聚合自动路由最粗可用粒度（满桶走汇总、边缘桶回退 raw，精确等价）；`REBUILD ROLLUP <db>` 存量回填 |
+| 并行查询扩展（v1.1.1） | GROUP BY series_id, time(N) 按 series 取模分片并行 + Go 侧按桶合并；明细导出按 rowid 区间并行 scan、顺序发送（方案 B） |
+| SCRIPT 后处理（v1.1.1） | `SUBMIT QUERY … SCRIPT 'x.js' OUTPUT out`：结果 JSONL 流入 nodejs/python 子进程，产物落 jobs/<id>.<out>（script_dir 白名单） |
+| caching_sha2_password（v1.1.1） | MySQL 8 默认登录算法：账号级 `IDENTIFIED WITH caching_sha2_password`、握手默认 `auth.auth_plugin` 可配、RSA 全认证（非 TLS）、改密自动失效登录缓存 |
 | S3 对象存储（v1.1.0，可选） | AWS SigV4（表头 + 预签名 URL + aws-chunked）；一 bucket 一表 + 分块；AK/SK 签发/轮换/禁用/吊销；PUT/GET/HEAD/DELETE/COPY、ListObjects V1/V2、ListObjectVersions；下载限速（单连接/用户总带宽合并/并发上限）；UA/IP/Referer/Header 请求策略；上传回调（HMAC）；图片裁剪/缩放/转换/base64；多版本 + 对象锁（WORM）+ 生命周期；virtual-host + 自定义域名独立证书（SNI 热加载）；`s3_usage` 计费 SQL 可查 + 导出接口（详见 docs/S3对象存储.md） |
 
 ---
@@ -348,6 +352,7 @@ log:
 | --- | --- | --- |
 | ✅ v1.0.10 | 运维与查询补强 | **已完成**：查询 QoS（全系统/单库）；每周周期调度 + `SHOW QUERY SCHEDULE` + `PAUSE/RESUME`；**用户权限系统**（账号入库、库/表/IP 权限、MySQL 风格 `CREATE USER`/`GRANT`）+ **防爆破**（IP/账号/混合锁定、可选 ufw/iptables/firewall-cmd 系统层封锁、登录失败 HTTP 告警）；**JSON 复杂查询**；**Geo 字段查询** |
 | ✅ v1.1.0 | S3 对象存储 | **已完成**：AWS SigV4 兼容（表头/预签名/aws-chunked）；bucket 一张表、用户多组 AK/SK（AS/SK 前缀，SK 明文仅一次可见）；下载限速（单连接/多线程合并/并发上限）；UA/IP/Referer/Header 请求策略 + 上传回调（HMAC）；图片预处理/base64 直传/多版本/对象锁/生命周期；region 通配、virtual-host、多 endpoint 泛域名证书、bucket 自定义域名（SNI 热加载）；SQL 可查的 `s3_usage` 计费 + 导出接口 |
+| ✅ v1.1.1 | 存量余项 + caching_sha2 | **已完成**：rollup 多粒度预聚合（同遍落 m1/h1/d1、长范围聚合自动路由最粗粒度、精确等价）；GROUP BY series_id 分片并行；明细导出并行（方案 B）；SCRIPT 后处理管道（JSONL→nodejs/python）；MySQL 兼容 M3（ON DUPLICATE KEY UPDATE/VALUES()/FOR UPDATE/CONCAT_WS/LPAD/RPAD/DATE_FORMAT 周）；**caching_sha2_password**（MySQL 8 登录算法，RSA 全认证 + 缓存失效） |
 | v1.2.0 | Redis 键值/队列 | `mode:redis` 同端口 RESP；key/队列/TTL/自动落盘；每用户独立 namespace；内存上限 + LRU 淘汰 |
 | v1.3.0 | RabbitMQ 队列 | `mode:rabbitmq` 同端口 AMQP 0-9-1；exchange/queue/binding/发布消费；消息持久化、管理面观测 |
 

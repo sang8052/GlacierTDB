@@ -119,6 +119,18 @@ else
 fi
 
 # ----------------------------------------------------------------------------
+# 2.5 SCRIPT 后处理测试夹具（test_v111.py 用；写入被测容器 /data 卷的 scripts/ 目录）
+# ----------------------------------------------------------------------------
+DATA_DIR=$(docker inspect "$PROXY" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)
+if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+    mkdir -p "$DATA_DIR/scripts"
+    printf '#!/bin/sh\ncat >/dev/null\necho SCRIPT_OK\n' > "$DATA_DIR/scripts/pipe.js"
+    echo "[OK] SCRIPT 测试夹具就绪: $DATA_DIR/scripts/pipe.js"
+else
+    echo "[SKIP] 未找到被测容器 /data 挂载，SCRIPT 用例将验证错误路径"
+fi
+
+# ----------------------------------------------------------------------------
 # 3. Python 三件套（pymysql / sqlalchemy / concurrent）
 # ----------------------------------------------------------------------------
 step "步骤 3/4: Python 测试（PyMySQL / SQLAlchemy / 并发，容器 ${PY_IMG}）"
@@ -128,11 +140,11 @@ step "步骤 3/4: Python 测试（PyMySQL / SQLAlchemy / 并发，容器 ${PY_IM
 PYRUN=$(cat <<'EOF'
 set -u
 if (unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; \
-    pip install --no-cache-dir -q -i https://pypi.tuna.tsinghua.edu.cn/simple PyMySQL SQLAlchemy); then
+    pip install --no-cache-dir -q -i https://pypi.tuna.tsinghua.edu.cn/simple PyMySQL SQLAlchemy cryptography); then
     echo "[OK] pip 安装成功（清华镜像源直连）"
 elif (export http_proxy="__PIP_PROXY__" https_proxy="__PIP_PROXY__" \
                    HTTP_PROXY="__PIP_PROXY__" HTTPS_PROXY="__PIP_PROXY__"; \
-      pip install --no-cache-dir -q PyMySQL SQLAlchemy); then
+      pip install --no-cache-dir -q PyMySQL SQLAlchemy cryptography); then
     echo "[OK] pip 安装成功（pypi 官方源 + 代理）"
 else
     echo "[FAIL] pip 安装失败（清华源直连 与 官方源+代理 均不可用）"
@@ -153,6 +165,7 @@ echo "---- test_v108.py ----"; python /tests/test_v108.py || rc=1
 echo "---- test_v109.py ----"; python /tests/test_v109.py || rc=1
 echo "---- test_v110.py ----"; python /tests/test_v110.py || rc=1
 echo "---- test_s3.py ----";  python /tests/test_s3.py  || rc=1
+echo "---- test_v111.py ----"; python /tests/test_v111.py || rc=1
 exit $rc
 EOF
 )
