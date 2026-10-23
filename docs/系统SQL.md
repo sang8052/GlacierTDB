@@ -34,7 +34,7 @@ SELECT name FROM server_config WHERE name LIKE 'sqlite.%';
 
 | 键 | 说明 |
 | --- | --- |
-| `glacier_version` | GlacierTDB 自身版本（如 `1.0.10.alpha`） |
+| `glacier_version` | GlacierTDB 自身版本（如 `1.3.0.alpha`） |
 | `server` / `server_version` | 产品名 / 对外模拟的 MySQL 协议版本（`8.99.999`） |
 | `listen` / `db_dir` / `default_db` / `databases` | 监听、库目录、默认库、当前库列表 |
 | `auth.user` / `auth.readonly_user` | 管理账号（固定 `glacier`）/ 只读账号名 |
@@ -403,7 +403,7 @@ Go 标量函数（v1.0.8，注册进每个后端连接，任意表达式位置�
 
 ```sql
 -- 日常
-SELECT glacier_version;                          -- 1.0.10.alpha
+SELECT glacier_version;                          -- 1.3.0.alpha
 USE GlacierTDB;                                  -- 进管理面
 SHOW CLIENTS;                                    -- 看连接
 SHOW TRANSACTIONS;                               -- 看事务

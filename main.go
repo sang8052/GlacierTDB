@@ -12,8 +12,6 @@ import (
 
 	"glaciertdb/internal/auth"
 	"glaciertdb/internal/dirlock"
-	"glaciertdb/internal/kv"
-	"glaciertdb/internal/mq"
 	"glaciertdb/internal/s3"
 	"runtime"
 	"runtime/debug"
@@ -152,29 +150,6 @@ func main() {
 		logx.Infof("s3 object storage enabled: region=%q endpoints=%d", cfg.S3.Region, len(cfg.S3.Endpoints))
 	}
 
-	// 键值/队列（v1.2.0，mode:redis 同端口 RESP 服务）
-	var kvstore *kv.Store
-	if cfg.KV.Enable {
-		kvstore, err = kv.Open(backend, cfg)
-		if err != nil {
-			logx.Errorf("init kv store: %v", err)
-			os.Exit(1)
-		}
-		logx.Infof("kv: redis protocol enabled on %s (mode:redis / RESP sniff), max_memory_mb=%d eviction=%s",
-			cfg.Listen, cfg.KV.MaxMemoryMB, cfg.KV.Eviction)
-	}
-
-	// 消息队列（v1.3.0，mode:rabbitmq 同端口 AMQP 0-9-1）
-	var mqstore *mq.Store
-	if cfg.MQ.Enable {
-		mqstore, err = mq.Open(backend, cfg.MQ.MaxMessageMB)
-		if err != nil {
-			logx.Errorf("init mq store: %v", err)
-			os.Exit(1)
-		}
-		logx.Infof("mq: amqp protocol enabled on %s (mode:rabbitmq / AMQP sniff)", cfg.Listen)
-	}
-
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -183,7 +158,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if err := proxy.Run(cfg, backend, authStore, s3store, s3srv, kvstore, mqstore); err != nil {
+	if err := proxy.Run(cfg, backend, authStore, s3store, s3srv); err != nil {
 		logx.Errorf("listen %s: %v", cfg.Listen, err)
 		os.Exit(1)
 	}
