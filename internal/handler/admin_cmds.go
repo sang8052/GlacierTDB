@@ -518,6 +518,11 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		case "mq_exchanges":
 			cols = mqExchangeCols
 			rows = h.mqExchangeRows()
+		case "mqtt_retains":
+			cols = []string{"namespace", "topic", "bytes", "qos", "ts"}
+			if h.mqstore != nil {
+				rows = h.mqstore.RetainStats()
+			}
 		}
 		rows = filterAdminRows(cols, rows, where)
 		res, err := meta.SimpleRS(cols, rows)
@@ -544,6 +549,11 @@ func (h *Handler) serverConfigRows() [][]any {
 		{"db_dir", cfg.DBDir},
 		{"default_db", cfg.DefaultDB},
 		{"databases", strings.Join(dbNames, ",")},
+		{"mq.server_version", cfg.MQ.ServerVersion},
+		{"mqtt.enable", b2s(cfg.MQ.Enable && cfg.MQ.MQTT.Enable)},
+		{"mqtt.listen", cfg.MQ.MQTT.Listen},
+		{"mqtt.ws_path", cfg.MQ.MQTT.WsPath},
+		{"timeseries.cold_after_days", fmt.Sprintf("%d", cfg.Timeseries.ColdAfterDays)},
 		{"auth.user", cfg.Auth.User},
 		{"auth.readonly_user", cfg.Auth.ReadOnlyUser},
 		{"memory_limit_mb", fmt.Sprintf("%d", cfg.MemoryLimitMB)},

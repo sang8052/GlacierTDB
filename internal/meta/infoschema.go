@@ -145,6 +145,7 @@ func isColumns(ctx *Ctx) ([]string, [][]any, error) {
 			if len(c) > 4 && c[4] != nil {
 				dflt = toStr(c[4])
 			}
+			ctype = OverrideColumnType(db, tname, cname, ctype)
 			dataType := strings.ToUpper(strings.TrimSpace(strings.SplitN(ctype, "(", 2)[0]))
 			colKey := ""
 			extra := ""

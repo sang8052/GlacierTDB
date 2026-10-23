@@ -102,6 +102,17 @@ mux_sniff_ms: 300
 mq:
   enable: true            # AMQP 服务开关（默认开；false 时 3309 不识别 AMQP）
   max_message_mb: 32      # 单条消息上限
+  server_version: "3.13.0"   # 对外宣称的 RabbitMQ 版本串（Connection.Start server-properties，v1.3.3）
+  mqtt:                   # MQTT 接入（v1.3.3）：桥接进 mqtt topic 交换机，认证走统一账号
+    enable: true          # 开关（依赖 mq.enable）
+    listen: ""            # 可选独立监听（tcp+ws 同端口，如 0.0.0.0:1883；空 = 仅 3309 复用）
+    ws_path: /mqtt        # 3309 上 WebSocket 升级路径
+
+# 时序冷压缩与固化（v1.3.3）：points 表超龄数据自动 gzip 固化进 points_cold，
+# 查询/写入触及冻结区间自动解冻（透明）；手动命令 COMPRESS/THAW/SHOW COLD
+timeseries:
+  cold_after_days: 0      # 数据年龄超过 N 天自动冷压缩（0 = 关闭自动策略，仅手动）
+  cold_scan_min_sec: 600  # 后台扫描周期（最低 60）
 
 # S3 对象存储（v1.1.0，可选模块）：AWS Signature V4 兼容，独立 HTTP(S) 监听器（不进 3309 复用）
 # 详见 docs/S3对象存储.md 与 docs/配置说明.md §2.10

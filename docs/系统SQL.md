@@ -399,7 +399,36 @@ Go 标量函数（v1.0.8，注册进每个后端连接，任意表达式位置�
 
 `POINT` / `GEOMETRY` / `LINESTRING` / `POLYGON` 等建表类型直通 SQLite（WKT 文本存储）。
 
-## 6. 快速速查
+## 6. MySQL 8 兼容 M4 批（v1.3.3）
+
+- **运算符**：`&&`→AND、`||`→OR（MySQL 默认语义）、`!`→NOT、`XOR`、`a DIV b`（整除）、`RLIKE`→REGEXP、`BINARY 'x'`→CAST AS BLOB、`0x1F` 十六进制、`N'x'`/`_utf8mb4'x'` 引导符剥除；
+- **函数（Go 注册，任意表达式位置可用）**：`LOCATE/CHAR_LENGTH/REPEAT/REVERSE/SPACE/STRCMP/ASCII/UNHEX/FORMAT`、`MOD/FLOOR/CEIL/POW/SQRT/LOG2/TRUNCATE/SIGN/DEGREES/PI`、`YEAR/MONTH/DAY/DAYOFWEEK/WEEKDAY/QUARTER/DAYNAME/MONTHNAME/DAYOFYEAR/LAST_DAY/TO_DAYS/FROM_DAYS/SEC_TO_TIME/TIME_TO_SEC`；
+- **改写型函数**：`DATE_ADD/DATE_SUB/ADDDATE/SUBDATE/TIMESTAMPADD`（月末 clamp）、`EXTRACT(unit FROM x)`、`TRIM(BOTH|LEADING|TRAILING … FROM …)`、`POSITION(x IN y)`、`SUBSTRING(x FROM n FOR m)`、`GROUP_CONCAT(x SEPARATOR s)`、`CAST/CONVERT`（含 `USING`）、`UNIX_TIMESTAMP(x)` 整数、`ISNULL(x)`；
+- **DDL/语句**：`ENUM/SET/JSON/BIT/BLOB 族` 类型映射、列级 `COLLATE/CHARACTER SET/USING BTREE` 剥除、表尾属性与 `PARTITION BY` 剥除、`ALTER TABLE ADD|DROP INDEX`、`MODIFY/CHANGE COLUMN`、`RENAME TABLE a TO b`、`CREATE TABLE t LIKE src`、`INSERT INTO t SET …`、`UPDATE/DELETE … ORDER BY … LIMIT n`；
+- **维护语句**：`ANALYZE/CHECK/OPTIMIZE/REPAIR TABLE`（四列 OK 结果集）、`CHECKSUM TABLE`；
+- **用户变量**：`SET @a = 42` 会话登记，后续语句 `@a` 自动替换为字面量（`@@version` 等系统变量不受影响）。
+
+## 6.1 列类型映射（v1.3.3，系统库 glacier_meta）
+
+- **落盘**：`DOUBLE/FLOAT/DECIMAL` 列以 SQLite TEXT 存储——INSERT/UPDATE 的裸数字字面量自动加引号，**17 位有效数字精确往返**（`SELECT typeof(money)` 为 `text`）；
+- **读出**：按建表登记的 MySQL 类型还原——DOUBLE/FLOAT 列返回 float64（协议类型码 5），DECIMAL 返回精确文本（NEWDECIMAL=246，客户端转 Decimal）；
+- **谓词语义**：WHERE 比较与 ORDER BY 的浮点列自动包 `CAST(col AS REAL)`，数值比较/排序不受 TEXT 存储影响；
+- **类型回放**：`SHOW COLUMNS` / `SHOW CREATE TABLE` / `information_schema.COLUMNS` 优先回放建表时的原始类型（如 `ENUM('a','b','c')`、`DECIMAL(8,2)`、`BIT(1)`）；
+- CREATE/ALTER（ADD/DROP/RENAME COLUMN、CHANGE）/DROP/RENAME TABLE/LIKE 全路径维护映射；存量旧表（无映射）行为不变。
+
+## 6.2 时序冷压缩命令（v1.3.3，普通库执行）
+
+```sql
+COMPRESS COLD points BEFORE '2026-10-01' [STEP n DAY|HOUR];   -- 边界前完整块 gzip 固化进 points_cold
+THAW COLD points [ALL | BEFORE '2026-10-01' | CHUNK <ms>];    -- 解冻回热表
+SHOW COLD [points];                                            -- 块数/行数/压缩比（返回 chunk 起始时间等）
+```
+
+- 读写透明：查询解析 ts 谓词，触及冻结区间自动解冻（无谓词保守全解）；写入撞冻结区间 PK 冲突自动解冻重试；
+- 解冻期间临时摘除 rollup 触发器，`SUM(cnt)` 与全量严格一致；
+- 自动策略：`timeseries.cold_after_days > 0` 时后台周期固化所有库（详见 docs/配置说明.md）。
+
+## 7. 快速速查
 
 ```sql
 -- 日常

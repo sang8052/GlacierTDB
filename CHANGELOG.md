@@ -2,6 +2,44 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.3.alpha] - 2026-10-23
+
+### 新增
+- **MySQL 8 兼容 M4 批**（参考 MySQL 8 语法标准逐项补齐）：
+  - **运算符**：`&&`→AND、`||`→OR（MySQL 默认语义，先于 CONCAT 展开）、`!`→NOT（非 `!=`）、`XOR`→`<>`、`a DIV b`→整除、`RLIKE`→REGEXP（注册 Go `regexp()` 函数）、`BINARY 'x'`→`CAST('x' AS BLOB)`、`0x1F` 十六进制字面量→`x'..'` blob、`N'..'`/`_utf8mb4'..'` 字符集引导符剥除（跨引号边界安全扫描）；
+  - **函数**：LOCATE/CHAR_LENGTH/REPEAT/REVERSE/SPACE/STRCMP/ASCII/UNHEX/FORMAT；MOD/FLOOR/CEIL/POW/SQRT/LOG 族/三角/RADIANS/DEGREES/SIGN/TRUNCATE；YEAR/MONTH/DAY 族/DAYOFWEEK/WEEKDAY/WEEK/QUARTER/DAYNAME/MONTHNAME/DAYOFYEAR/LAST_DAY/TO_DAYS/FROM_DAYS/SEC_TO_TIME/TIME_TO_SEC（Go 注册进 SQLite）；DATE_ADD/DATE_SUB/ADDDATE/SUBDATE/TIMESTAMPADD（月末 clamp 的 MySQL 日历语义）、EXTRACT(unit FROM x)、TRIM(BOTH|LEADING|TRAILING ... FROM)、POSITION(x IN y)、SUBSTRING(x FROM n FOR m)、MID、UNIX_TIMESTAMP(x)→整数、SYSDATE、ISNULL；CAST/CONVERT 类型词根映射（含 `CONVERT(x USING cs)`）；GROUP_CONCAT `SEPARATOR` 语法（幂等改写，防定位器自噬死循环）；
+  - **DDL**：`ENUM/SET/JSON/BIT/TINYBLOB/MEDIUMBLOB/LONGBLOB/SERIAL/NVARCHAR` 类型映射；列级 `COLLATE`/`CHARACTER SET`/`USING BTREE` 剥除；表尾 `AUTO_INCREMENT=`/`CHARSET=`/`COLLATE=`/`COMMENT=`/`ROW_FORMAT=` 等属性与 `PARTITION BY` 子句（仅 CREATE TABLE）；`ALTER TABLE ADD|DROP INDEX|KEY`→CREATE/DROP INDEX、`MODIFY/CHANGE COLUMN`、`ALTER ... SET/DROP DEFAULT`/`AUTO_INCREMENT=`/`ENABLE|DISABLE KEYS` 等 no-op 兼容；`RENAME TABLE a TO b [, c TO d]`；`CREATE TABLE t LIKE src`；`INSERT INTO t SET a=1, b=...`；`UPDATE/DELETE ... ORDER BY ... LIMIT n`→rowid 子查询；
+  - **维护语句应答**：ANALYZE/CHECK/OPTIMIZE/REPAIR TABLE（四列 OK 结果集）、CHECKSUM TABLE；
+  - **用户变量**：`SET @a = expr` 会话登记，语句中 `@a` 字面量替换（`@@系统变量` 不受影响）。
+- **时序冷压缩与固化**：`points`（series_id/ts/val 约定）按时间步长分块 gzip 压缩进 `points_cold`（varint ts 增量 + float64 原码，字节级无损），删除热表数据行完成固化——
+  - 命令：`COMPRESS COLD points BEFORE <time> [STEP n DAY|HOUR]`、`THAW COLD points [ALL|BEFORE t|CHUNK ms]`、`SHOW COLD [points]`（块数/行数/压缩比）；
+  - **透明性**：读查询解析 ts 谓词，触及冻结区间自动解冻（无谓词保守全解）；写入撞冻结区间 PK 冲突自动全解重试；解冻期间临时摘除 rollup 触发器防重复计数（解冻后 `SUM(cnt)` 与全量一致）；
+  - 策略：`timeseries.cold_after_days`（>0 时后台周期固化全部库）+ `cold_scan_min_sec`。
+- **列类型映射（colmeta 系统库 glacier_meta）**：每库每表登记「列 → MySQL 原始类型」——
+  - **落盘**：DOUBLE/FLOAT/DECIMAL 一律 SQLite TEXT 存储（防 15 位浮点格式化截断），INSERT/UPDATE 中这些列的裸数字字面量自动加引号原样保存；
+  - **读出**：结果集按映射还原 float64 并回放 MySQL 类型码（DOUBLE=5/NEWDECIMAL=246，pymysql 正确得到 float/Decimal）；WHERE 比较与 ORDER BY 的浮点列引用自动包 `CAST(col AS REAL)`（TEXT 存储下的数值语义）；
+  - **反射回放**：SHOW COLUMNS / SHOW CREATE TABLE / information_schema.COLUMNS 优先回放建表时的 MySQL 原始类型（ENUM('a','b')/DECIMAL(8,2)/BIT(1) 原样）；
+  - CREATE/ALTER（ADD/DROP/RENAME COLUMN、CHANGE）/DROP/RENAME TABLE/LIKE 全路径维护映射（进程内缓存，写路径失效）。
+- **MQTT 接入（ws + tcp，桥接 RabbitMQ）**：MQTT 3.1/3.1.1 over TCP 与 WebSocket（RFC 6455）——
+  - 3309 复用：MQTT CONNECT 首包嗅探（0x1x）、HTTP Upgrade→`/mqtt`、`mode:mqtt` 声明行；可选独立监听 `mq.mqtt.listen`（tcp+ws 同端口）；
+  - 桥接：topic `a/b/c` ↔ routing key `a.b.c`（`mqtt` topic 交换机），过滤器 `+`/`#` ↔ `*`/`#`；QoS0/1（PUBACK）、保留消息（mqtt_retains 落盘重启不丢）、clean_session=0 离线队列补投、遗嘱消息（异常断开发布）、keepalive（1.5 倍超时）；每连接单队列消费者按过滤器分发（多订阅不吞消息）；
+  - 认证沿用统一账号体系（CONNECT username/password）；管理面 `mqtt_retains` 表。
+- **RabbitMQ 版本串可配置**：`mq.server_version`（默认 3.13.0），Connection.Start server-properties.version 原样上报。
+
+### 修复
+- **AMQP Channel.Close-Ok 方法号错误**（历史 bug）：应答 method 51（误用 Connection.Close-Ok 号）→ 规范值 **41**；此前 pika `connection.close()` 必报 `KeyError(1310771)` 断流；
+- MQTT 桥接消息的 content header 缺 2 字节 property-flags（空属性时）导致 AMQP 消费端帧解析崩溃；
+- SUBACK 先于保留消息补发（MQTT 顺序语义）；
+- **BUG.txt 使用反馈三项**：
+  - **redis-py ≥ 8 连接即失败**：`HELLO` 此前直接报 unknown command 且 redis-py 将握手错误视为致命 → 实现最小 HELLO 应答（server map + `proto:2`，AUTH/SETNAME 子参数一并处理，`default` 等价单密码；`HELLO 9` 报 `NOPROTO`）——redis-py 8.1 实测**不传 `protocol` 直连成功**（RESP3 解析器对 RESP2 基础类型帧兼容），显式 `protocol=2` 老路径不受影响；
+  - **`async_query` 段缺失静默禁用与文档「默认 true」不一致**：`Default()` 补 `enable: true`（与 kv/mq 行为对齐，段缺失即启用；显式 `enable: false` 仍生效）；
+  - **`SCAN` 未实现导致 `redis-cli --scan` 静默无结果**：实现 `SCAN cursor [MATCH p] [COUNT n] [TYPE t]`（简化语义：单批全量返回 + 游标恒 0，真实 Redis 嵌套应答形态 `[cursor, [keys…]]`），`redis-cli --scan` 与 redis-py `scan_iter` 可用。
+
+### 变更
+- **DDL 类型映射行为**：`DOUBLE/FLOAT` 由映射 REAL 改为 **TEXT**（v1.3.3 类型映射核心变更；存量 REAL 表不受影响，查出无映射则维持原样）——`tests/test_mysql_compat.py` 断言同步更新；
+- 新系统库 `glacier_meta.db`（列类型映射，不对客户端暴露）；`Backend` 新增 `OpenMetaDB`；
+- `tests/test_v133.py` 新增 120 项（含 BUG.txt 反馈验证 9 项）+ `--check-restart` 重启持久化 4 项（冷块/rollup 一致性/保留消息）；`tests/run_all.sh` 纳入（pip 依赖加 redis）；全套回归 **ALL TESTS PASSED**（21 脚本 + 三重启持久化）。
+
 ## [1.3.2.alpha] - 2026-10-23
 
 ### 新增

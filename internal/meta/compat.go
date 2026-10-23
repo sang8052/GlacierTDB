@@ -31,16 +31,28 @@ var (
 		re   *regexp.Regexp
 		repl string
 	}{
+		// v1.3.3：ENUM/SET → TEXT（原始类型由 colmeta 记录，SHOW/查出时回放）
+		{regexp.MustCompile(`(?i)\bENUM\s*\([^)]*\)`), "TEXT"},
+		{regexp.MustCompile(`(?i)\bSET\s*\([^)]*\)`), "TEXT"},
+		{regexp.MustCompile(`(?i)\bJSON\b`), "TEXT"},
+		{regexp.MustCompile(`(?i)\bSERIAL\b`), "INTEGER"},
+		{regexp.MustCompile(`(?i)\b(TINYBLOB|MEDIUMBLOB|LONGBLOB)\b`), "BLOB"},
+		{regexp.MustCompile(`(?i)\bBIT\s*\(\d+\)`), "INTEGER"},
+		{regexp.MustCompile(`(?i)\bBIT\b`), "INTEGER"},
+		{regexp.MustCompile(`(?i)\bNVARCHAR\s*\(\d+\)`), "TEXT"},
+		{regexp.MustCompile(`(?i)\bNVARCHAR\b`), "TEXT"},
+		{regexp.MustCompile(`(?i)\bNCHAR\b`), "TEXT"},
 		{regexp.MustCompile(`(?i)\b(TINYINT|MEDIUMINT|SMALLINT|BIGINT|BOOLEAN|BOOL|INT)\s*\(\d+\)`), "INTEGER"},
 		{regexp.MustCompile(`(?i)\b(TINYINT|MEDIUMINT|SMALLINT|BIGINT|BOOLEAN|BOOL|INT)\b`), "INTEGER"},
 		{regexp.MustCompile(`(?i)\b(VARCHAR|CHAR|TINYTEXT|MEDIUMTEXT|LONGTEXT)\s*\(\d+\)`), "TEXT"},
 		{regexp.MustCompile(`(?i)\b(VARCHAR|CHAR|TINYTEXT|MEDIUMTEXT|LONGTEXT)\b`), "TEXT"},
 		{regexp.MustCompile(`(?i)\b(DATETIME|TIMESTAMP|DATE|TIME|YEAR)\s*\(\d+\)`), "TEXT"},
 		{regexp.MustCompile(`(?i)\b(DATETIME|TIMESTAMP|DATE|TIME|YEAR)\b`), "TEXT"},
-		{regexp.MustCompile(`(?i)\bDOUBLE(\s+PRECISION)?\s*\(\d+,\d+\)`), "REAL"},
-		{regexp.MustCompile(`(?i)\bDOUBLE(\s+PRECISION)?\b`), "REAL"},
-		{regexp.MustCompile(`(?i)\bFLOAT\s*\(\d+(,\d+)?\)`), "REAL"},
-		{regexp.MustCompile(`(?i)\bFLOAT\b`), "REAL"},
+		// v1.3.3：浮点/精确小数一律 TEXT 落盘（防 15 位格式化截断；查出按 colmeta 还原）
+		{regexp.MustCompile(`(?i)\bDOUBLE(\s+PRECISION)?\s*\(\d+,\d+\)`), "TEXT"},
+		{regexp.MustCompile(`(?i)\bDOUBLE(\s+PRECISION)?\b`), "TEXT"},
+		{regexp.MustCompile(`(?i)\bFLOAT\s*\(\d+(,\d+)?\)`), "TEXT"},
+		{regexp.MustCompile(`(?i)\bFLOAT\b`), "TEXT"},
 		{regexp.MustCompile(`(?i)\b(DECIMAL|NUMERIC)\s*\(\d+,\d+\)`), "TEXT"},
 		{regexp.MustCompile(`(?i)\b(DECIMAL|NUMERIC)\b`), "TEXT"},
 		{regexp.MustCompile(`(?i)\b(VARBINARY|BINARY)\s*\(\d+\)`), "BLOB"},
@@ -50,12 +62,19 @@ var (
 		{regexp.MustCompile(`(?i)\s*\bAUTO_INCREMENT\b`), ""}, // INTEGER PRIMARY KEY 天然自增
 		{regexp.MustCompile(`(?i)\s+ON\s+UPDATE\s+CURRENT_TIMESTAMP(\s*\(\d*\))?`), ""},
 		{regexp.MustCompile(`(?i)\s+COMMENT\s+'(?:[^']|'')*'`), ""}, // 列/索引注释
+		{regexp.MustCompile(`(?i)\s+COLLATE\s+[A-Za-z0-9_]+`), ""},  // 列级排序规则（v1.3.3）
+		{regexp.MustCompile(`(?i)\s+CHARACTER\s+SET\s+[A-Za-z0-9_]+`), ""},
+		{regexp.MustCompile(`(?i)\s+USING\s+BTREE`), ""}, // 索引存储引擎提示
 		// MySQL 建表内联 KEY/INDEX 段（SQLite 用独立 CREATE INDEX）
 		{regexp.MustCompile(`(?i),\s*(?:UNIQUE\s+)?(?:FULLTEXT\s+|SPATIAL\s+)?(?:KEY|INDEX)\s+` + "`?" + `\w+` + "`?" + `\s*\([^)]*\)`), ""},
 		// 表尾属性：) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ...
 		{regexp.MustCompile(`(?is)\)\s*ENGINE\s*=\s*\w+.*$`), ")"},
+		// v1.3.3：无 ENGINE 前缀的表尾属性兜底（AUTO_INCREMENT=/CHARSET=/COLLATE=/COMMENT=/ROW_FORMAT=…）
+		{regexp.MustCompile(`(?is)\)\s*(?:AUTO_INCREMENT|DEFAULT\s+CHARSET|CHARSET|CHARACTER\s+SET|COLLATE|COMMENT|ROW_FORMAT|MAX_ROWS|AVG_ROW_LENGTH|PACK_KEYS|DELAY_KEY_WRITE|CHECKSUM|TABLESPACE|INSERT_METHOD|STATS_[A-Z_]+|KEY_BLOCK_SIZE)\s*=?\s*.*$`), ")"},
+		{regexp.MustCompile(`(?i)\bCOLLATE\s*=\s*[A-Za-z0-9_]+\s*$`), ""},
 	}
 	reDefaultNow = regexp.MustCompile(`(?i)\bDEFAULT\s+CURRENT_TIMESTAMP(\s*\(\d*\))?`)
+	reDefaultNowFn = regexp.MustCompile(`(?i)\bDEFAULT\s+NOW\s*\(\s*\)`)
 )
 
 // uuidExpr 生成 UUID v4 样式字符串的 SQLite 表达式。
@@ -116,8 +135,18 @@ func RewriteDDLTypes(q string) string {
 		out = r.re.ReplaceAllString(out, r.repl)
 	}
 	out = reDefaultNow.ReplaceAllString(out, "DEFAULT (datetime('now'))")
+	out = reDefaultNowFn.ReplaceAllString(out, "DEFAULT (datetime('now'))")
+	// PARTITION BY 子句剥离（仅 CREATE TABLE；CREATE VIEW 可能含窗口函数 PARTITION BY，不能动）
+	if reIsCreateTable.MatchString(q) {
+		out = rePartitionBy.ReplaceAllString(out, "")
+	}
 	return out
 }
+
+var (
+	reIsCreateTable = regexp.MustCompile(`(?is)^\s*CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE\b`)
+	rePartitionBy   = regexp.MustCompile(`(?is)\bPARTITION\s+BY\b.*$`)
+)
 
 // rewriteCall 对函数调用做括号配对参数分割后重组（支持嵌套：外层先展开，内层随后续轮次处理）。
 func rewriteCall(q string, locator *regexp.Regexp, build func(args []string) string) string {

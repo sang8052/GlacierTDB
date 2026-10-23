@@ -366,7 +366,7 @@ var methodSpecs = map[uint32]methodSpec{
 	key(20, 20): {"Channel.Flow", "b"},
 	key(20, 21): {"Channel.Flow-Ok", "b"},
 	key(20, 40): {"Channel.Close", "hshh"},
-	key(20, 51): {"Channel.Close-Ok", ""},
+	key(20, 41): {"Channel.Close-Ok", ""}, // 0-9-1 规范：CloseOk=41（51 是 Connection.Close-Ok）
 	key(40, 10): {"Exchange.Declare", "hssbbbbbt"},
 	key(40, 11): {"Exchange.Declare-Ok", ""},
 	key(40, 20): {"Exchange.Delete", "hsbb"},
@@ -606,7 +606,11 @@ func (h contentHeader) encode() []byte {
 	e.short(60) // Basic
 	e.short(0)
 	e.longlong(h.bodySize)
-	e.b = append(e.b, h.props...)
+	if len(h.props) >= 2 {
+		e.b = append(e.b, h.props...)
+	} else {
+		e.short(0) // property-flags 至少 2 字节（MQTT 桥接消息无属性时的兜底，v1.3.3）
+	}
 	return e.b
 }
 

@@ -267,6 +267,8 @@ func registerCompatFuncs(c *sqlite3.Conn) error {
 		registerJSONFuncs(c),
 		// Geo/ST 函数族（v1.0.10：WKT/WKB/GeoJSON 自动识别）
 		registerGeoFuncs(c),
+		// MySQL 8 兼容 M4 函数族（v1.3.3：字符串/数学/日期）
+		registerM4Funcs(c),
 	); err != nil {
 		return err
 	}
