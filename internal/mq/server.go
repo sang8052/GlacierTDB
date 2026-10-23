@@ -80,10 +80,14 @@ func ServeConn(c net.Conn, store *Store, auths *auth.Store, cfg *config.Config) 
 }
 
 func (cs *connState) serve(_ []byte) {
-	// Connection.Start（0-9-1）
+	// Connection.Start（0-9-1）；server-properties 的 version 可配置（mq.server_version，v1.3.3）
+	srvVer := "3.13.0"
+	if cs.cfg != nil && cs.cfg.MQ.ServerVersion != "" {
+		srvVer = cs.cfg.MQ.ServerVersion
+	}
 	props := map[string]any{
 		"product":    "GlacierTDB",
-		"version":    "1.3.0",
+		"version":    srvVer,
 		"platform":   "Go",
 		"copyright":  "",
 		"information": "GlacierTDB AMQP 0-9-1 basic queue",
@@ -201,9 +205,9 @@ func (cs *connState) handleMethod(chNum uint16, m *methodMsg) bool {
 
 	case key(20, 40): // Close
 		cs.closeChannel(chNum)
-		cs.writeMethod(chNum, &methodMsg{class: 20, method: 51, args: nil})
+		cs.writeMethod(chNum, &methodMsg{class: 20, method: 41, args: nil}) // CloseOk=41
 
-	case key(20, 51): // Close-Ok
+	case key(20, 41): // Close-Ok
 		cs.closeChannel(chNum)
 
 	// ---- Exchange ----

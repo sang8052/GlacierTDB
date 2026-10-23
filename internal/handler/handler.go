@@ -19,6 +19,7 @@ import (
 	"glaciertdb/internal/admin"
 	"glaciertdb/internal/auth"
 	"glaciertdb/internal/asyncq"
+	"glaciertdb/internal/colmeta"
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/kv"
 	"glaciertdb/internal/logx"
@@ -49,10 +50,12 @@ type Handler struct {
 	s3srv      *s3.Server // 对象存储服务（证书刷新用）
 	kvstore    *kv.Store  // 键值/队列存储（v1.2.0；nil = 模块关闭）
 	mqstore    *mq.Store  // 消息队列存储（v1.3.0；nil = 模块关闭）
+	colmeta    *colmeta.Store // 列类型映射系统库（v1.3.3；nil = 模块关闭）
+	usrVars    map[string]string // 会话用户变量 @var（v1.3.3）
 	adminMode  bool     // USE GlacierTDB 后进入管理面
 	lastQuery  string   // 最近一条语句（管理面展示）
 	txStartedAt time.Time // 当前事务开启时刻
-	mu         sync.Mutex // 保护 lastQuery/adminMode/txStartedAt 的跨连接读
+	mu         sync.Mutex // 保护 lastQuery/adminMode/txStartedAt/usrVars 的跨连接读
 
 	authCacheInv func(user string) // caching_sha2_password 缓存失效钩子（改密后调用）
 }
@@ -66,7 +69,7 @@ var _ meta.Querier = (*sqlite.Session)(nil)
 
 // New 创建连接级 handler（连到 defaultDB）。
 func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *admin.Registry, aq *asyncq.Engine,
-	as *auth.Store, s3s *s3.Store, s3srv *s3.Server, kvs *kv.Store, mqs *mq.Store) (*Handler, error) {
+	as *auth.Store, s3s *s3.Store, s3srv *s3.Server, kvs *kv.Store, mqs *mq.Store, cm *colmeta.Store) (*Handler, error) {
 	s, err := b.OpenSession(cfg.Auth.User, remote, defaultDB)
 	if err != nil {
 		return nil, err
@@ -87,6 +90,7 @@ func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *a
 		s3srv:      s3srv,
 		kvstore:    kvs,
 		mqstore:    mqs,
+		colmeta:    cm,
 	}
 	if as != nil {
 		h.userType = as.UserType(cfg.Auth.User)
@@ -280,6 +284,15 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 		s = meta.RewriteDBPrefix(s, h.session.CurrentDB())
 	}
 
+	// 用户变量（v1.3.3）：SET @a = expr 登记会话变量；语句中 @a 替换为字面量
+	if m := reSetUsrVar.FindStringSubmatch(s); m != nil {
+		h.setUserVar(m[1], m[3])
+		return meta.OKResult(), nil
+	}
+	if strings.Contains(s, "@") && !strings.Contains(s, "@@") {
+		s = h.substituteUsrVars(s)
+	}
+
 	// 异步查询命令（SUBMIT/SHOW QUERY JOBS/FETCH/CANCEL/DROP，私有语法，先于探活）
 	if res, ok, err := h.handleAsyncQ(s); ok || err != nil {
 		return res, err
@@ -401,6 +414,38 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 		return nil, err
 	}
 
+	// 2c-1) 时序冷压缩命令（COMPRESS/THAW/SHOW COLD，v1.3.3）
+	if res, ok, err := h.handleColdStmt(s); ok || err != nil {
+		h.slow(start, s)
+		return res, err
+	}
+
+	// 2c-2) RENAME TABLE a TO b（可多对，v1.3.3）
+	if res, ok, err := h.handleRenameTable(s); ok || err != nil {
+		h.slow(start, s)
+		return res, err
+	}
+
+	// 2c-3) ALTER TABLE 兼容拦截（ADD/DROP INDEX、MODIFY/CHANGE、no-op 形态，v1.3.3）
+	if handled, stmt, aerr := h.handleAlterTableIntercept(s); handled {
+		if aerr != nil {
+			return nil, aerr
+		}
+		if stmt == "" {
+			h.slow(start, s)
+			return meta.OKResult(), nil
+		}
+		res, werr := h.execWriteOne(stmt)
+		if werr == nil {
+			h.afterWriteSuccess(stmt)
+		}
+		h.slow(start, s)
+		return res, werr
+	}
+
+	// 2c-4) 时序冷区自动解冻（读写触及冻结区间先解冻，v1.3.3）
+	h.maybeThawCold(s)
+
 	// 2d) 时序 rollup 自动路由（v1.1.1）：长范围聚合优先走 m1/h1/d1 汇总表（精确等价）
 	if res, ok, err := h.tryRollup(s); ok || err != nil {
 		h.slow(start, s)
@@ -410,6 +455,11 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 	// 3) 方言改写（先把 MySQL 转义序列的字面量还原为 SQLite 语义——
 	//    pymysql 等客户端把 " 转义为 \" 发送，SQLite 不处理反斜杠会原样落盘）
 	sq := meta.RewriteDialect(meta.RewriteLastInsertID(meta.UnescapeLiterals(s)))
+
+	// 3a) 读语句的浮点列比较/排序语义修正（TEXT 落盘下的数值语义，v1.3.3）
+	if isReadStmt(sq) {
+		sq = h.rewriteFloatPredicates(sq)
+	}
 
 	// 4) 文本协议占位符拒绝：真 MySQL 对 select $$ / select ? 报 1064，
 	//    SQLite 却会按未绑定参数执行返回 NULL 结果集，客户端消费失步
@@ -504,9 +554,16 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 		if err != nil {
 			return nil, MapSQLiteErr(err)
 		}
+		// 类型还原（v1.3.3）：浮点/DECIMAL 列 TEXT → float64/标记，需在编码前就位
+		plan := h.typeRestorePlan(sq, cols, rows)
 		rs, err := meta.BuildResultset(cols, rows)
 		if err != nil {
 			return nil, MapSQLiteErr(err)
+		}
+		for i, code := range plan {
+			if i < len(rs.Fields) {
+				rs.Fields[i].Type = code
+			}
 		}
 		binarizeBlobFields(rs, rows)
 		return mysql.NewResult(rs), nil
@@ -516,6 +573,9 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 	if h.readonly {
 		return nil, roErr()
 	}
+	// 类型映射（v1.3.3）：浮点/DECIMAL 列字面量加引号 + 比较语义修正
+	sq = h.quoteTextColumnLiterals(sq)
+	sq = h.rewriteFloatPredicates(sq)
 	// rollup 汇总表/触发器懒建（v1.1.1）：首次写 points 前就位（同遍落保证从第一行开始）
 	if reRollInsert.MatchString(sq) {
 		h.ensureRollupTables()
@@ -537,7 +597,41 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 		}
 	}
 	lastID, affected, err := h.session.Exec(sq)
+	if err != nil {
+		// 时序冻结区写入冲突 → 自动全解冻重试一次（v1.3.3）
+		if h.retryThawOnConstraint(err, sq) {
+			lastID, affected, err = h.session.Exec(sq)
+		}
+	}
 	h.slow(start, s)
+	if err != nil {
+		return nil, MapSQLiteErr(err)
+	}
+	// DDL 映射登记（CREATE/ALTER/DROP，v1.3.3）
+	h.afterWriteSuccess(s)
+	return &mysql.Result{AffectedRows: uint64(affected), InsertId: uint64(lastID)}, nil
+}
+
+// execWriteOne 单条写语句执行（锁/隐式事务语义与主写路径一致；拦截器复用）。
+func (h *Handler) execWriteOne(sq string) (*mysql.Result, error) {
+	if h.readonly {
+		return nil, roErr()
+	}
+	if !h.session.InTx {
+		if h.autocommit {
+			h.session.AcquireWrite()
+			defer h.session.ReleaseWrite()
+		} else {
+			h.session.AcquireWrite()
+			if _, _, err := h.session.Exec("BEGIN IMMEDIATE"); err != nil {
+				h.session.ReleaseWrite()
+				return nil, MapSQLiteErr(err)
+			}
+			h.session.InTx = true
+			h.setTxStart()
+		}
+	}
+	lastID, affected, err := h.session.Exec(sq)
 	if err != nil {
 		return nil, MapSQLiteErr(err)
 	}

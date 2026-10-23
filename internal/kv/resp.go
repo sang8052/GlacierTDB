@@ -132,5 +132,15 @@ func (w *RespWriter) BulkArray(items [][]byte) {
 // NullArray 空数组（*-1，BLPOP/BRPOP 超时应答）。
 func (w *RespWriter) NullArray() { w.bw.WriteString("*-1\r\n") }
 
+// ScanReply SCAN 应答：[cursor, [keys...]]（cursor 为 bulk、keys 为数组，真实 Redis 形态，v1.3.3）。
+func (w *RespWriter) ScanReply(cursor string, keys [][]byte) {
+	fmt.Fprintf(w.bw, "*2\r\n")
+	w.BulkStr(cursor)
+	fmt.Fprintf(w.bw, "*%d\r\n", len(keys))
+	for _, k := range keys {
+		w.Bulk(k)
+	}
+}
+
 // Flush 提交缓冲。
 func (w *RespWriter) Flush() error { return w.bw.Flush() }

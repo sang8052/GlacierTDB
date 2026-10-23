@@ -107,9 +107,6 @@ func ServeConn(c net.Conn, store *Store, auths *auth.Store, cfg *config.Config) 
 				reply(func() { w.Error("ERR DB index is out of range") })
 			}
 
-		case "HELLO":
-			reply(func() { w.Error("ERR unknown command 'HELLO' (RESP2 only; disable HELLO/RESP3 on client)") })
-
 		case "INFO":
 			reply(func() {
 				w.BulkStr(fmt.Sprintf("# Server\r\nredis_version:glaciertdb-kv\r\nuptime_in_seconds:%d\r\n"+
@@ -117,6 +114,103 @@ func ServeConn(c net.Conn, store *Store, auths *auth.Store, cfg *config.Config) 
 					"# Stats\r\nops:%d\r\n", store.UptimeSec(), store.MemBytes(),
 					int64(store.MaxMemoryMB())<<20, store.Eviction(), store.OpsTotal()))
 			})
+
+		case "HELLO":
+			// HELLO [protover [AUTH user pass] [SETNAME name]]（BUG.txt ①，v1.3.3）：
+			// 最小应答——server map + proto=2（RESP2 only，客户端据此自动降级）；
+			// redis-py ≥8 默认发 HELLO 3 AUTH default <pwd>，收到 map 即继续（proto 校验已被
+			// redis-py 注释，RESP3 解析器对 RESP2 基础类型帧兼容）。
+			protover, hasAuth, auser, apass, badArg := parseHelloArgs(rest)
+			if badArg {
+				reply(func() { w.Error("ERR syntax error in HELLO") })
+				continue
+			}
+			if protover != "" && protover != "2" && protover != "3" {
+				reply(func() { w.Error("NOPROTO unsupported protocol version") })
+				continue
+			}
+			if hasAuth {
+				// HELLO 内嵌认证：default 走单密码路径，其余按账号
+				args := []string{auser, apass}
+				if auser == "default" {
+					args = []string{apass}
+				}
+				if u, ok := doAuth(args, ip, remote, auths); ok {
+					ns = u
+				} else {
+					reply(func() { w.Error("WRONGPASS invalid username-password pair") })
+					continue
+				}
+			}
+			id := atomic.AddUint64(&helloConnSeq, 1)
+			reply(func() {
+				w.BulkArray([][]byte{
+					[]byte("server"), []byte("redis"),
+					[]byte("version"), []byte(config.GlacierVersion),
+					[]byte("proto"), []byte("2"),
+					[]byte("id"), []byte(fmt.Sprintf("%d", id)),
+					[]byte("mode"), []byte("standalone"),
+					[]byte("role"), []byte("master"),
+					[]byte("modules"), {},
+				})
+			})
+
+		case "SCAN":
+			// SCAN cursor [MATCH pattern] [COUNT n] [TYPE t]（BUG.txt ③，v1.3.3）：
+			// 简化实现——单批返回全部匹配 key，游标恒 0（redis-cli --scan / scan_iter 可用）。
+			if len(rest) < 1 {
+				reply(func() { w.Error("ERR wrong number of arguments for 'scan' command") })
+				continue
+			}
+			if _, err := strconv.ParseUint(strings.TrimSpace(rest[0]), 10, 64); err != nil {
+				reply(func() { w.Error("ERR invalid cursor") })
+				continue
+			}
+			pattern, typ := "*", ""
+			bad := false
+			for i := 1; i < len(rest); i++ {
+				switch strings.ToUpper(rest[i]) {
+				case "MATCH", "COUNT":
+					if i+1 >= len(rest) {
+						bad = true
+					} else {
+						if strings.ToUpper(rest[i]) == "MATCH" {
+							pattern = rest[i+1]
+						}
+						i++ // COUNT 值接受忽略
+					}
+				case "TYPE":
+					if i+1 >= len(rest) {
+						bad = true
+					} else {
+						typ = strings.ToLower(rest[i+1])
+						i++
+					}
+				default:
+					bad = true
+				}
+				if bad {
+					break
+				}
+			}
+			if bad {
+				reply(func() { w.Error("ERR syntax error") })
+				continue
+			}
+			keys := store.Keys(ns, pattern)
+			var keyBytes [][]byte
+			if typ != "" {
+				for _, k := range keys {
+					if store.Type(ns, k) == typ {
+						keyBytes = append(keyBytes, []byte(k))
+					}
+				}
+			} else {
+				for _, k := range keys {
+					keyBytes = append(keyBytes, []byte(k))
+				}
+			}
+			reply(func() { w.ScanReply("0", keyBytes) }) // 游标恒 0：一轮取尽
 
 		case "GET":
 			if len(rest) != 1 {
@@ -518,6 +612,37 @@ func doAuth(rest []string, ip, remote string, auths *auth.Store) (string, bool) 
 	}
 	auths.RecordLogin(ip, remote, user, true, "kv")
 	return user, true
+}
+
+// helloConnSeq HELLO 应答的连接序号（server map 的 id 字段）。
+var helloConnSeq uint64
+
+// parseHelloArgs 解析 HELLO 参数：[protover] [AUTH user pass] [SETNAME name]。
+// 返回（协议版本（可空）, 是否携带 AUTH, user, pass, 语法是否错误）。
+func parseHelloArgs(rest []string) (protover string, hasAuth bool, user, pass string, bad bool) {
+	i := 0
+	if i < len(rest) && !strings.EqualFold(rest[i], "AUTH") && !strings.EqualFold(rest[i], "SETNAME") {
+		protover = rest[i]
+		i++
+	}
+	for i < len(rest) {
+		switch strings.ToUpper(rest[i]) {
+		case "AUTH":
+			if i+2 >= len(rest) {
+				return "", false, "", "", true
+			}
+			hasAuth, user, pass = true, rest[i+1], rest[i+2]
+			i += 3
+		case "SETNAME":
+			if i+1 >= len(rest) {
+				return "", false, "", "", true
+			}
+			i += 2 // 连接名接受忽略
+		default:
+			return "", false, "", "", true
+		}
+	}
+	return protover, hasAuth, user, pass, false
 }
 
 // strconvParseInt 整数解析（快捷）。

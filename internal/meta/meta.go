@@ -176,6 +176,13 @@ var (
 	reUnixsw           = regexp.MustCompile(`(?i)\bUNIX_TIMESTAMP\s*\(\s*\)`)
 	reTrunc            = regexp.MustCompile(`(?i)^TRUNCATE\s+(?:TABLE\s+)?`)
 
+	// ---- MySQL 8 维护语句（v1.3.3）：返回标准四列/两列结果集，不透传 ----
+	reMaintAnalyze  = regexp.MustCompile(`(?i)^ANALYZE\s+(?:NO\s+WRITE_TO_BINLOG\s+|LOCAL\s+)?TABLE\b`)
+	reMaintCheck    = regexp.MustCompile(`(?i)^CHECK\s+TABLE\b`)
+	reMaintOptimize = regexp.MustCompile(`(?i)^OPTIMIZE\s+(?:NO\s+WRITE_TO_BINLOG\s+|LOCAL\s+)?TABLE\b`)
+	reMaintRepair   = regexp.MustCompile(`(?i)^REPAIR\s+TABLE\b`)
+	reMaintChecksum = regexp.MustCompile(`(?i)^CHECKSUM\s+TABLE\b`)
+
 	// ---- 时序改写（详见 schema/timeseries.sql 约定：ts = epoch ms）----
 	reInterval   = regexp.MustCompile(`(?i)\b(NOW\s*\(\s*\)|CURRENT_TIMESTAMP)(\s*([+-])\s*INTERVAL\s+'?(\d+)\s*(SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|YEAR)S?'?)`)
 	reDatePred   = regexp.MustCompile("(?i)\\b(ts|time)\\s*(>=|<=|>|<|=|!=|<>)\\s*'(2\\d{3}-\\d{2}-\\d{2}(?:[ T]\\d{2}:\\d{2}(?::\\d{2})?)?)'")
@@ -197,6 +204,8 @@ func RewriteLastInsertID(q string) string { return reLastInsertIDCall.ReplaceAll
 
 // RewriteDialect 少量 MySQL 函数改写。
 func RewriteDialect(q string) string {
+	// ---- 运算符级改写（v1.3.3 M4；必须在 CONCAT→|| 展开之前：MySQL || 是 OR）----
+	q = RewriteOperators(q)
 	// ---- JSON 运算符（v1.0.10）----
 	q = RewriteJSONOps(q) // -> / ->> → json_extract 等价形式
 	// ---- 时序改写 ----
@@ -228,6 +237,8 @@ func RewriteDialect(q string) string {
 	}
 	// ---- MySQL 兼容 M1（LIMIT 双参 / CONCAT / IF / RAND / UUID）----
 	q = RewriteMySQLCompat(q)
+	// ---- MySQL 兼容 M4（v1.3.3：CAST/CONVERT/EXTRACT/DATE_ADD 族/GROUP_CONCAT SEPARATOR…）----
+	q = RewriteMySQLCompat2(q)
 	// ---- DDL 类型映射（仅 CREATE/ALTER TABLE 等语句生效）----
 	q = RewriteDDLTypes(q)
 	return q
@@ -270,6 +281,20 @@ func expandInterval(q string) string {
 // HandleProbe 处理探活/元语句。MapSQLError 在 main 里注入（避免 import cycle）。
 var MapSQLError = func(err error) error { return err }
 
+// ColumnTypeLookuper 列类型回放钩子（handler 注入 colmeta：SQLite 声明类型 →
+// 建表时的 MySQL 原始类型；无映射返回 ""，v1.3.3）。
+var ColumnTypeLookuper func(db, tbl, col, sqliteType string) string
+
+// OverrideColumnType 应用列类型回放；无映射/无钩子时返回 SQLite 声明类型。
+func OverrideColumnType(db, tbl, col, sqliteType string) string {
+	if ColumnTypeLookuper != nil {
+		if t := ColumnTypeLookuper(db, tbl, col, sqliteType); t != "" {
+			return t
+		}
+	}
+	return sqliteType
+}
+
 func HandleProbe(ctx *Ctx, q string) (res *Result, handled bool, err error) {
 	if q == "" {
 		return OKResult(), true, nil
@@ -298,6 +323,11 @@ func HandleProbe(ctx *Ctx, q string) (res *Result, handled bool, err error) {
 	// SHOW 家族
 	if res, ok, err := handleShow(ctx, q); ok || err != nil {
 		return res, true, err
+	}
+
+	// ANALYZE / CHECK / OPTIMIZE / REPAIR / CHECKSUM TABLE（v1.3.3：MySQL 标准应答形态）
+	if res, ok := handleMaintTable(ctx, q); ok {
+		return res, true, nil
 	}
 
 	if reSet.MatchString(q) {
@@ -626,13 +656,17 @@ func handleShow(ctx *Ctx, q string) (*Result, bool, error) {
 		return res, true, err
 	}
 
-	// 兜底：任何其他 SHOW 变体（客户端工具层出不穷）一律空结果集，绝不透传 SQLite
-	if reShowAnything.MatchString(q) {
+	// 兜底：任何其他 SHOW 变体（客户端工具层出不穷）一律空结果集，绝不透传 SQLite；
+	// 例外：SHOW COLD（时序冷压缩命令，v1.3.3 在 handler 层处理，不能在此吞掉）
+	if reShowAnything.MatchString(q) && !reShowColdHead.MatchString(q) {
 		res, err := simpleRS([]string{"Name", "Value"}, nil)
 		return res, true, err
 	}
 	return nil, false, nil
 }
+
+// reShowColdHead SHOW COLD 命令头（handler 的冷压缩命令，探活层放行）。
+var reShowColdHead = regexp.MustCompile(`(?i)^SHOW\s+COLD\b`)
 
 // HandleDescribe 处理 MySQL 的 DESC[RIBE] tbl 语法（等价 SHOW COLUMNS）。
 func HandleDescribe(ctx *Ctx, q string) (*Result, bool, error) {
@@ -641,6 +675,67 @@ func HandleDescribe(ctx *Ctx, q string) (*Result, bool, error) {
 		return nil, false, nil
 	}
 	return showColumns(ctx, "SHOW COLUMNS FROM "+m[1])
+}
+
+// handleMaintTable ANALYZE/CHECK/OPTIMIZE/REPAIR/CHECKSUM TABLE 的 MySQL 标准应答
+//（v1.3.3：SQLite 无对应维护语义，回 OK 形态；CHECKSUM 回 0）。
+func handleMaintTable(ctx *Ctx, q string) (*Result, bool) {
+	var op string
+	switch {
+	case reMaintAnalyze.MatchString(q):
+		op = "analyze"
+	case reMaintCheck.MatchString(q):
+		op = "check"
+	case reMaintOptimize.MatchString(q):
+		op = "optimize"
+	case reMaintRepair.MatchString(q):
+		op = "repair"
+	case reMaintChecksum.MatchString(q):
+		op = "checksum"
+	default:
+		return nil, false
+	}
+	targets := maintTableTargets(q)
+	db := ctx.Sess.CurrentDB()
+	if op == "checksum" {
+		var rows [][]any
+		for _, t := range targets {
+			rows = append(rows, []any{db + "." + t, int64(0)})
+		}
+		res, err := simpleRS([]string{"Table", "Checksum"}, rows)
+		if err != nil {
+			return nil, true
+		}
+		return res, true
+	}
+	var rows [][]any
+	for _, t := range targets {
+		rows = append(rows, []any{db + "." + t, op, "status", "OK"})
+	}
+	res, err := simpleRS([]string{"Table", "Op", "Msg_type", "Msg_text"}, rows)
+	if err != nil {
+		return nil, true
+	}
+	return res, true
+}
+
+// maintTableTargets 取维护语句的表名清单（去维护关键字后按逗号切）。
+func maintTableTargets(q string) []string {
+	s := q
+	for _, re := range []*regexp.Regexp{reMaintAnalyze, reMaintCheck, reMaintOptimize, reMaintRepair, reMaintChecksum} {
+		if re.MatchString(s) {
+			s = strings.TrimSpace(re.ReplaceAllString(s, ""))
+			break
+		}
+	}
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		t := strings.Trim(strings.TrimSpace(part), "`\"'")
+		if t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func showColumns(ctx *Ctx, q string) (*Result, bool, error) {
@@ -688,7 +783,7 @@ func showColumns(ctx *Ctx, q string) (*Result, bool, error) {
 		if pattern != "" && !likeMatch(pattern, name) {
 			continue
 		}
-		typ := rowGet(r, 2)
+		typ := OverrideColumnType(ctx.Sess.CurrentDB(), table, name, rowGet(r, 2))
 		notnull := rowGet(r, 3)
 		var dflt any
 		if len(r) > 4 && r[4] != nil {
@@ -800,7 +895,7 @@ func buildMySQLCreateTable(ctx *Ctx, _, table, sqliteSQL string) string {
 	nameIdx := map[string]int{}
 	for _, r := range rows {
 		name := rowGet(r, 1)
-		typ := rowGet(r, 2)
+		typ := OverrideColumnType(ctx.Sess.CurrentDB(), table, name, rowGet(r, 2))
 		notnull := rowGet(r, 3) == "1"
 		dflt := rowGet(r, 4)
 		pkOrd := toI64(rowGet(r, 5))

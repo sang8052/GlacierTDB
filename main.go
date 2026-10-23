@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"glaciertdb/internal/auth"
+	"glaciertdb/internal/colmeta"
 	"glaciertdb/internal/dirlock"
 	"glaciertdb/internal/kv"
 	"glaciertdb/internal/mq"
@@ -164,7 +165,7 @@ func main() {
 			cfg.Listen, cfg.KV.MaxMemoryMB, cfg.KV.Eviction)
 	}
 
-	// 消息队列（v1.3.0，mode:rabbitmq 同端口 AMQP 0-9-1）
+	// 消息队列（v1.3.0，mode:rabbitmq 同端口 AMQP 0-9-1；MQTT 桥接 v1.3.3）
 	var mqstore *mq.Store
 	if cfg.MQ.Enable {
 		mqstore, err = mq.Open(backend, cfg.MQ.MaxMessageMB)
@@ -172,7 +173,28 @@ func main() {
 			logx.Errorf("init mq store: %v", err)
 			os.Exit(1)
 		}
-		logx.Infof("mq: amqp protocol enabled on %s (mode:rabbitmq / AMQP sniff)", cfg.Listen)
+		logx.Infof("mq: amqp protocol enabled on %s (mode:rabbitmq / AMQP sniff, server_version=%s)",
+			cfg.Listen, cfg.MQ.ServerVersion)
+		if cfg.MQ.MQTT.Enable {
+			logx.Infof("mqtt: enabled on %s (tcp sniff 0x1x / ws %s / mode:mqtt)%s",
+				cfg.Listen, cfg.MQ.MQTT.WsPath, map[bool]string{true: " + standalone " + cfg.MQ.MQTT.Listen, false: ""}[cfg.MQ.MQTT.Listen != ""])
+		}
+	}
+
+	// 列类型映射系统库（v1.3.3：每库每表「列 → MySQL 原始类型」，存取自动还原）
+	metaDB, err := backend.OpenMetaDB()
+	if err != nil {
+		logx.Errorf("open colmeta system db: %v", err)
+		os.Exit(1)
+	}
+	cmeta, err := colmeta.Open(metaDB)
+	if err != nil {
+		logx.Errorf("init colmeta store: %v", err)
+		os.Exit(1)
+	}
+	if cfg.Timeseries.ColdAfterDays > 0 {
+		logx.Infof("timeseries: cold policy enabled (after %d days, scan every %ds)",
+			cfg.Timeseries.ColdAfterDays, cfg.Timeseries.ColdScanMinSec)
 	}
 
 	go func() {
@@ -183,7 +205,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if err := proxy.Run(cfg, backend, authStore, s3store, s3srv, kvstore, mqstore); err != nil {
+	if err := proxy.Run(cfg, backend, authStore, s3store, s3srv, kvstore, mqstore, cmeta); err != nil {
 		logx.Errorf("listen %s: %v", cfg.Listen, err)
 		os.Exit(1)
 	}

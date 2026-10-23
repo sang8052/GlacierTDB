@@ -111,6 +111,11 @@ CREATE TABLE IF NOT EXISTS mq_stats (
   published INTEGER NOT NULL DEFAULT 0, delivered INTEGER NOT NULL DEFAULT 0,
   acked INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (ns, name)
+);
+CREATE TABLE IF NOT EXISTS mqtt_retains (
+  ns TEXT NOT NULL, topic TEXT NOT NULL, rk TEXT NOT NULL DEFAULT '',
+  payload BLOB, qos INTEGER NOT NULL DEFAULT 0, ts INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (ns, topic)
 );`); err != nil {
 		return nil, fmt.Errorf("init mq schema: %w", err)
 	}
@@ -711,3 +716,76 @@ func b2i(b bool) int {
 
 // DefaultExchange 默认交换机名（routing key = 队列名）。
 const DefaultExchange = ""
+
+// ---------------------------------------------------------------------------
+// MQTT 保留消息（v1.3.3）
+// ---------------------------------------------------------------------------
+
+// Retained 一条保留消息。
+type Retained struct {
+	Topic   string
+	Payload []byte
+	QoS     int
+}
+
+// RetainPut 更新/写入保留消息；payload 空 = 删除（MQTT 语义）。
+func (s *Store) RetainPut(ns, topic, rk string, payload []byte, qos int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(payload) == 0 {
+		_, err := s.db.Exec(`DELETE FROM mqtt_retains WHERE ns=? AND topic=?`, ns, topic)
+		return err
+	}
+	_, err := s.db.Exec(`INSERT INTO mqtt_retains(ns,topic,rk,payload,qos,ts) VALUES(?,?,?,?,?,?)
+		ON CONFLICT(ns,topic) DO UPDATE SET rk=excluded.rk, payload=excluded.payload, qos=excluded.qos, ts=excluded.ts`,
+		ns, topic, rk, payload, qos, time.Now().Unix())
+	return err
+}
+
+// RetainDrop 显式删除保留消息。
+func (s *Store) RetainDrop(ns, topic string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, _ = s.db.Exec(`DELETE FROM mqtt_retains WHERE ns=? AND topic=?`, ns, topic)
+}
+
+// RetainAll 取全部保留消息（过滤交给调用方的 MQTT 通配匹配）。
+func (s *Store) RetainAll(ns string) []Retained {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT topic,payload,qos FROM mqtt_retains WHERE ns=? ORDER BY topic`, ns)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []Retained
+	for rows.Next() {
+		var r Retained
+		var q int
+		if rows.Scan(&r.Topic, &r.Payload, &q) == nil {
+			r.QoS = q
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// RetainStats 保留消息统计（管理面 mqtt_retains 表）。
+func (s *Store) RetainStats() [][]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT ns,topic,LENGTH(payload),qos,ts FROM mqtt_retains ORDER BY ns,topic`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out [][]any
+	for rows.Next() {
+		var ns, topic string
+		var size, qos, ts int64
+		if rows.Scan(&ns, &topic, &size, &qos, &ts) == nil {
+			out = append(out, []any{ns, topic, size, int64(qos), int64(ts)})
+		}
+	}
+	return out
+}

@@ -12,6 +12,7 @@ import (
 
 	"glaciertdb/internal/logx"
 	"glaciertdb/internal/meta"
+	"glaciertdb/internal/sqlite"
 )
 
 // 时序 rollup 多粒度预聚合（v1.1.1，FEATURE §5 P0）：
@@ -83,8 +84,17 @@ func (h *Handler) ensureRollupTables() bool {
 		}
 		rollupMade.Delete(key)
 	}
+	if ensureRollupTablesSess(h.session) {
+		rollupMade.Store(key, true)
+		return true
+	}
+	return false
+}
+
+// ensureRollupTablesSess 会话级建汇总表与触发器（cold 解冻后重建复用，v1.3.3）。
+func ensureRollupTablesSess(sess *sqlite.Session) bool {
 	// schema 校验：points 必须有 series_id / ts / val 三列
-	_, ti, err := h.session.Query(`PRAGMA main.table_info("points")`)
+	_, ti, err := sess.Query(`PRAGMA main.table_info("points")`)
 	if err != nil || len(ti) == 0 {
 		return false
 	}
@@ -109,26 +119,12 @@ func (h *Handler) ensureRollupTables() bool {
   max_val REAL,
   PRIMARY KEY (series_id, bucket_ts)
 )`, t)
-		if _, _, err := h.session.Exec(ddl); err != nil {
+		if _, _, err := sess.Exec(ddl); err != nil {
 			logx.Warnf("rollup create %s: %v", t, err)
 			return false
 		}
-		trg := fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS points_rollup_ai_%s AFTER INSERT ON points BEGIN
-  INSERT INTO %s(series_id,bucket_ts,cnt,cntv,sum_val,min_val,max_val)
-  VALUES (NEW.series_id, NEW.ts/%d*%d, 1, CASE WHEN NEW.val IS NULL THEN 0 ELSE 1 END, NEW.val, NEW.val, NEW.val)
-  ON CONFLICT(series_id,bucket_ts) DO UPDATE SET
-    cnt = cnt + 1,
-    cntv = cntv + excluded.cntv,
-    sum_val = CASE WHEN excluded.sum_val IS NULL THEN sum_val WHEN sum_val IS NULL THEN excluded.sum_val ELSE sum_val + excluded.sum_val END,
-    min_val = CASE WHEN excluded.min_val IS NULL THEN min_val WHEN min_val IS NULL THEN excluded.min_val WHEN excluded.min_val < min_val THEN excluded.min_val ELSE min_val END,
-    max_val = CASE WHEN excluded.max_val IS NULL THEN max_val WHEN max_val IS NULL THEN excluded.max_val WHEN excluded.max_val > max_val THEN excluded.max_val ELSE max_val END;
-END`, g.suffix, t, g.periodMs, g.periodMs)
-		if _, _, err := h.session.Exec(trg); err != nil {
-			logx.Warnf("rollup create trigger %s: %v", t, err)
-			return false
-		}
 	}
-	rollupMade.Store(key, true)
+	ensureRollupTriggers(sess)
 	return true
 }
 

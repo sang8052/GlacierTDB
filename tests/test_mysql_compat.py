@@ -82,10 +82,10 @@ def main() -> int:
     cur.execute("SELECT name, type FROM pragma_table_info('m1_ddl')")
     types = {r[0]: r[1] for r in cur.fetchall()}
     check(types.get("id") == "INTEGER" and types.get("name") == "TEXT"
-          and types.get("flag") == "INTEGER" and types.get("score") == "REAL"
+          and types.get("flag") == "INTEGER" and types.get("score") == "TEXT"
           and types.get("amount") == "TEXT" and types.get("created") == "TEXT"
           and types.get("data") == "BLOB",
-          "类型映射 INT→INTEGER/VARCHAR→TEXT/TINYINT→INTEGER/DOUBLE→REAL/DECIMAL→TEXT/DATETIME→TEXT/VARBINARY→BLOB（%s）" % types)
+          "类型映射 INT→INTEGER/VARCHAR→TEXT/TINYINT→INTEGER/DOUBLE→TEXT(v1.3.3)/DECIMAL→TEXT/DATETIME→TEXT/VARBINARY→BLOB（%s）" % types)
     cur.execute("INSERT INTO m1_ddl (name, flag, score) VALUES ('行A', 1, 9.5)")
     check(cur.lastrowid >= 1, "AUTO_INCREMENT 列自增回填 lastrowid=%s" % cur.lastrowid)
     cur.execute("SELECT created FROM m1_ddl WHERE name='行A'")

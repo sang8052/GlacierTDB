@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.3.2.alpha"
+const GlacierVersion = "1.3.3.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -130,8 +130,25 @@ type KVOpts struct {
 
 // MQOpts RabbitMQ 能力（v1.3.0，mode:rabbitmq 同端口 AMQP 0-9-1 基本队列）。
 type MQOpts struct {
-	Enable       bool `yaml:"enable"`         // AMQP 服务开关（默认开）
-	MaxMessageMB int  `yaml:"max_message_mb"` // 单条消息上限
+	Enable        bool     `yaml:"enable"`         // AMQP 服务开关（默认开）
+	MaxMessageMB  int      `yaml:"max_message_mb"` // 单条消息上限
+	ServerVersion string   `yaml:"server_version"` // 对外宣称的 RabbitMQ 版本串（Connection.Start server-properties，v1.3.3）
+	MQTT          MQTTOpts `yaml:"mqtt"`           // MQTT 接入（v1.3.3）
+}
+
+// MQTTOpts MQTT 协议接入（v1.3.3）：MQTT 3.1/3.1.1 over TCP + WebSocket，
+// 桥接进 mq 的 topic 交换机（topic '/' ↔ routing key '.'）。
+type MQTTOpts struct {
+	Enable bool   `yaml:"enable"`   // MQTT 服务开关（默认开；依赖 mq.enable）
+	Listen string `yaml:"listen"`   // 可选独立监听（tcp 与 ws 同端口，如 0.0.0.0:1883；空 = 仅 3309 复用）
+	WsPath string `yaml:"ws_path"`  // WebSocket 升级路径（默认 /mqtt）
+}
+
+// TimeseriesOpts 时序冷压缩策略（v1.3.3）：cold_after_days>0 时后台周期把
+// 超龄的 points 数据压缩进 points_cold（固化归档，查询时自动解冻）。
+type TimeseriesOpts struct {
+	ColdAfterDays  int `yaml:"cold_after_days"`   // 数据年龄超过 N 天自动冷压缩（0 = 关闭自动策略）
+	ColdScanMinSec int `yaml:"cold_scan_min_sec"` // 后台扫描周期（默认 600 秒，最低 60）
 }
 
 // SecOpts 静态加密（adiantum VFS，4KiB 块加密，防外部程序直接读底层文件）。
@@ -175,6 +192,7 @@ type Config struct {
 	Concurrency ConcurrencyOpts `yaml:"concurrency"`
 	ParallelQuery ParallelOpts `yaml:"parallel_query"`
 	Rollup        RollupOpts   `yaml:"rollup"`
+	Timeseries    TimeseriesOpts `yaml:"timeseries"`
 	AsyncQuery    AsyncOpts    `yaml:"async_query"`
 	Maintenance   MaintOpts    `yaml:"maintenance"`
 	Security      SecOpts      `yaml:"security"`
@@ -210,10 +228,11 @@ func Default() *Config {
 		ParallelQuery: ParallelOpts{ScanRows: 1000000},
 		Maintenance:   MaintOpts{},
 		AsyncQuery: AsyncOpts{
-			Workers:            2,
+			Enable:            true, // 段缺失时默认启用（与 kv/mq 一致；BUG.txt ②，v1.3.3）
+			Workers:           2,
 			MetricsIntervalSec: 30,
-			ResultTTLHours:     24,
-			DefaultTimeoutSec:  1800,
+			ResultTTLHours:    24,
+			DefaultTimeoutSec: 1800,
 			CallbackMaxInlineKB: 64,
 		},
 		Concurrency: ConcurrencyOpts{
@@ -247,9 +266,12 @@ func Default() *Config {
 			Eviction: "allkeys-lru",
 		},
 		MQ: MQOpts{
-			Enable:       true,
-			MaxMessageMB: 32,
+			Enable:        true,
+			MaxMessageMB:  32,
+			ServerVersion: "3.13.0",
+			MQTT:          MQTTOpts{Enable: true, WsPath: "/mqtt"},
 		},
+		Timeseries: TimeseriesOpts{ColdAfterDays: 0, ColdScanMinSec: 600},
 		MuxSniffMs: 300,
 		SQLite: SQLiteOpts{
 			Synchronous:   "NORMAL",
@@ -447,6 +469,22 @@ func (c *Config) Fill() {
 	// MQ 消息队列（v1.3.0）
 	if c.MQ.MaxMessageMB <= 0 {
 		c.MQ.MaxMessageMB = 32
+	}
+	if c.MQ.ServerVersion == "" {
+		c.MQ.ServerVersion = "3.13.0"
+	}
+	if c.MQ.MQTT.WsPath == "" {
+		c.MQ.MQTT.WsPath = "/mqtt"
+	}
+	// 时序冷压缩（v1.3.3）
+	if c.Timeseries.ColdAfterDays < 0 {
+		c.Timeseries.ColdAfterDays = 0
+	}
+	if c.Timeseries.ColdScanMinSec <= 0 {
+		c.Timeseries.ColdScanMinSec = 600
+	}
+	if c.Timeseries.ColdScanMinSec < 60 {
+		c.Timeseries.ColdScanMinSec = 60
 	}
 	// 端口复用嗅探窗口（0 = 关闭嗅探，纯 MySQL）
 	if c.MuxSniffMs < 0 {
