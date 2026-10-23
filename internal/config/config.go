@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.2.0.alpha"
+const GlacierVersion = "1.3.0.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -127,6 +127,12 @@ type KVOpts struct {
 	ScanIntervalSec int    `yaml:"scan_interval_sec"` // TTL 主动扫描周期（最低 1）
 }
 
+// MQOpts RabbitMQ 能力（v1.3.0，mode:rabbitmq 同端口 AMQP 0-9-1 基本队列）。
+type MQOpts struct {
+	Enable       bool `yaml:"enable"`         // AMQP 服务开关（默认开）
+	MaxMessageMB int  `yaml:"max_message_mb"` // 单条消息上限
+}
+
 // SecOpts 静态加密（adiantum VFS，4KiB 块加密，防外部程序直接读底层文件）。
 type SecOpts struct {
 	Encrypt    bool   `yaml:"encrypt"`    // 首次启用要求空目录或已有加密库
@@ -175,6 +181,7 @@ type Config struct {
 	Lock          LockOpts     `yaml:"lock"`
 	S3            S3Opts       `yaml:"s3"`
 	KV            KVOpts       `yaml:"kv"`
+	MQ            MQOpts       `yaml:"mq"`
 
 	// MuxSniffMs 3309 端口复用嗅探窗口（v1.2.0）：等待客户端首包以识别 mode:/RESP/AMQP，
 	// 超时无数据按 MySQL 处理（MySQL 客户端静默等握手）。高 RTT 客户端可调大。
@@ -237,6 +244,10 @@ func Default() *Config {
 		KV: KVOpts{
 			Enable:   true,
 			Eviction: "allkeys-lru",
+		},
+		MQ: MQOpts{
+			Enable:       true,
+			MaxMessageMB: 32,
 		},
 		MuxSniffMs: 300,
 		SQLite: SQLiteOpts{
@@ -431,6 +442,10 @@ func (c *Config) Fill() {
 	}
 	if c.KV.ScanIntervalSec < 1 {
 		c.KV.ScanIntervalSec = 1
+	}
+	// MQ 消息队列（v1.3.0）
+	if c.MQ.MaxMessageMB <= 0 {
+		c.MQ.MaxMessageMB = 32
 	}
 	// 端口复用嗅探窗口（0 = 关闭嗅探，纯 MySQL）
 	if c.MuxSniffMs < 0 {

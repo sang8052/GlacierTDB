@@ -185,6 +185,15 @@ SET KV MAX_MEMORY 64;                   -- 热改内存上限 MB（0 = 不限，
 SET KV EVICTION allkeys-lru;            -- allkeys-lru | volatile-lru | noeviction
 ```
 
+### 1.9c 消息队列管理（v1.3.0，mq.enable 开启后可用）
+
+```sql
+SHOW QUEUES;        -- 队列深度/unacked/消费者数/published/delivered/acked
+SHOW EXCHANGES;     -- 交换机类型/绑定数
+SELECT * FROM mq_queues WHERE ready > 0;
+SELECT * FROM mq_exchanges;
+```
+
 ### 1.10 S3 对象存储管理（v1.1.0；模块开启 s3.enable 后可用）
 
 详见 [S3对象存储.md](S3对象存储.md)。变更命令仅超级用户（只读 1290 / 普通用户 1142），

@@ -2,6 +2,30 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.0.alpha] - 2026-10-23
+
+### 新增
+- **RabbitMQ 能力 · AMQP 0-9-1 基本队列（mode:rabbitmq，FEATURE §4）**：3309 同端口 AMQP 0-9-1 服务（`mode:rabbitmq` 声明行或 AMQP 魔数嗅探进入）——
+  - **声明绑定**：exchange（direct / fanout / topic）+ queue + binding 的声明与绑定（含默认交换机 `""` 直达队列）；`Exchange.Delete` / `Queue.Delete` / `Queue.Purge` / `Queue.Unbind`；
+  - **生产消费**：`basic.publish` / `basic.consume` / `basic.ack` / `basic.nack`（requeue 重投 + redelivered 标志）/ `basic.reject` / `basic.get`（轮询）/ `basic.qos`（prefetch 未 ack 不续投）/ `basic.cancel` / `basic.recover`；
+  - **topic 路由**：`*` 单词、`#` 零或多词通配（RabbitMQ 语义）；
+  - **持久化**：消息与消费游标落 SQLite（`glacier_mq.db`），durable 队列 + persistent 消息**重启不丢**；连接断开/通道关闭未确认消息自动重入队（redelivered）；`mq.max_message_mb` 单条消息上限；
+  - **认证**：SASL PLAIN 沿用统一账号体系（host 授权 / 锁定 / 登录审计 / 防爆破一致生效），命名空间按登录账号隔离；
+  - **管理面**：`SHOW QUEUES`（深度 / unacked / 消费者数 / published / delivered / acked）、`SHOW EXCHANGES`（类型 / 绑定数）、`SELECT * FROM mq_queues / mq_exchanges`；
+  - **异步任务互通**：`SUBMIT QUERY … CALLBACK 'amqp://user:pass@host:3309/' QUEUE '<队列>'` 自服务回环（amqp091-go 客户端实测互通）。
+- **端口复用补齐**：`mode:rabbitmq` 声明与 AMQP 魔数嗅探从占位转为实装（FEATURE §0 全部落地：mysql / redis / rabbitmq 三协议同端口）。
+
+### 修复
+- **异步回调队列/主题名带引号落库（存量）**：`SUBMIT … QUEUE 'q'` / `TOPIC 't'` 的值此前未剥离单引号，实际发布到名为 `'q'` 的队列（含引号字符）——现与其他选项一致剥离引号。
+
+### 已知问题
+- pika 1.4.4 客户端在 `connection.close()` 关闭握手时自身抛 `KeyError`（会话内操作全部正常；对任何 AMQP 服务端同样复现的客户端缺陷），测试中关闭调用已容错；amqp091-go（Go）无此问题。
+- `channel.flow` 仅回显、事务（Tx）为最小空实现、`basic.return`（mandatory 回退）未实现——定位为基本队列通知/分发（FEATURE 红线：不做镜像集群、不做事务性队列）。
+
+### 变更
+- 系统库新增 `glacier_mq.db`；`config.yaml` 新增 `mq` 段（`enable` / `max_message_mb`）；
+- `tests/test_v130.py` 新增 28 项 + 重启持久化 1 项；`tests/run_all.sh` 纳入并扩展步骤 3.5（双模块重启恢复验证）；全套回归 ALL TESTS PASSED。
+
 ## [1.2.0.alpha] - 2026-10-23
 
 ### 新增

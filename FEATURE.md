@@ -29,6 +29,7 @@ mode:redis
 
 - 声明行为**连接级一次性**，会话内不切换服务；
 - S3 对象存储**不进 3309 复用**：HTTP(S) + virtual-host + 每 endpoint 泛域名证书需要独立 TLS 监听器（v1.1.0，见 §2）；
+- 三协议已全部实装（v1.3.0）：`mode:mysql` / `mode:redis` / `mode:rabbitmq` 声明行 + RESP/AMQP 嗅探 + 静默默认 MySQL；
 - QoS、防爆破、审计、权限体系对所有协议统一生效（同一账号体系，见 v1.0.10 §1.3）。
 
 ---
@@ -175,7 +176,7 @@ qos:
 
 ---
 
-## 4. v1.3.0 —— RabbitMQ 能力（基本队列）
+## 4. v1.3.0 —— RabbitMQ 能力（基本队列） ✅（已随 v1.3.0.alpha 发布，2026-10-23，见 docs/消息队列.md）
 
 通过 `mode:rabbitmq` 在 3309 同端口提供 AMQP 0-9-1 基本能力：
 
@@ -184,6 +185,9 @@ qos:
 - 管理面 `SHOW QUEUES` / `SHOW EXCHANGES`（深度、消费者数、入出速率）；
 - 与异步任务回调通道互通（`CALLBACK 'amqp://…'` 由本模块自服务回环可选）；
 - 定位：**基本队列通知 / 分发**，不做镜像集群、不做事务性队列——单写者模型内够用即可。
+
+实现口径：channel.flow 仅回显、Tx 为空实现（不承诺事务性队列）、basic.return 未实现；
+consumer 断线未确认自动重入队；命名空间按登录账号隔离。
 
 ---
 

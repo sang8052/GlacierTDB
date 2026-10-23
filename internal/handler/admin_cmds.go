@@ -23,7 +23,7 @@ var (
 	reAdminShowClient = regexp.MustCompile(`(?i)^SHOW\s+CLIENTS$`)
 	reAdminShowTx     = regexp.MustCompile(`(?i)^SHOW\s+TRANSACTIONS$`)
 	reAdminSetPwd     = regexp.MustCompile(`(?i)^(?:SET\s+PASSWORD(?:\s+FOR\s+(\S+?))?\s*=\s*|ALTER\s+USER\s+(\S+?)\s+IDENTIFIED\s+BY\s+)'([^']{1,64})'\s*$`)
-	reAdminSelect     = regexp.MustCompile("(?i)^SELECT\\s+(.+?)\\s+FROM\\s+(server_config|clients|transactions|qos_status|users|user_grants|user_hosts|login_attempts|locked|s3_usage|s3_buckets|s3_keys|s3_lifecycle|s3_domains|kv_stats)(?:\\s+WHERE\\s+(.+?))?(?:\\s+ORDER\\s+BY\\s+.+?)?(?:\\s+LIMIT\\s+\\d+(?:\\s*,\\s*\\d+)?)?\\s*$")
+	reAdminSelect     = regexp.MustCompile("(?i)^SELECT\\s+(.+?)\\s+FROM\\s+(server_config|clients|transactions|qos_status|users|user_grants|user_hosts|login_attempts|locked|s3_usage|s3_buckets|s3_keys|s3_lifecycle|s3_domains|kv_stats|mq_queues|mq_exchanges)(?:\\s+WHERE\\s+(.+?))?(?:\\s+ORDER\\s+BY\\s+.+?)?(?:\\s+LIMIT\\s+\\d+(?:\\s*,\\s*\\d+)?)?\\s*$")
 	reKillConn        = regexp.MustCompile(`(?i)^KILL\s+(?:CONNECTION\s+|QUERY\s+)?(\d+)$`)
 	reUseAdmin        = regexp.MustCompile("(?i)^USE\\s+`?(GlacierTDB|glacier)`?\\s*$") // 管理库别名：glacier 为系统内置名，禁止建库
 	reAdminSetConc    = regexp.MustCompile(`(?i)^SET\s+(GLOBAL_THREADS|PER_DB_READ_THREADS|DB_READ_THREADS)\s*(?:([A-Za-z0-9_-]+)\s*)?=\s*(\d+)\s*$`)
@@ -152,6 +152,11 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 
 	// 键值/队列管理命令（v1.2.0：kv_stats / 内存上限 / 淘汰策略）
 	if res, handled, err := h.handleKVAdmin(q); handled || err != nil {
+		return res, true, err
+	}
+
+	// 消息队列管理命令（v1.3.0：SHOW QUEUES / SHOW EXCHANGES）
+	if res, handled, err := h.handleMQAdmin(q); handled || err != nil {
 		return res, true, err
 	}
 
@@ -504,6 +509,12 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		case "kv_stats":
 			cols = kvStatCols
 			rows = h.kvStatRows()
+		case "mq_queues":
+			cols = mqQueueCols
+			rows = h.mqQueueRows()
+		case "mq_exchanges":
+			cols = mqExchangeCols
+			rows = h.mqExchangeRows()
 		}
 		rows = filterAdminRows(cols, rows, where)
 		res, err := meta.SimpleRS(cols, rows)

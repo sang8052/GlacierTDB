@@ -20,6 +20,7 @@ import (
 	"glaciertdb/internal/handler"
 	"glaciertdb/internal/kv"
 	"glaciertdb/internal/logx"
+	"glaciertdb/internal/mq"
 	"glaciertdb/internal/meta"
 	"glaciertdb/internal/s3"
 	"glaciertdb/internal/sqlite"
@@ -45,14 +46,14 @@ func (b *bufferedConn) Read(p []byte) (int, error) { return b.br.Read(p) }
 // sniffConn 嗅探首包并分发；返回后 MySQL 路径继续用带缓冲的连接。
 func sniffConn(msrv *server.Server, raw net.Conn, cfg *config.Config, backend *sqlite.Backend,
 	reg *admin.Registry, aq *asyncq.Engine, store *auth.Store,
-	s3store *s3.Store, s3srv *s3.Server, kvs *kv.Store) {
+	s3store *s3.Store, s3srv *s3.Server, kvs *kv.Store, mqs *mq.Store) {
 	remote := raw.RemoteAddr().String()
 	bc := &bufferedConn{Conn: raw, br: bufio.NewReader(raw)}
 
 	sniff := time.Duration(cfg.MuxSniffMs) * time.Millisecond
 	if sniff <= 0 || (!cfg.KV.Enable) {
 		// 纯 MySQL（嗅探关闭）
-		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, remote)
 		return
 	}
 	_ = raw.SetReadDeadline(time.Now().Add(sniff))
@@ -60,7 +61,7 @@ func sniffConn(msrv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 	_ = raw.SetReadDeadline(time.Time{})
 	if ferr != nil || len(first) == 0 {
 		// 窗口内无数据：客户端静默等握手 → MySQL
-		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, remote)
 		return
 	}
 	switch first[0] {
@@ -71,28 +72,26 @@ func sniffConn(msrv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 			consumeModeLine(bc.br) // 声明行消费掉（连接级一次性）
 			switch strings.ToLower(m[1]) {
 			case "mysql":
-				serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+				serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, remote)
 			case "redis":
 				serveRedis(bc, cfg, store, kvs, remote)
 			case "rabbitmq":
-				logx.Debugf("mux: rabbitmq mode from %s (v1.3.0 not implemented)", remote)
-				raw.Close()
+				serveRabbit(bc, cfg, store, mqs, remote)
 			}
 			return
 		}
 		// 非声明行：原样交 MySQL
-		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, remote)
 	case '*', '+', '-', ':', '$':
 		serveRedis(bc, cfg, store, kvs, remote)
 	case 'A', 'a':
-		if line := peekLine(bc.br); strings.HasPrefix(line, "AMQP") {
-			logx.Debugf("mux: AMQP sniff from %s (v1.3.0 not implemented)", remote)
-			raw.Close()
+		if head, err := bc.br.Peek(4); err == nil && string(head) == "AMQP" {
+			serveRabbit(bc, cfg, store, mqs, remote)
 			return
 		}
-		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, remote)
 	default:
-		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, remote)
 	}
 }
 
@@ -135,11 +134,21 @@ func consumeModeIfDeclared(br *bufio.Reader) {
 	}
 }
 
+// serveRabbit 进入 AMQP 0-9-1 协议栈（v1.3.0）。
+func serveRabbit(bc *bufferedConn, cfg *config.Config, store *auth.Store, mqs *mq.Store, remote string) {
+	if mqs == nil {
+		bc.Close()
+		return
+	}
+	logx.Debugf("mq: serve %s (amqp)", remote)
+	mq.ServeConn(bc, mqs, store, cfg)
+}
+
 // serveMySQL MySQL 协议路径（原有逻辑）。
 func serveMySQL(srv *server.Server, raw net.Conn, cfg *config.Config, backend *sqlite.Backend,
 	reg *admin.Registry, aq *asyncq.Engine, store *auth.Store,
-	s3store *s3.Store, s3srv *s3.Server, kvs *kv.Store, remote string) {
-	h, err := handler.New(backend, cfg, remote, cfg.DefaultDB, reg, aq, store, s3store, s3srv, kvs)
+	s3store *s3.Store, s3srv *s3.Server, kvs *kv.Store, mqs *mq.Store, remote string) {
+	h, err := handler.New(backend, cfg, remote, cfg.DefaultDB, reg, aq, store, s3store, s3srv, kvs, mqs)
 	if err != nil {
 		logx.Errorf("open sqlite session for %s: %v", remote, err)
 		raw.Close()
@@ -202,7 +211,7 @@ func newMySQLServer(cfg *config.Config) *server.Server {
 }
 
 // Run 阻塞监听并服务连接（s3store / s3srv / kvs 可为 nil：对应模块关闭）。
-func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store *s3.Store, s3srv *s3.Server, kvs *kv.Store) error {
+func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store *s3.Store, s3srv *s3.Server, kvs *kv.Store, mqs *mq.Store) error {
 	meta.MapSQLError = handler.MapSQLiteErr
 
 	reg := admin.NewRegistry()
@@ -229,7 +238,7 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 			logx.Errorf("accept: %v", err)
 			continue
 		}
-		go sniffConn(msrv, c, cfg, backend, reg, aq, store, s3store, s3srv, kvs)
+		go sniffConn(msrv, c, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs)
 	}
 }
 

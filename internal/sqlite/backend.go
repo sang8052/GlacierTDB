@@ -36,6 +36,9 @@ const SystemS3DB = "glacier_s3"
 // SystemKVDB 键值/队列系统库文件名（v1.2.0：glacier_kv.db，mode:redis 落盘层，不对客户端暴露）。
 const SystemKVDB = "glacier_kv"
 
+// SystemMQDB 消息队列系统库文件名（v1.3.0：glacier_mq.db，AMQP 消息与游标落盘，不对客户端暴露）。
+const SystemMQDB = "glacier_mq"
+
 // 合法库名：字母数字下划线连字符（防路径穿越）
 var reDBName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
@@ -275,9 +278,20 @@ func (b *Backend) OpenKVDB() (*sql.DB, error) {
 	return db, nil
 }
 
+// OpenMQDB 打开消息队列系统库（glacier_mq.db，v1.3.0），供 mq 包使用。
+func (b *Backend) OpenMQDB() (*sql.DB, error) {
+	db, err := b.openFileRetry(b.fileFor(SystemMQDB), 2)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	return db, nil
+}
+
 // isSystemDB 判断是否系统内置库（不对客户端暴露、禁止 CREATE/DROP）。
 func isSystemDB(name string) bool {
-	return name == SystemAuthDB || name == SystemS3DB || name == SystemKVDB
+	return name == SystemAuthDB || name == SystemS3DB || name == SystemKVDB || name == SystemMQDB
 }
 
 // CreateDatabase 创建一个库（空 .db 文件，应用 WAL）。

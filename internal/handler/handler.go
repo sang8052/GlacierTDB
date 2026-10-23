@@ -22,6 +22,7 @@ import (
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/kv"
 	"glaciertdb/internal/logx"
+	"glaciertdb/internal/mq"
 	"glaciertdb/internal/meta"
 	"glaciertdb/internal/s3"
 	"glaciertdb/internal/sqlite"
@@ -47,6 +48,7 @@ type Handler struct {
 	s3store    *s3.Store  // 对象存储系统库（v1.1.0；nil = 模块关闭）
 	s3srv      *s3.Server // 对象存储服务（证书刷新用）
 	kvstore    *kv.Store  // 键值/队列存储（v1.2.0；nil = 模块关闭）
+	mqstore    *mq.Store  // 消息队列存储（v1.3.0；nil = 模块关闭）
 	adminMode  bool     // USE GlacierTDB 后进入管理面
 	lastQuery  string   // 最近一条语句（管理面展示）
 	txStartedAt time.Time // 当前事务开启时刻
@@ -64,7 +66,7 @@ var _ meta.Querier = (*sqlite.Session)(nil)
 
 // New 创建连接级 handler（连到 defaultDB）。
 func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *admin.Registry, aq *asyncq.Engine,
-	as *auth.Store, s3s *s3.Store, s3srv *s3.Server, kvs *kv.Store) (*Handler, error) {
+	as *auth.Store, s3s *s3.Store, s3srv *s3.Server, kvs *kv.Store, mqs *mq.Store) (*Handler, error) {
 	s, err := b.OpenSession(cfg.Auth.User, remote, defaultDB)
 	if err != nil {
 		return nil, err
@@ -84,6 +86,7 @@ func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *a
 		s3store:    s3s,
 		s3srv:      s3srv,
 		kvstore:    kvs,
+		mqstore:    mqs,
 	}
 	if as != nil {
 		h.userType = as.UserType(cfg.Auth.User)

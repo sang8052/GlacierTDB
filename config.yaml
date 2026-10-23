@@ -96,6 +96,12 @@ kv:
 # 超时无数据按 MySQL 处理（MySQL 客户端静默等握手）；高 RTT 客户端可调大
 mux_sniff_ms: 300
 
+# 消息队列（v1.3.0）：mode:rabbitmq 在 3309 同端口提供 AMQP 0-9-1 基本队列
+# 详见 docs/消息队列.md
+mq:
+  enable: true            # AMQP 服务开关（默认开；false 时 3309 不识别 AMQP）
+  max_message_mb: 32      # 单条消息上限
+
 # S3 对象存储（v1.1.0，可选模块）：AWS Signature V4 兼容，独立 HTTP(S) 监听器（不进 3309 复用）
 # 详见 docs/S3对象存储.md 与 docs/配置说明.md §2.10
 s3:

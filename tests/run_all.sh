@@ -140,11 +140,11 @@ step "步骤 3/4: Python 测试（PyMySQL / SQLAlchemy / 并发，容器 ${PY_IM
 PYRUN=$(cat <<'EOF'
 set -u
 if (unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; \
-    pip install --no-cache-dir -q -i https://pypi.tuna.tsinghua.edu.cn/simple PyMySQL SQLAlchemy cryptography); then
+    pip install --no-cache-dir -q -i https://pypi.tuna.tsinghua.edu.cn/simple PyMySQL SQLAlchemy cryptography pika); then
     echo "[OK] pip 安装成功（清华镜像源直连）"
 elif (export http_proxy="__PIP_PROXY__" https_proxy="__PIP_PROXY__" \
                    HTTP_PROXY="__PIP_PROXY__" HTTPS_PROXY="__PIP_PROXY__"; \
-      pip install --no-cache-dir -q PyMySQL SQLAlchemy cryptography); then
+      pip install --no-cache-dir -q PyMySQL SQLAlchemy cryptography pika); then
     echo "[OK] pip 安装成功（pypi 官方源 + 代理）"
 else
     echo "[FAIL] pip 安装失败（清华源直连 与 官方源+代理 均不可用）"
@@ -167,6 +167,7 @@ echo "---- test_v110.py ----"; python /tests/test_v110.py || rc=1
 echo "---- test_s3.py ----";  python /tests/test_s3.py  || rc=1
 echo "---- test_v111.py ----"; python /tests/test_v111.py || rc=1
 echo "---- test_v120.py ----"; python /tests/test_v120.py || rc=1
+echo "---- test_v130.py ----"; python /tests/test_v130.py || rc=1
 exit $rc
 EOF
 )
@@ -196,6 +197,11 @@ if docker restart "$PROXY" >/dev/null 2>&1; then
         record "test_v120 restart persistence : PASS"
     else
         record "test_v120 restart persistence : FAIL"
+    fi
+    if docker run --rm --network "$NET" -v "$TESTS_DIR":/tests:ro "$PY_IMG" bash -c         "pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple pika >/dev/null 2>&1 && python /tests/test_v130.py --check-restart"; then
+        record "test_v130 restart persistence : PASS"
+    else
+        record "test_v130 restart persistence : FAIL"
     fi
 else
     echo "[FAIL] docker restart $PROXY 失败"

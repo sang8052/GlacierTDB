@@ -13,6 +13,7 @@ import (
 	"glaciertdb/internal/auth"
 	"glaciertdb/internal/dirlock"
 	"glaciertdb/internal/kv"
+	"glaciertdb/internal/mq"
 	"glaciertdb/internal/s3"
 	"runtime"
 	"runtime/debug"
@@ -163,6 +164,17 @@ func main() {
 			cfg.Listen, cfg.KV.MaxMemoryMB, cfg.KV.Eviction)
 	}
 
+	// 消息队列（v1.3.0，mode:rabbitmq 同端口 AMQP 0-9-1）
+	var mqstore *mq.Store
+	if cfg.MQ.Enable {
+		mqstore, err = mq.Open(backend, cfg.MQ.MaxMessageMB)
+		if err != nil {
+			logx.Errorf("init mq store: %v", err)
+			os.Exit(1)
+		}
+		logx.Infof("mq: amqp protocol enabled on %s (mode:rabbitmq / AMQP sniff)", cfg.Listen)
+	}
+
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -171,7 +183,7 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if err := proxy.Run(cfg, backend, authStore, s3store, s3srv, kvstore); err != nil {
+	if err := proxy.Run(cfg, backend, authStore, s3store, s3srv, kvstore, mqstore); err != nil {
 		logx.Errorf("listen %s: %v", cfg.Listen, err)
 		os.Exit(1)
 	}

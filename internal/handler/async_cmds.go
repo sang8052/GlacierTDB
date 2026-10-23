@@ -141,7 +141,7 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 		case "BY", "ROWS", "BYTES":
 			// 已由 PARTITION 消费
 		case "TOPIC", "QUEUE":
-			cbOpt = next()
+			cbOpt = strings.Trim(next(), "'") // 引号剥离（存量 bug：队列/主题名被带引号落库）
 			i++
 		case "EVERY":
 			v := strings.ToUpper(next())
