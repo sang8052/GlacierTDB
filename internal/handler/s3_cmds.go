@@ -33,6 +33,7 @@ import (
 //	SHOW S3 POLICIES
 //	SHOW S3 USAGE [FOR <user>]   EXPORT S3 USAGE [FOR <user>] [TO '<file>']
 //	SHOW S3 OBJECTS <bucket> [LIKE '<prefix>'] [LIMIT <n>]
+//	SHOW S3 UPLOADS [<bucket>]（分片上传会话，v1.3.1）
 //	S3 RETAIN <bucket>/<key> UNTIL '<date>' (COMPLIANCE|GOVERNANCE) [VERSION '<v>']
 //	S3 LEGAL_HOLD <bucket>/<key> (ON|OFF) [VERSION '<v>']
 func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
@@ -84,6 +85,8 @@ func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
 			return h.s3ShowPolicies()
 		case up(1) == "S3" && up(2) == "OBJECTS":
 			return h.s3ShowObjects(toks)
+		case up(1) == "S3" && up(2) == "UPLOADS":
+			return h.s3ShowUploads(toks)
 		}
 	case "ALTER":
 		if up(1) == "BUCKET" {
@@ -143,7 +146,8 @@ func isS3Command(up func(int) string) bool {
 		return up(1) == "BUCKET" || (up(1) == "S3" && up(2) == "KEY")
 	case "SHOW":
 		return up(1) == "BUCKETS" || (up(1) == "S3" && (up(2) == "KEYS" || up(2) == "USAGE" ||
-			up(2) == "LIFECYCLE" || up(2) == "DOMAINS" || up(2) == "POLICIES" || up(2) == "OBJECTS"))
+			up(2) == "LIFECYCLE" || up(2) == "DOMAINS" || up(2) == "POLICIES" || up(2) == "OBJECTS" ||
+			up(2) == "UPLOADS"))
 	case "ALTER":
 		return up(1) == "BUCKET"
 	case "SET", "CLEAR":
@@ -740,6 +744,13 @@ func (h *Handler) s3ShowObjects(toks []string) (*mysql.Result, bool, error) {
 	return res, true, err2
 }
 
+func (h *Handler) s3ShowUploads(toks []string) (*mysql.Result, bool, error) {
+	// SHOW S3 UPLOADS [<bucket>]（分片上传会话）
+	res, err := meta.SimpleRS([]string{"upload_id", "bucket", "key", "parts", "bytes", "created"},
+		h.s3UploadRows(argVal(toks, 3)))
+	return res, true, err
+}
+
 func (h *Handler) s3Retain(toks []string) (*mysql.Result, bool, error) {
 	if err := h.adminMutateGate(); err != nil {
 		return nil, true, err
@@ -849,6 +860,15 @@ func (h *Handler) s3DomainRows() [][]any {
 	var rows [][]any
 	for _, d := range h.s3store.Domains() {
 		rows = append(rows, []any{d.Host, d.Bucket, d.CertFile, d.KeyFile, d.CreatedTS})
+	}
+	return rows
+}
+
+// s3UploadRows 分片上传会话行（SHOW S3 UPLOADS / s3_uploads 表）。
+func (h *Handler) s3UploadRows(bucket string) [][]any {
+	var rows [][]any
+	for _, u := range h.s3store.ListMultipartUploads(bucket, "") {
+		rows = append(rows, []any{u.UploadID, u.Bucket, u.Key, int64(u.Parts), u.Bytes, u.CreatedTS})
 	}
 	return rows
 }

@@ -77,6 +77,10 @@ type Job struct {
 	EveryAt     string     `json:"every_at,omitempty"`     // EVERY DAY/WEEK AT 'HH:MM' 的时刻
 	EveryWd     int        `json:"every_weekday,omitempty"` // 每周调度周几（0=非每周，1..7=周一..周日，v1.0.10）
 	EveryWeeks  int        `json:"every_weeks,omitempty"`   // 每 N 周（v1.0.10，默认 1）
+	EveryMonths   int      `json:"every_months,omitempty"`   // 每 N 月（0=非每月，v1.3.1）
+	EveryMonthDay int      `json:"every_month_day,omitempty"` // 每月几号 1-31（月尾 clamp，v1.3.1）
+	EveryYears    int      `json:"every_years,omitempty"`    // 每 N 年（0=非每年，v1.3.1）
+	EveryYearDay  string   `json:"every_year_day,omitempty"` // 每年 'MM-DD'（v1.3.1）
 	QosWaitMs   int64      `json:"qos_wait_ms,omitempty"`   // 本次执行的 QoS 排队毫秒（v1.0.10）
 	RecurGroup  string     `json:"recur_group,omitempty"`  // 周期链 ID；CANCEL 取消整链
 	CancelCh    chan struct{} `json:"-"`
@@ -130,7 +134,7 @@ func (e *Engine) Submit(j *Job) string {
 	j.State = StatePending
 	j.SubmitTS = time.Now()
 	j.CancelCh = make(chan struct{})
-	if j.EverySec > 0 || j.EveryAt != "" || j.EveryWd > 0 {
+	if j.EverySec > 0 || j.EveryAt != "" || j.EveryWd > 0 || j.EveryMonths > 0 || j.EveryYears > 0 {
 		if j.RecurGroup == "" {
 			j.RecurGroup = fmt.Sprintf("g_%s_%04d", time.Now().Format("20060102_150405"), time.Now().UnixNano()%10000)
 		}
@@ -138,6 +142,21 @@ func (e *Engine) Submit(j *Job) string {
 	// 每周调度：首次执行排到下一个周几时刻（不立即执行）
 	if j.EveryWd > 0 && j.At == nil {
 		t := nextWeekOccurrence(time.Now(), j.EveryWd, j.EveryAt)
+		j.At = &t
+	}
+	// 每月 / 每年调度：首次执行排到下一个日历时刻（月尾日 clamp，v1.3.1）
+	if j.EveryMonths > 0 && j.At == nil {
+		if j.EveryMonthDay <= 0 {
+			j.EveryMonthDay = time.Now().Day()
+		}
+		t := nextMonthOccurrence(time.Now(), j.EveryMonths, j.EveryMonthDay, j.EveryAt)
+		j.At = &t
+	}
+	if j.EveryYears > 0 && j.At == nil {
+		if j.EveryYearDay == "" {
+			j.EveryYearDay = time.Now().Format("01-02")
+		}
+		t := nextYearOccurrence(time.Now(), j.EveryYears, j.EveryYearDay, j.EveryAt)
 		j.At = &t
 	}
 	ttl := time.Duration(e.cfg.AsyncQuery.ResultRetainSec) * time.Second
@@ -327,7 +346,19 @@ func (e *Engine) finish(j *Job, st State, errMsg string) {
 			next.QosWaitMs = 0
 			next.SubmitTS = time.Now()
 			next.CancelCh = make(chan struct{})
-			if j.EveryWd > 0 {
+			if j.EveryMonths > 0 {
+				// 每月（每 N 月）调度：下一个日历月几时刻（月尾日 clamp，v1.3.1）
+				t := nextMonthOccurrence(time.Now(), j.EveryMonths, j.EveryMonthDay, j.EveryAt)
+				next.At = &t
+				next.Window = [2]string{}
+				next.WindowWd = 0
+			} else if j.EveryYears > 0 {
+				// 每年（每 N 年）调度：下一个 MM-DD 时刻（2/29 平年 clamp 到 2/28，v1.3.1）
+				t := nextYearOccurrence(time.Now(), j.EveryYears, j.EveryYearDay, j.EveryAt)
+				next.At = &t
+				next.Window = [2]string{}
+				next.WindowWd = 0
+			} else if j.EveryWd > 0 {
 				// 每周（每 N 周）调度：下一周几时刻（N>1 再推 (N-1) 周）
 				t := nextWeekOccurrence(time.Now(), j.EveryWd, j.EveryAt)
 				if j.EveryWeeks > 1 {
@@ -703,6 +734,74 @@ func nextWeekOccurrence(now time.Time, wd int, at string) time.Time {
 	return now.Add(7 * 24 * time.Hour) // 兜底
 }
 
+// clampDay 月尾日 clamp：day 超过当月天数取当月最后一天（1/31 → 2/28）。
+func clampDay(year int, month time.Month, day int) int {
+	if day < 1 {
+		day = 1
+	}
+	last := time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
+	if day > last {
+		return last
+	}
+	return day
+}
+
+// nextMonthOccurrence 计算下一个「每月 day + 时刻」（每 months 月一跳；月尾日 clamp）。
+// day<=0 取 after 当日；at 为空用 after 的时刻。
+func nextMonthOccurrence(after time.Time, months, day int, at string) time.Time {
+	if months <= 0 {
+		months = 1
+	}
+	if day <= 0 {
+		day = after.Day()
+	}
+	h, m := after.Hour(), after.Minute()
+	if hh, mm, ok := parseHM(at); ok {
+		h, m = hh, mm
+	}
+	for k := 0; k <= 12*months+12; k += months {
+		base := time.Date(after.Year(), after.Month(), 1, 0, 0, 0, 0, after.Location()).AddDate(0, k, 0)
+		t := time.Date(base.Year(), base.Month(), clampDay(base.Year(), base.Month(), day), h, m, 0, 0, after.Location())
+		if t.After(after) {
+			return t
+		}
+	}
+	return after.AddDate(0, months, 0) // 兜底
+}
+
+// nextYearOccurrence 计算下一个「每年 MM-DD + 时刻」（每 years 年一跳；2/29 平年 clamp 到 2/28）。
+// mmdd 解析失败取 after 当日；at 为空用 after 的时刻。
+func nextYearOccurrence(after time.Time, years int, mmdd, at string) time.Time {
+	if years <= 0 {
+		years = 1
+	}
+	month, day := int(after.Month()), after.Day()
+	if mm, dd, err := parseMMDD(mmdd); err == nil {
+		month, day = mm, dd
+	}
+	h, m := after.Hour(), after.Minute()
+	if hh, mm, ok := parseHM(at); ok {
+		h, m = hh, mm
+	}
+	for k := 0; k <= years+2; k += years {
+		y := after.Year() + k
+		t := time.Date(y, time.Month(month), clampDay(y, time.Month(month), day), h, m, 0, 0, after.Location())
+		if t.After(after) {
+			return t
+		}
+	}
+	return after.AddDate(years, 0, 0) // 兜底
+}
+
+// parseMMDD 解析 'MM-DD'（月 1-12、日 1-31）。
+func parseMMDD(s string) (int, int, error) {
+	var mm, dd int
+	if n, _ := fmt.Sscanf(strings.TrimSpace(s), "%d-%d", &mm, &dd); n != 2 || mm < 1 || mm > 12 || dd < 1 || dd > 31 {
+		return 0, 0, fmt.Errorf("invalid MM-DD %q", s)
+	}
+	return mm, dd, nil
+}
+
 // ScheduleRow 周期配置行（SHOW QUERY SCHEDULE / query_schedule）。
 type ScheduleRow struct {
 	RecurGroup string
@@ -764,6 +863,34 @@ func (e *Engine) Schedule() []ScheduleRow {
 // scheduleExpr 生成人类可读周期表达。
 func scheduleExpr(j *Job) string {
 	switch {
+	case j.EveryMonths > 0:
+		s := "EVERY "
+		if j.EveryMonths > 1 {
+			s += fmt.Sprintf("%d MONTHS", j.EveryMonths)
+		} else {
+			s += "MONTH"
+		}
+		if j.EveryMonthDay > 0 {
+			s += fmt.Sprintf(" ON %d", j.EveryMonthDay)
+		}
+		if j.EveryAt != "" {
+			s += " AT " + j.EveryAt
+		}
+		return s
+	case j.EveryYears > 0:
+		s := "EVERY "
+		if j.EveryYears > 1 {
+			s += fmt.Sprintf("%d YEARS", j.EveryYears)
+		} else {
+			s += "YEAR"
+		}
+		if j.EveryYearDay != "" {
+			s += " ON " + j.EveryYearDay
+		}
+		if j.EveryAt != "" {
+			s += " AT " + j.EveryAt
+		}
+		return s
 	case j.EveryWd > 0:
 		s := "EVERY "
 		if j.EveryWeeks > 1 {

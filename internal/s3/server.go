@@ -353,6 +353,10 @@ func (h *endpointHandler) handleBucket(w http.ResponseWriter, r *http.Request, b
 	q := r.URL.Query()
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
+		if _, ok := q["uploads"]; ok {
+			h.listMultipartUploads(w, r, bucket, reqID)
+			return
+		}
 		if _, ok := q["versions"]; ok {
 			h.listVersions(w, r, bucket, reqID)
 			return
@@ -546,12 +550,30 @@ func (h *endpointHandler) listVersions(w http.ResponseWriter, r *http.Request, b
 	writeXML(w, http.StatusOK, out, reqID, r.Method == http.MethodHead)
 }
 
-// handleObject 对象级操作（PUT / GET / HEAD / DELETE / COPY）。
+// handleObject 对象级操作（PUT / GET / HEAD / DELETE / COPY / 分片上传）。
 func (h *endpointHandler) handleObject(w http.ResponseWriter, r *http.Request, bucket, key, owner,
 	payloadHash string, lim config.S3Limit, userTB *tokenBucket, reqID string) {
 	q := r.URL.Query()
 	versionID := q.Get("versionId")
+	uploadID := q.Get("uploadId")
 	img, hasImg := parseImgParams(map[string][]string(q))
+
+	// 分片上传（multipart，v1.3.1）：uploadId 维度路由
+	if uploadID != "" {
+		switch r.Method {
+		case http.MethodPut:
+			h.uploadPart(w, r, bucket, key, uploadID, payloadHash, reqID)
+		case http.MethodPost:
+			h.completeMultipart(w, r, bucket, key, uploadID, owner, reqID)
+		case http.MethodDelete:
+			h.abortMultipart(w, r, bucket, key, uploadID, reqID)
+		case http.MethodGet, http.MethodHead:
+			h.listParts(w, r, bucket, key, uploadID, reqID)
+		default:
+			writeErr(w, r, reqID, &s3Error{Code: "MethodNotAllowed", Status: 405, Msg: "The specified method is not allowed against this resource"})
+		}
+		return
+	}
 
 	switch r.Method {
 	case http.MethodPut:
@@ -560,6 +582,14 @@ func (h *endpointHandler) handleObject(w http.ResponseWriter, r *http.Request, b
 			return
 		}
 		h.putObject(w, r, bucket, key, owner, payloadHash, img, hasImg, reqID)
+
+	case http.MethodPost:
+		// POST /{bucket}/{key}?uploads → InitiateMultipartUpload
+		if q.Has("uploads") {
+			h.initiateMultipart(w, r, bucket, key, reqID)
+			return
+		}
+		writeErr(w, r, reqID, &s3Error{Code: "MethodNotAllowed", Status: 405, Msg: "The specified method is not allowed against this resource"})
 
 	case http.MethodGet, http.MethodHead:
 		h.getObject(w, r, bucket, key, versionID, owner, img, hasImg, lim, userTB, reqID)
@@ -789,6 +819,184 @@ func (h *endpointHandler) copyObject(w http.ResponseWriter, r *http.Request, buc
 		ETag         string   `xml:"ETag"`
 		LastModified string   `xml:"LastModified"`
 	}{ETag: "\"" + m.ETag + "\"", LastModified: isoTime(m.CreatedTS)}, reqID, false)
+}
+
+// ---------------------------------------------------------------------------
+// 分片上传（multipart，v1.3.1）
+// ---------------------------------------------------------------------------
+
+// putAttrs 从请求头提取对象写入属性（PUT / InitiateMultipartUpload 共用）。
+func putAttrs(r *http.Request) ObjectAttrs {
+	attrs := ObjectAttrs{
+		ContentType:        r.Header.Get("Content-Type"),
+		ContentEncoding:    r.Header.Get("Content-Encoding"),
+		CacheControl:       r.Header.Get("Cache-Control"),
+		ContentDisposition: r.Header.Get("Content-Disposition"),
+		Metadata:           map[string]string{},
+	}
+	for k, vs := range r.Header {
+		if lk := strings.ToLower(k); strings.HasPrefix(lk, "x-amz-meta-") && len(vs) > 0 {
+			attrs.Metadata[strings.TrimPrefix(lk, "x-amz-meta-")] = vs[0]
+		}
+	}
+	if attrs.ContentEncoding == "aws-chunked" {
+		attrs.ContentEncoding = ""
+	}
+	return attrs
+}
+
+// initiateMultipart POST /{bucket}/{key}?uploads → InitiateMultipartUpload。
+func (h *endpointHandler) initiateMultipart(w http.ResponseWriter, r *http.Request, bucket, key, reqID string) {
+	uploadID, err := h.srv.store.InitiateMultipart(bucket, key, putAttrs(r))
+	if err != nil {
+		writeErr(w, r, reqID, toS3Err(err))
+		return
+	}
+	writeXML(w, http.StatusOK, struct {
+		XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
+		Xmlns    string   `xml:"xmlns,attr"`
+		Bucket   string   `xml:"Bucket"`
+		Key      string   `xml:"Key"`
+		UploadID string   `xml:"UploadId"`
+	}{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Bucket: bucket, Key: key, UploadID: uploadID}, reqID, false)
+}
+
+// uploadPart PUT /{bucket}/{key}?partNumber=N&uploadId=... → UploadPart（ETag = 分片 MD5）。
+func (h *endpointHandler) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key, uploadID,
+	payloadHash, reqID string) {
+	partNumber, _ := strconv.Atoi(r.URL.Query().Get("partNumber"))
+	if partNumber <= 0 {
+		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400,
+			Msg: "partNumber must be a positive integer"})
+		return
+	}
+	body := io.Reader(r.Body)
+	chunked := payloadHash == payloadStreaming ||
+		strings.Contains(strings.ToLower(r.Header.Get("Content-Encoding")), "aws-chunked")
+	if chunked {
+		body = newAWSChunkedReader(r.Body)
+	}
+	var hr io.Reader = body
+	if payloadHash != "" && payloadHash != payloadUnsigned && payloadHash != payloadStreaming {
+		hr = &hashCheckReader{r: body, h: sha256.New(), expected: payloadHash}
+	}
+	sizeHint := r.ContentLength
+	if chunked {
+		sizeHint = -1
+	}
+	etag, err := h.srv.store.UploadPart(bucket, key, uploadID, partNumber, hr, sizeHint)
+	if err != nil {
+		writeErr(w, r, reqID, toS3Err(err))
+		return
+	}
+	w.Header().Set("ETag", "\""+etag+"\"")
+	w.WriteHeader(http.StatusOK)
+}
+
+// completeMultipart POST /{bucket}/{key}?uploadId=... → CompleteMultipartUpload。
+func (h *endpointHandler) completeMultipart(w http.ResponseWriter, r *http.Request, bucket, key, uploadID,
+	owner, reqID string) {
+	var body struct {
+		XMLName xml.Name `xml:"CompleteMultipartUpload"`
+		Parts   []struct {
+			PartNumber int    `xml:"PartNumber"`
+			ETag       string `xml:"ETag"`
+		} `xml:"Part"`
+	}
+	if err := xml.NewDecoder(io.LimitReader(r.Body, 4<<20)).Decode(&body); err != nil {
+		writeErr(w, r, reqID, &s3Error{Code: "MalformedXML", Status: 400,
+			Msg: "The XML you provided was not well-formed"})
+		return
+	}
+	parts := make([]PartSpec, 0, len(body.Parts))
+	for _, p := range body.Parts {
+		parts = append(parts, PartSpec{PartNumber: p.PartNumber, ETag: p.ETag})
+	}
+	m, replaced, err := h.srv.store.CompleteMultipart(bucket, key, uploadID, parts)
+	if err != nil {
+		writeErr(w, r, reqID, toS3Err(err))
+		return
+	}
+	if b, berr := h.srv.store.Bucket(bucket); berr == nil {
+		h.srv.notifyPut(b, m, replaced)
+	}
+	writeXML(w, http.StatusOK, struct {
+		XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
+		Xmlns    string   `xml:"xmlns,attr"`
+		Location string   `xml:"Location"`
+		Bucket   string   `xml:"Bucket"`
+		Key      string   `xml:"Key"`
+		ETag     string   `xml:"ETag"`
+	}{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Location: "/" + bucket + "/" + key,
+		Bucket: bucket, Key: key, ETag: "\"" + m.ETag + "\""}, reqID, false)
+}
+
+// abortMultipart DELETE /{bucket}/{key}?uploadId=... → AbortMultipartUpload。
+func (h *endpointHandler) abortMultipart(w http.ResponseWriter, r *http.Request, bucket, key, uploadID, reqID string) {
+	if err := h.srv.store.AbortMultipart(bucket, key, uploadID); err != nil {
+		writeErr(w, r, reqID, toS3Err(err))
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// listParts GET /{bucket}/{key}?uploadId=... → ListParts。
+func (h *endpointHandler) listParts(w http.ResponseWriter, r *http.Request, bucket, key, uploadID, reqID string) {
+	parts, err := h.srv.store.ListParts(bucket, key, uploadID)
+	if err != nil {
+		writeErr(w, r, reqID, toS3Err(err))
+		return
+	}
+	type xmlPart struct {
+		PartNumber   int    `xml:"PartNumber"`
+		LastModified string `xml:"LastModified"`
+		ETag         string `xml:"ETag"`
+		Size         int64  `xml:"Size"`
+	}
+	out := struct {
+		XMLName  xml.Name  `xml:"ListPartsResult"`
+		Xmlns    string    `xml:"xmlns,attr"`
+		Bucket   string    `xml:"Bucket"`
+		Key      string    `xml:"Key"`
+		UploadID string    `xml:"UploadId"`
+		MaxParts int       `xml:"MaxParts"`
+		IsTruncated bool   `xml:"IsTruncated"`
+		Parts    []xmlPart `xml:"Part"`
+	}{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Bucket: bucket, Key: key,
+		UploadID: uploadID, MaxParts: maxParts}
+	for _, p := range parts {
+		out.Parts = append(out.Parts, xmlPart{
+			PartNumber: p.PartNumber, LastModified: isoTime(p.CreatedTS),
+			ETag: "\"" + p.ETag + "\"", Size: p.Size,
+		})
+	}
+	writeXML(w, http.StatusOK, out, reqID, r.Method == http.MethodHead)
+}
+
+// listMultipartUploads GET /{bucket}?uploads → ListMultipartUploads。
+func (h *endpointHandler) listMultipartUploads(w http.ResponseWriter, r *http.Request, bucket, reqID string) {
+	q := r.URL.Query()
+	uploads := h.srv.store.ListMultipartUploads(bucket, q.Get("prefix"))
+	type xmlUpload struct {
+		Key       string `xml:"Key"`
+		UploadID  string `xml:"UploadId"`
+		Initiated string `xml:"Initiated"`
+	}
+	out := struct {
+		XMLName     xml.Name    `xml:"ListMultipartUploadsResult"`
+		Xmlns       string      `xml:"xmlns,attr"`
+		Bucket      string      `xml:"Bucket"`
+		Prefix      string      `xml:"Prefix,omitempty"`
+		MaxUploads  int         `xml:"MaxUploads"`
+		IsTruncated bool        `xml:"IsTruncated"`
+		Uploads     []xmlUpload `xml:"Upload"`
+	}{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Bucket: bucket,
+		Prefix: q.Get("prefix"), MaxUploads: 1000}
+	for _, u := range uploads {
+		out.Uploads = append(out.Uploads, xmlUpload{
+			Key: u.Key, UploadID: u.UploadID, Initiated: isoTime(u.CreatedTS)})
+	}
+	writeXML(w, http.StatusOK, out, reqID, r.Method == http.MethodHead)
 }
 
 // ---------------------------------------------------------------------------

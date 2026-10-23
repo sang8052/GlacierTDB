@@ -54,8 +54,8 @@ RabbitMQ、MinIO）各自为政——安装、守护、备份、升级都是负�
 | --- | --- | --- | --- |
 | **MySQL 网关** | `:3309`（默认） | MySQL 协议 + 标准 SQL，mysql CLI / Navicat / DBeaver / PyMySQL / SQLAlchemy / JDBC 直连；多库、事务、管理面 | 本文 / 系统SQL |
 | **时序冷库** | 同 MySQL | `series`+`points` 聚簇 schema、时间谓词整数化、`GROUP BY time(N)`、**rollup 预聚合自动路由**、多核并行 | 时序数据库 |
-| **异步任务** | 同 MySQL | `SUBMIT QUERY` 秒回 job_id；AT / WINDOW / WHEN / EVERY 周期调度；四通道回调 + HMAC；**SCRIPT 后处理管道** | 异步任务 |
-| **S3 对象存储** | `:9000`（HTTP/S） | AWS SigV4（表头/预签名/aws-chunked）；版本、对象锁、生命周期、限速、请求策略、上传回调、图片处理、计费 | S3对象存储 |
+| **异步任务** | 同 MySQL | `SUBMIT QUERY` 秒回 job_id；AT / WINDOW / WHEN / EVERY 周期调度（含每月/每年）；四通道回调 + HMAC；**SCRIPT 后处理管道** | 异步任务 |
+| **S3 对象存储** | `:9000`（HTTP/S） | AWS SigV4（表头/预签名/aws-chunked）；**multipart 分片上传**、版本、对象锁、生命周期、限速、请求策略、上传回调、图片处理、计费 | S3对象存储 |
 | **Redis 键值/队列** | `:3309`（mode:redis） | RESP string/list；TTL 惰性+扫描；**SQLite 落盘重启无损**；每用户命名空间；LRU 淘汰 | 键值队列 |
 | **RabbitMQ 队列** | `:3309`（mode:rabbitmq） | AMQP 0-9-1：direct/fanout/topic、publish/consume/ack/nack/prefetch；消息与游标落盘重启不丢 | 消息队列 |
 | **运维与安全** | 全协议 | 用户权限（库/表/IP 授权）、防爆破自动锁、查询 QoS、caching_sha2_password、SQL 审计日志 | 本文 / 配置说明 |
@@ -135,9 +135,9 @@ PRAGMA cache_size   = -256;     -- 每连接 256 KB
 ### 3. 异步任务引擎
 
 - `SUBMIT QUERY '<sql>'` 秒回 job_id，结果 JSONL 落盘分页拉取（`FETCH QUERY RESULT` / `query_result()`）；
-- **调度**：`AT 'HH:MM'` 定时、`WINDOW '周五 17:00-20:00'` 每日/周几窗口、`WHEN CPU<70` 资源门槛（CPU/MEM/DISK_MBPS/连接数等）、`EVERY DAY|WEEK|n SECONDS…` 周期任务（含每周/每 N 周）；`SHOW QUERY SCHEDULE`、`PAUSE/RESUME` 链启停；
+- **调度**：`AT 'HH:MM'` 定时、`WINDOW '周五 17:00-20:00'` 每日/周几窗口、`WHEN CPU<70` 资源门槛（CPU/MEM/DISK_MBPS/连接数等）、`EVERY DAY|WEEK|MONTH|YEAR|n SECONDS…` 周期任务（含每周/每 N 周、每月/每年，月尾日自动 clamp 如 1/31→2/28）；`SHOW QUERY SCHEDULE`、`PAUSE/RESUME` 链启停；
 - **回调**：HTTP POST（HMAC 签名 + 退避重试）/ TCP 流 / RabbitMQ / Kafka 四通道；`PARTITION BY ROWS|BYTES` 分片回调；
-- **SCRIPT 后处理管道**：`SCRIPT 'x.js' OUTPUT out`——结果 JSONL 流入 nodejs/python 子进程，产物落 `jobs/<id>.<out>`（`script_dir` 白名单）；
+- **SCRIPT 后处理管道**：`SCRIPT 'x.js' OUTPUT out`——结果 JSONL 流入 nodejs/python/php 子进程，产物落 `jobs/<id>.<out>`（`script_dir` 白名单）；
 - 详见 [docs/异步任务.md](docs/异步任务.md)。
 
 ### 4. 运维与安全
@@ -153,7 +153,8 @@ AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked`），boto3 
 
 - 一 bucket 一表（`glacier_s3.db`）+ 大对象分块；桶从属用户、命名空间隔离；
 - **AK/SK**：AK 32 位 `AS` 前缀 / SK 48 位 `SK` 前缀，签发/轮换/禁用/吊销（SK 明文仅一次可见）；
-- PUT/GET/HEAD/DELETE/COPY、ListObjects V1/V2、ListObjectVersions；**多版本 + 对象锁（WORM/legal hold）+ 生命周期自动删除**；
+- PUT/GET/HEAD/DELETE/COPY、ListObjects V1/V2、ListObjectVersions；**multipart 分片上传**（Initiate/UploadPart/Complete/Abort/ListParts/ListMultipartUploads，复合 ETag 对齐 S3 语义）；
+- **多版本 + 对象锁（WORM/legal hold）+ 生命周期自动删除**；
 - **下载限速**：单连接 / 用户总带宽（多连接合并）/ 并发上限；**请求策略**（UA/IP/Referer/自定义 header 条件）；**上传回调**（HMAC 签名）；
 - **图片处理**：裁剪 / 缩放 / 格式转换 / base64 输出与直传；
 - **网络**：region 通配（`'*'`）、virtual-host + path-style、多 endpoint、每 endpoint 泛域名证书 + bucket 自定义域名独立证书（SNI 分发、替换热加载）；
@@ -316,7 +317,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 ## 🧪 测试与兼容性
 
 `tests/run_all.sh` 一键全量（Docker 编排：mysql:8 CLI + python:3.12 PyMySQL/SQLAlchemy/pika），
-当前 **18 个测试脚本 + KV/MQ 双重启持久化检查，全套 ALL TESTS PASSED（2026-10-23）**：
+当前 **19 个测试脚本 + KV/MQ 双重启持久化检查，全套 ALL TESTS PASSED（2026-10-23）**：
 
 | 覆盖 | 要点 |
 | --- | --- |
@@ -329,6 +330,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.1.1（37 项） | rollup 精确性对拍、REBUILD、M3 兼容、caching_sha2 登录/缓存失效 |
 | Redis（69 项）+ 重启 | 命令集、TTL、命名空间隔离、LRU/noeviction、kv_stats；容器重启无损 |
 | RabbitMQ（28 项）+ 重启 | 路由语义、consume/ack/nack/prefetch、SHOW QUEUES、amqp 回调回环；消息重启不丢 |
+| v1.3.1（44 项） | multipart 分片上传全流程（复合 ETag/Abort/ListParts）、每月/每年调度（月尾 clamp）、PHP SCRIPT 错误路径 |
 
 ---
 
@@ -342,6 +344,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.1.1 | 存量余项全清（rollup / 分片并行 / 明细并行 / SCRIPT / M3）+ caching_sha2_password | ✅ |
 | v1.2.0 | Redis 键值/队列（RESP / TTL / 落盘 / 命名空间 / 淘汰）+ 3309 端口复用 | ✅ |
 | v1.3.0 | RabbitMQ 队列（AMQP 0-9-1 / 路由 / 持久化 / 观测）——五件套愿景交付完毕 | ✅ |
+| v1.3.1 | S3 multipart 分片上传、每月/每年调度、SCRIPT PHP 运行时 | ✅ |
 
 各版本完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)；
 未排期候选与设计红线见 [FEATURE.md](FEATURE.md)。
@@ -353,7 +356,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 **协议层**
 
 - 不支持预处理语句（`COM_STMT_*`），客户端走文本协议；不支持 TLS / XA / `LOAD DATA` / `LOCK TABLES` / 复制协议（公网暴露请前置认证代理）；
-- S3 不含 multipart 分片上传（红线首版不承诺，常规 PUT 覆盖 `max_object_mb` 内对象）；
+- S3 multipart 为基础分片上传（无 UploadPartCopy / 未完成上传自动生命周期，未完成会话需 Abort 或 `DROP BUCKET FORCE` 回收）；单对象上限 `max_object_mb`；
 - Redis 为 RESP2（无 `HELLO`/RESP3、无 BLPOP 阻塞弹出、无事务/发布订阅）；
 - AMQP 为基本队列（无镜像/仲裁队列、无事务性队列、`basic.return` 未实现；pika 1.4.4 客户端 close() 有自身 bug，见消息队列手册）。
 

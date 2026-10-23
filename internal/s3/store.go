@@ -200,6 +200,21 @@ CREATE TABLE IF NOT EXISTS s3_lifecycle (
 CREATE TABLE IF NOT EXISTS s3_policies (
   scope  TEXT PRIMARY KEY,
   policy TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS s3_uploads (
+  upload_id  TEXT PRIMARY KEY,
+  bucket     TEXT NOT NULL,
+  key        TEXT NOT NULL,
+  attrs      TEXT NOT NULL DEFAULT '{}',
+  created_ts TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS s3_parts (
+  upload_id   TEXT NOT NULL,
+  part_number INTEGER NOT NULL,
+  size        INTEGER NOT NULL DEFAULT 0,
+  etag        TEXT NOT NULL DEFAULT '',
+  created_ts  TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (upload_id, part_number)
 );`)
 	if err != nil {
 		return fmt.Errorf("init s3 schema: %w", err)
@@ -342,6 +357,10 @@ func (s *Store) DropBucket(name string, force bool) error {
 			return &s3Error{Code: "BucketNotEmpty", Status: 409,
 				Msg: "The bucket you tried to delete is not empty"}
 		}
+	}
+	// 先清理未完成分片上传（分块表还在），再删表
+	if err := s.dropBucketUploads(b); err != nil {
+		return err
 	}
 	if _, err := s.db.Exec(fmt.Sprintf(`DROP TABLE IF EXISTS %s`, b.TableName)); err != nil {
 		return err

@@ -32,7 +32,7 @@ var (
 )
 
 // parseSubmitOpts 解析 SUBMIT 之后的选项段。
-func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time.Time, win [2]string, weekWd int, when, part, partBytes, script, scriptOut string, retainSec, everySec int, everyAt string, everyWd, everyWeeks int, err error) {
+func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time.Time, win [2]string, weekWd int, when, part, partBytes, script, scriptOut string, retainSec, everySec int, everyAt string, everyWd, everyWeeks, everyMonths, everyMonthDay int, everyYears int, everyYearDay string, err error) {
 	s := strings.TrimSpace(rest)
 	// WHEN 到 PARTITION/SCRIPT 前的整段。v1.0.9 修复：WHEN 作为首个选项
 	// （紧跟 SQL 引号）时，旧正则要求 WHEN 前必须有空白，导致报 unknown SUBMIT
@@ -162,6 +162,31 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 				}
 				return nil
 			}
+			// parseOnAtMD 解析可选的 ON <1-31 | 'MM-DD'> 与 AT 'HH:MM' 后缀（EVERY MONTH/YEAR 用，v1.3.1）。
+			parseOnAtMD := func(isYear bool) error {
+				if i+2 < len(toks) && strings.EqualFold(toks[i+1], "ON") {
+					v2 := strings.Trim(toks[i+2], "'")
+					if isYear {
+						var mm, dd int
+						if n, _ := fmt.Sscanf(v2, "%d-%d", &mm, &dd); n != 2 || mm < 1 || mm > 12 || dd < 1 || dd > 31 {
+							return fmt.Errorf("invalid EVERY ... ON %q (expect 'MM-DD')", toks[i+2])
+						}
+						everyYearDay = fmt.Sprintf("%02d-%02d", mm, dd)
+					} else {
+						d, e := strconv.Atoi(v2)
+						if e != nil || d < 1 || d > 31 {
+							return fmt.Errorf("invalid EVERY ... ON %q (expect 1-31)", toks[i+2])
+						}
+						everyMonthDay = d
+					}
+					i += 2
+				}
+				if i+2 < len(toks) && strings.ToUpper(toks[i+1]) == "AT" {
+					everyAt = strings.Trim(toks[i+2], "'")
+					i += 2
+				}
+				return nil
+			}
 			switch v {
 			case "DAY":
 				everySec = 86400
@@ -178,6 +203,22 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 					err = e
 					return
 				}
+			case "MONTH", "MONTHS":
+				// EVERY MONTH [ON <1-31>] [AT 'HH:MM']（v1.3.1；ON 省略 = 提交日，月尾 clamp）
+				everyMonths = 1
+				everyMonthDay = time.Now().Day()
+				if e := parseOnAtMD(false); e != nil {
+					err = e
+					return
+				}
+			case "YEAR", "YEARS":
+				// EVERY YEAR [ON '<MM-DD>'] [AT 'HH:MM']（v1.3.1；ON 省略 = 提交日）
+				everyYears = 1
+				everyYearDay = time.Now().Format("01-02")
+				if e := parseOnAtMD(true); e != nil {
+					err = e
+					return
+				}
 			case "HOUR":
 				everySec = 3600
 			case "MINUTE":
@@ -187,7 +228,7 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 			default:
 				var n int
 				if _, e := fmt.Sscanf(v, "%d", &n); e != nil || n <= 0 {
-					err = fmt.Errorf("invalid EVERY %q (expect DAY [AT 'HH:MM'] / WEEK [ON 周X] [AT 'HH:MM'] / HOUR / MINUTE / SECOND / n SECONDS|MINUTES|HOURS|WEEKS)", v)
+					err = fmt.Errorf("invalid EVERY %q (expect DAY [AT 'HH:MM'] / WEEK [ON 周X] [AT 'HH:MM'] / MONTH [ON <1-31>] [AT 'HH:MM'] / YEAR [ON '<MM-DD>'] [AT 'HH:MM'] / HOUR / MINUTE / SECOND / n SECONDS|MINUTES|HOURS|WEEKS|MONTHS|YEARS)", v)
 					return
 				}
 				u := strings.ToUpper(next())
@@ -204,6 +245,22 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 					everyWeeks = n
 					everyWd = todayWeekdayCN()
 					if e := parseOnAt(); e != nil {
+						err = e
+						return
+					}
+				case "MONTH", "MONTHS":
+					// EVERY n MONTHS [ON <1-31>] [AT 'HH:MM']（v1.3.1）
+					everyMonths = n
+					everyMonthDay = time.Now().Day()
+					if e := parseOnAtMD(false); e != nil {
+						err = e
+						return
+					}
+				case "YEAR", "YEARS":
+					// EVERY n YEARS [ON '<MM-DD>'] [AT 'HH:MM']（v1.3.1）
+					everyYears = n
+					everyYearDay = time.Now().Format("01-02")
+					if e := parseOnAtMD(true); e != nil {
 						err = e
 						return
 					}
@@ -331,7 +388,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			return nil, true, roErr()
 		}
 		sqlText := strings.ReplaceAll(m[1], "''", "'")
-		cb, cbOpt, sign, timeout, at, win, weekWd, when, part, partBytes, script, scriptOut, retainSec, everySec, everyAt, everyWd, everyWeeks, perr := parseSubmitOpts(m[2])
+		cb, cbOpt, sign, timeout, at, win, weekWd, when, part, partBytes, script, scriptOut, retainSec, everySec, everyAt, everyWd, everyWeeks, everyMonths, everyMonthDay, everyYears, everyYearDay, perr := parseSubmitOpts(m[2])
 		if perr != nil {
 			return nil, true, mysql.NewError(1064, perr.Error())
 		}
@@ -353,6 +410,8 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			At: at, Window: win, WindowWd: weekWd, WhenExpr: when, PartRows: partRows, PartBytes: partBytesN,
 			Script: script, ScriptOut: scriptOut, RetainSec: retainSec,
 			EverySec: everySec, EveryAt: everyAt, EveryWd: everyWd, EveryWeeks: everyWeeks,
+			EveryMonths: everyMonths, EveryMonthDay: everyMonthDay,
+			EveryYears: everyYears, EveryYearDay: everyYearDay,
 		}
 		// 回调通道解析：http(s):// | tcp://host:port | amqp://… | kafka://broker
 		lcb := strings.ToLower(cb)

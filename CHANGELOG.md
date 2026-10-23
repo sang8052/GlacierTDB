@@ -2,6 +2,21 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.1.alpha] - 2026-10-23
+
+### 新增
+- **S3 分片上传（multipart）**：S3 标准分片上传全操作——
+  - **API**：`POST /{bucket}/{key}?uploads`（InitiateMultipartUpload，返回 UploadId）/ `PUT ?partNumber=N&uploadId=`（UploadPart，响应 ETag = 该 part 内容 MD5）/ `POST ?uploadId=`（CompleteMultipartUpload，body 为 Part 列表 XML，ETag = MD5(各 part MD5 顺序拼接)+"-N"，S3 复合 ETag 语义）/ `DELETE ?uploadId=`（Abort，204）/ `GET ?uploadId=`（ListParts）/ `GET /{bucket}?uploads`（ListMultipartUploads）；
+  - **校验**：partNumber 1..10000、Complete 所列 part 齐全（缺片 `InvalidPart`）+ 序号严格递增（`InvalidPartOrder`）+ ETag 与已上传分片一致；同序号重传覆盖（最后一次为准）；合并后大小受 `max_object_mb` 约束；未知 uploadId `NoSuchUpload`；
+  - **存储**：`glacier_s3.db` 新增 `s3_uploads`（会话，含对象属性）+ `s3_parts`（分片元数据）；分片内容存桶分块表（`chk_<bucket>`，`key='!mpu!<uploadId>'`，`seq=partNumber` 单行 BLOB）；Complete 按 part 顺序合并走对象两段式写入（inline/chunk），成功后清理分片与会话；`DROP BUCKET FORCE` 顺带回收未完成会话；
+  - **管理面**：`SHOW S3 UPLOADS [<bucket>]` / `SELECT * FROM s3_uploads`（分片数 / 字节聚合）；记账沿用 `s3_usage`（UploadPart 记 PUT + bytes_in，Abort 记 DELETE）；完成/覆盖写触发上传回调。
+- **异步调度补齐每月/每年**：`EVERY MONTH [ON <1-31>] [AT 'HH:MM']`、`EVERY YEAR [ON '<MM-DD>'] [AT 'HH:MM']`、`EVERY n MONTHS|YEARS`——首次排期与周期复发均日历感知（月尾日 clamp，如 1/31 → 2/28；2/29 平年 clamp 到 2/28）；ON 省略取提交日；`SHOW QUERY SCHEDULE` / `query_schedule` 的 schedule 表达与 next_run 展示（`EVERY MONTH ON 15 AT 03:00` 形式）。
+- **SCRIPT 后处理支持 PHP**：`.php` 脚本走 `async_query.php_path` 运行时（与 nodejs/python 同机制：script_dir 白名单、TIMEOUT 超时、CANCEL 中断、stderr 摘要进错误消息）；未配置 `php_path` 时任务 ERROR 并提示 `script runtime disabled (set async_query.nodejs_path / python_path / php_path)`。
+
+### 变更
+- `config.yaml` `async_query` 段新增 `php_path`；系统库 `glacier_s3.db` 新增 `s3_uploads` / `s3_parts` 表（幂等建表，存量升级无损）；
+- `tests/test_v131.py` 新增 44 项（multipart 全流程 / 复合 ETag 语义 / Abort / 每月·每年排期与月尾 clamp / PHP 错误路径）；`tests/run_all.sh` 纳入（SCRIPT 夹具补 `pipe.php`）；全套回归 ALL TESTS PASSED（19 脚本 + KV/MQ 双重启持久化）。
+
 ## [1.3.0.alpha] - 2026-10-23
 
 ### 新增

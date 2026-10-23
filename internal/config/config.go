@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.3.0.alpha"
+const GlacierVersion = "1.3.1.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -43,6 +43,7 @@ type AsyncOpts struct {
 	CallbackMaxInlineKB int  `yaml:"callback_max_inline_kb"`
 	NodejsPath        string `yaml:"nodejs_path"`  // 后处理 runtime（空=禁用 nodejs）
 	PythonPath        string `yaml:"python_path"`  // 后处理 runtime（空=禁用 python）
+	PhpPath           string `yaml:"php_path"`     // 后处理 runtime（空=禁用 php，v1.3.1）
 	ScriptDir         string `yaml:"script_dir"`   // SCRIPT 白名单目录（必须位于其下）
 }
 

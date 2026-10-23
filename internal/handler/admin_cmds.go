@@ -23,7 +23,7 @@ var (
 	reAdminShowClient = regexp.MustCompile(`(?i)^SHOW\s+CLIENTS$`)
 	reAdminShowTx     = regexp.MustCompile(`(?i)^SHOW\s+TRANSACTIONS$`)
 	reAdminSetPwd     = regexp.MustCompile(`(?i)^(?:SET\s+PASSWORD(?:\s+FOR\s+(\S+?))?\s*=\s*|ALTER\s+USER\s+(\S+?)\s+IDENTIFIED\s+BY\s+)'([^']{1,64})'\s*$`)
-	reAdminSelect     = regexp.MustCompile("(?i)^SELECT\\s+(.+?)\\s+FROM\\s+(server_config|clients|transactions|qos_status|users|user_grants|user_hosts|login_attempts|locked|s3_usage|s3_buckets|s3_keys|s3_lifecycle|s3_domains|kv_stats|mq_queues|mq_exchanges)(?:\\s+WHERE\\s+(.+?))?(?:\\s+ORDER\\s+BY\\s+.+?)?(?:\\s+LIMIT\\s+\\d+(?:\\s*,\\s*\\d+)?)?\\s*$")
+	reAdminSelect     = regexp.MustCompile("(?i)^SELECT\\s+(.+?)\\s+FROM\\s+(server_config|clients|transactions|qos_status|users|user_grants|user_hosts|login_attempts|locked|s3_usage|s3_buckets|s3_keys|s3_lifecycle|s3_domains|s3_uploads|kv_stats|mq_queues|mq_exchanges)(?:\\s+WHERE\\s+(.+?))?(?:\\s+ORDER\\s+BY\\s+.+?)?(?:\\s+LIMIT\\s+\\d+(?:\\s*,\\s*\\d+)?)?\\s*$")
 	reKillConn        = regexp.MustCompile(`(?i)^KILL\s+(?:CONNECTION\s+|QUERY\s+)?(\d+)$`)
 	reUseAdmin        = regexp.MustCompile("(?i)^USE\\s+`?(GlacierTDB|glacier)`?\\s*$") // 管理库别名：glacier 为系统内置名，禁止建库
 	reAdminSetConc    = regexp.MustCompile(`(?i)^SET\s+(GLOBAL_THREADS|PER_DB_READ_THREADS|DB_READ_THREADS)\s*(?:([A-Za-z0-9_-]+)\s*)?=\s*(\d+)\s*$`)
@@ -506,6 +506,9 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		case "s3_domains":
 			cols = []string{"host", "bucket", "cert_file", "key_file", "created"}
 			rows = h.s3DomainRows()
+		case "s3_uploads":
+			cols = []string{"upload_id", "bucket", "key", "parts", "bytes", "created"}
+			rows = h.s3UploadRows("")
 		case "kv_stats":
 			cols = kvStatCols
 			rows = h.kvStatRows()

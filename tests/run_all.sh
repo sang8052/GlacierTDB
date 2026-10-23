@@ -125,7 +125,8 @@ DATA_DIR=$(docker inspect "$PROXY" --format '{{range .Mounts}}{{if eq .Destinati
 if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
     mkdir -p "$DATA_DIR/scripts"
     printf '#!/bin/sh\ncat >/dev/null\necho SCRIPT_OK\n' > "$DATA_DIR/scripts/pipe.js"
-    echo "[OK] SCRIPT 测试夹具就绪: $DATA_DIR/scripts/pipe.js"
+    printf '#!/bin/sh\ncat >/dev/null\necho SCRIPT_OK\n' > "$DATA_DIR/scripts/pipe.php"
+    echo "[OK] SCRIPT 测试夹具就绪: $DATA_DIR/scripts/pipe.js（+ pipe.php）"
 else
     echo "[SKIP] 未找到被测容器 /data 挂载，SCRIPT 用例将验证错误路径"
 fi
@@ -168,6 +169,7 @@ echo "---- test_s3.py ----";  python /tests/test_s3.py  || rc=1
 echo "---- test_v111.py ----"; python /tests/test_v111.py || rc=1
 echo "---- test_v120.py ----"; python /tests/test_v120.py || rc=1
 echo "---- test_v130.py ----"; python /tests/test_v130.py || rc=1
+echo "---- test_v131.py ----"; python /tests/test_v131.py || rc=1
 exit $rc
 EOF
 )

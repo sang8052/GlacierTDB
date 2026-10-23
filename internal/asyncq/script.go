@@ -16,7 +16,8 @@ import (
 
 // runScript 后处理管道（v1.1.1）：结果 JSONL（jobs/<id>.jsonl）经 stdin 流入
 // SCRIPT 指定的脚本，stdout 产物落 jobs/<id>.<OUTPUT>（缺省 OUTPUT=out）。
-//   - 运行时按扩展名选择：.js → async_query.nodejs_path，.py → async_query.python_path（空 = 禁用）；
+//   - 运行时按扩展名选择：.js → async_query.nodejs_path，.py → async_query.python_path，
+//     .php → async_query.php_path（v1.3.1；空 = 禁用该运行时）；
 //   - 脚本必须位于 async_query.script_dir 白名单目录内（防任意路径执行）；
 //   - 超时取任务 TIMEOUT；CANCEL 可中断；stderr 摘要进错误消息。
 func (e *Engine) runScript(j *Job) error {
@@ -29,11 +30,13 @@ func (e *Engine) runScript(j *Job) error {
 		runtime = e.cfg.AsyncQuery.NodejsPath
 	case ".py":
 		runtime = e.cfg.AsyncQuery.PythonPath
+	case ".php":
+		runtime = e.cfg.AsyncQuery.PhpPath
 	default:
-		return fmt.Errorf("unsupported script type %q (expect .js / .py)", filepath.Ext(j.Script))
+		return fmt.Errorf("unsupported script type %q (expect .js / .py / .php)", filepath.Ext(j.Script))
 	}
 	if runtime == "" {
-		return fmt.Errorf("script runtime disabled (set async_query.nodejs_path / python_path)")
+		return fmt.Errorf("script runtime disabled (set async_query.nodejs_path / python_path / php_path)")
 	}
 	// 白名单目录校验（脚本必须位于 script_dir 之下）
 	if e.cfg.AsyncQuery.ScriptDir == "" {
