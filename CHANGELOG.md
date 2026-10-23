@@ -2,6 +2,22 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.2.0.alpha] - 2026-10-23
+
+### 新增
+- **Redis 键值/队列基础能力（mode:redis，FEATURE §3）**：3309 同端口 RESP2 协议服务——
+  - **基础能力**：string 类型 `GET/SET（EX|PX|NX|XX）/DEL/UNLINK/EXISTS/APPEND/INCR/DECR/INCRBY/DECRBY/MGET/MSET/KEYS/TYPE`；list 队列 `LPUSH/RPUSH/LPOP/RPOP（含 count）/LLEN/LRANGE`（负下标支持）；另有 `PING/ECHO/QUIT/SELECT/INFO/FLUSHDB/COMMAND`；
+  - **TTL**：`EXPIRE/PEXPIRE/TTL/PTTL/PERSIST`，惰性过期 + 定期扫描（`kv.scan_interval_sec`）；
+  - **自动落盘**：变更实时写 SQLite（`glacier_kv.db`，WAL），内存为缓存层，**重启无损恢复**（docker restart 后字符串/队列/TTL 全部还原，测试覆盖）；
+  - **命名空间**：每用户独立 namespace（登录账号隔离，跨用户 key 不可见）；
+  - **内存治理**：`kv.max_memory_mb` 上限 + 淘汰策略 `allkeys-lru` / `volatile-lru` / `noeviction`（超限 OOM 拒写）；`SHOW KV STATS` / `SELECT * FROM kv_stats` 查占用、命中率、过期/淘汰计数；`SET KV MAX_MEMORY <mb>` / `SET KV EVICTION <policy>` 管理面热改。
+- **3309 端口复用（FEATURE §0，服务声明协议）**：连接首包 `mode:<service>` 声明行（连接级一次性，`mysql`/`redis`/`rabbitmq`）优先；否则协议嗅探——RESP 首字节（`* + - : $`）→ Redis、AMQP 魔数（`AMQP`）→ RabbitMQ（v1.3.0 占位）、嗅探窗口内静默 → MySQL（默认，存量客户端零改动）；`mux_sniff_ms` 配置嗅探窗口（默认 300ms，高 RTT 环境可调大；`kv.enable: false` 可关闭嗅探恢复纯 MySQL 零延迟）。
+- **认证统一账号体系**：RESP `AUTH <password>` / `AUTH <user> <password>` 沿用 users 表（host 授权 / 账号锁定 / 登录审计 / 防爆破计数与 MySQL 侧一致）；未认证命令 `NOAUTH` 拒绝。
+
+### 变更
+- 系统库新增 `glacier_kv.db`（不对客户端暴露、禁 CREATE/DROP）；`config.yaml` 新增 `kv` 段与顶层 `mux_sniff_ms`；
+- `tests/test_v120.py` 新增 69 项 + 重启持久化检查 5 项；`tests/run_all.sh` 新增步骤 3.5（容器重启后数据恢复验证）；全套回归 ALL TESTS PASSED。
+
 ## [1.1.1.alpha] - 2026-10-23
 
 ### 新增

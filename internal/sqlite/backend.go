@@ -33,6 +33,9 @@ const SystemAuthDB = "glacier_auth"
 // SystemS3DB 对象存储系统库文件名（v1.1.0：glacier_s3.db，一 bucket 一表，不对客户端暴露）。
 const SystemS3DB = "glacier_s3"
 
+// SystemKVDB 键值/队列系统库文件名（v1.2.0：glacier_kv.db，mode:redis 落盘层，不对客户端暴露）。
+const SystemKVDB = "glacier_kv"
+
 // 合法库名：字母数字下划线连字符（防路径穿越）
 var reDBName = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
@@ -233,7 +236,7 @@ func (b *Backend) ListDatabases() []string {
 		name := e.Name()
 		if strings.HasSuffix(name, ".db") {
 			db := strings.TrimSuffix(name, ".db")
-			if db == SystemAuthDB || db == SystemS3DB {
+			if isSystemDB(db) {
 				continue
 			}
 			out = append(out, db)
@@ -261,9 +264,20 @@ func (b *Backend) OpenS3DB() (*sql.DB, error) {
 	return db, nil
 }
 
+// OpenKVDB 打开键值/队列系统库（glacier_kv.db，v1.2.0），供 kv 包使用。
+func (b *Backend) OpenKVDB() (*sql.DB, error) {
+	db, err := b.openFileRetry(b.fileFor(SystemKVDB), 2)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+	return db, nil
+}
+
 // isSystemDB 判断是否系统内置库（不对客户端暴露、禁止 CREATE/DROP）。
 func isSystemDB(name string) bool {
-	return name == SystemAuthDB || name == SystemS3DB
+	return name == SystemAuthDB || name == SystemS3DB || name == SystemKVDB
 }
 
 // CreateDatabase 创建一个库（空 .db 文件，应用 WAL）。

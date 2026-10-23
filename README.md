@@ -15,6 +15,7 @@
 | [docs/异步任务.md](docs/异步任务.md) | 异步任务手册：SUBMIT 全量语法、任务类型、回调协议、分片与示例 |
 | [docs/时序数据库.md](docs/时序数据库.md) | 时序冷库设计：存储模型、查询改写、rollup 与压缩路线 |
 | [docs/S3对象存储.md](docs/S3对象存储.md) | S3 对象存储手册：SigV4 鉴权、桶/对象/版本/对象锁、限速、策略、证书、计费（v1.1.0） |
+| [docs/键值队列.md](docs/键值队列.md) | 键值/队列手册：mode:redis、RESP 命令集、TTL、命名空间、内存治理、kv_stats（v1.2.0） |
 | [docs/部署运维.md](docs/部署运维.md) | 部署（Docker/裸机/systemd）、升级、备份恢复、监控、故障排查 |
 | [FEATURE.md](FEATURE.md) | **版本路线规划**：多中间件一篮子愿景、mode: 端口复用协议、v1.0.10–v1.3.0 路线 |
 | [CHANGELOG.md](CHANGELOG.md) | 更新日志 |
@@ -340,6 +341,8 @@ log:
 | 并行查询扩展（v1.1.1） | GROUP BY series_id, time(N) 按 series 取模分片并行 + Go 侧按桶合并；明细导出按 rowid 区间并行 scan、顺序发送（方案 B） |
 | SCRIPT 后处理（v1.1.1） | `SUBMIT QUERY … SCRIPT 'x.js' OUTPUT out`：结果 JSONL 流入 nodejs/python 子进程，产物落 jobs/<id>.<out>（script_dir 白名单） |
 | caching_sha2_password（v1.1.1） | MySQL 8 默认登录算法：账号级 `IDENTIFIED WITH caching_sha2_password`、握手默认 `auth.auth_plugin` 可配、RSA 全认证（非 TLS）、改密自动失效登录缓存 |
+| Redis 键值/队列（v1.2.0） | 3309 同端口 RESP（`mode:redis` / 嗅探）：GET/SET/DEL/INCR/MGET/KEYS + LPUSH/RPOP 队列；TTL 惰性+扫描；SQLite 实时落盘重启无损；每用户命名空间；内存上限 + LRU/volatile/noeviction；`kv_stats` 占用/命中率（详见 docs/键值队列.md） |
+| 端口复用（v1.2.0） | 3309 一端口多协议：`mode:<service>` 声明行优先，RESP/AMQP 嗅探兜底，静默默认 MySQL（存量客户端零改动） |
 | S3 对象存储（v1.1.0，可选） | AWS SigV4（表头 + 预签名 URL + aws-chunked）；一 bucket 一表 + 分块；AK/SK 签发/轮换/禁用/吊销；PUT/GET/HEAD/DELETE/COPY、ListObjects V1/V2、ListObjectVersions；下载限速（单连接/用户总带宽合并/并发上限）；UA/IP/Referer/Header 请求策略；上传回调（HMAC）；图片裁剪/缩放/转换/base64；多版本 + 对象锁（WORM）+ 生命周期；virtual-host + 自定义域名独立证书（SNI 热加载）；`s3_usage` 计费 SQL 可查 + 导出接口（详见 docs/S3对象存储.md） |
 
 ---
@@ -353,6 +356,7 @@ log:
 | ✅ v1.0.10 | 运维与查询补强 | **已完成**：查询 QoS（全系统/单库）；每周周期调度 + `SHOW QUERY SCHEDULE` + `PAUSE/RESUME`；**用户权限系统**（账号入库、库/表/IP 权限、MySQL 风格 `CREATE USER`/`GRANT`）+ **防爆破**（IP/账号/混合锁定、可选 ufw/iptables/firewall-cmd 系统层封锁、登录失败 HTTP 告警）；**JSON 复杂查询**；**Geo 字段查询** |
 | ✅ v1.1.0 | S3 对象存储 | **已完成**：AWS SigV4 兼容（表头/预签名/aws-chunked）；bucket 一张表、用户多组 AK/SK（AS/SK 前缀，SK 明文仅一次可见）；下载限速（单连接/多线程合并/并发上限）；UA/IP/Referer/Header 请求策略 + 上传回调（HMAC）；图片预处理/base64 直传/多版本/对象锁/生命周期；region 通配、virtual-host、多 endpoint 泛域名证书、bucket 自定义域名（SNI 热加载）；SQL 可查的 `s3_usage` 计费 + 导出接口 |
 | ✅ v1.1.1 | 存量余项 + caching_sha2 | **已完成**：rollup 多粒度预聚合（同遍落 m1/h1/d1、长范围聚合自动路由最粗粒度、精确等价）；GROUP BY series_id 分片并行；明细导出并行（方案 B）；SCRIPT 后处理管道（JSONL→nodejs/python）；MySQL 兼容 M3（ON DUPLICATE KEY UPDATE/VALUES()/FOR UPDATE/CONCAT_WS/LPAD/RPAD/DATE_FORMAT 周）；**caching_sha2_password**（MySQL 8 登录算法，RSA 全认证 + 缓存失效） |
+| ✅ v1.2.0 | Redis 键值/队列 | **已完成**：`mode:redis` 同端口 RESP 服务（声明行 + 协议嗅探 + MySQL 默认零改动）；string/list 队列全命令集；TTL 惰性+扫描；**SQLite 实时落盘、重启无损**；每用户命名空间隔离；`kv.max_memory_mb` + allkeys-lru/volatile-lru/noeviction 淘汰；`kv_stats` 占用/命中率 SQL 可查 |
 | v1.2.0 | Redis 键值/队列 | `mode:redis` 同端口 RESP；key/队列/TTL/自动落盘；每用户独立 namespace；内存上限 + LRU 淘汰 |
 | v1.3.0 | RabbitMQ 队列 | `mode:rabbitmq` 同端口 AMQP 0-9-1；exchange/queue/binding/发布消费；消息持久化、管理面观测 |
 

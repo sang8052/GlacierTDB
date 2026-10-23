@@ -176,6 +176,15 @@ CREATE USER 'u'@'%' IDENTIFIED WITH caching_sha2_password BY 'pwd';   -- MySQL 8
 ALTER USER 'u' IDENTIFIED WITH mysql_native_password [BY 'pwd'];      -- 切换登录算法
 ```
 
+### 1.9b 键值/队列管理（v1.2.0，kv.enable 开启后可用）
+
+```sql
+SHOW KV STATS;                          -- 占用/命中率（namespace/keys/memory_bytes/hits/misses/hit_rate/expired/evicted）
+SELECT * FROM kv_stats WHERE namespace = '*';
+SET KV MAX_MEMORY 64;                   -- 热改内存上限 MB（0 = 不限，重启失效）
+SET KV EVICTION allkeys-lru;            -- allkeys-lru | volatile-lru | noeviction
+```
+
 ### 1.10 S3 对象存储管理（v1.1.0；模块开启 s3.enable 后可用）
 
 详见 [S3对象存储.md](S3对象存储.md)。变更命令仅超级用户（只读 1290 / 普通用户 1142），

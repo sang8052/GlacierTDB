@@ -166,6 +166,7 @@ echo "---- test_v109.py ----"; python /tests/test_v109.py || rc=1
 echo "---- test_v110.py ----"; python /tests/test_v110.py || rc=1
 echo "---- test_s3.py ----";  python /tests/test_s3.py  || rc=1
 echo "---- test_v111.py ----"; python /tests/test_v111.py || rc=1
+echo "---- test_v120.py ----"; python /tests/test_v120.py || rc=1
 exit $rc
 EOF
 )
@@ -184,6 +185,22 @@ echo
 echo "—— 各 Python 测试的结论标记 ——"
 grep -E 'PYMYSQL:|SQLALCHEMY:|CONCURRENCY:' "$LOG_DIR/python_tests.out" || \
     echo "（未捕获到结论标记，详见 $LOG_DIR/python_tests.out）"
+
+# ----------------------------------------------------------------------------
+# 3.5 KV 持久化：重启 proxy 容器后数据无损恢复（v1.2.0）
+# ----------------------------------------------------------------------------
+step "步骤 3.5/4: KV 持久化（容器重启后 SQLite 恢复）"
+if docker restart "$PROXY" >/dev/null 2>&1; then
+    sleep 3
+    if docker run --rm --network "$NET" -v "$TESTS_DIR":/tests:ro "$PY_IMG"         python /tests/test_v120.py --check-restart; then
+        record "test_v120 restart persistence : PASS"
+    else
+        record "test_v120 restart persistence : FAIL"
+    fi
+else
+    echo "[FAIL] docker restart $PROXY 失败"
+    record "test_v120 restart persistence : FAIL"
+fi
 
 # ----------------------------------------------------------------------------
 # 4. 汇总

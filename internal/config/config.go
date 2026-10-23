@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.1.1.alpha"
+const GlacierVersion = "1.2.0.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -119,6 +119,14 @@ type S3Opts struct {
 	CallbackSecret  string   `yaml:"callback_secret"`        // 上传回调默认 HMAC 签名密钥
 }
 
+// KVOpts Redis 键值/队列（v1.2.0，mode:redis 同端口 RESP 服务）。
+type KVOpts struct {
+	Enable          bool   `yaml:"enable"`            // mode:redis 服务开关（默认开）
+	MaxMemoryMB     int    `yaml:"max_memory_mb"`     // 内存上限（0 = 不限）
+	Eviction        string `yaml:"eviction"`          // allkeys-lru | volatile-lru | noeviction
+	ScanIntervalSec int    `yaml:"scan_interval_sec"` // TTL 主动扫描周期（最低 1）
+}
+
 // SecOpts 静态加密（adiantum VFS，4KiB 块加密，防外部程序直接读底层文件）。
 type SecOpts struct {
 	Encrypt    bool   `yaml:"encrypt"`    // 首次启用要求空目录或已有加密库
@@ -166,6 +174,11 @@ type Config struct {
 	Qos           QosOpts      `yaml:"qos"`
 	Lock          LockOpts     `yaml:"lock"`
 	S3            S3Opts       `yaml:"s3"`
+	KV            KVOpts       `yaml:"kv"`
+
+	// MuxSniffMs 3309 端口复用嗅探窗口（v1.2.0）：等待客户端首包以识别 mode:/RESP/AMQP，
+	// 超时无数据按 MySQL 处理（MySQL 客户端静默等握手）。高 RTT 客户端可调大。
+	MuxSniffMs int `yaml:"mux_sniff_ms"`
 
 	Auth   Auth       `yaml:"auth"`
 	SQLite SQLiteOpts `yaml:"sqlite"`
@@ -221,6 +234,11 @@ func Default() *Config {
 			Endpoints: []S3Endpoint{{Listen: "0.0.0.0:9000"}},
 			BucketLimits: map[string]S3Limit{},
 		},
+		KV: KVOpts{
+			Enable:   true,
+			Eviction: "allkeys-lru",
+		},
+		MuxSniffMs: 300,
 		SQLite: SQLiteOpts{
 			Synchronous:   "NORMAL",
 			BusyTimeoutMs: 5000,
@@ -398,6 +416,28 @@ func (c *Config) Fill() {
 		if c.S3.LifecycleIntervalSec < 60 {
 			c.S3.LifecycleIntervalSec = 60
 		}
+	}
+	// KV 键值/队列（v1.2.0）
+	switch c.KV.Eviction {
+	case "allkeys-lru", "volatile-lru", "noeviction":
+	default:
+		c.KV.Eviction = "allkeys-lru"
+	}
+	if c.KV.MaxMemoryMB < 0 {
+		c.KV.MaxMemoryMB = 0
+	}
+	if c.KV.ScanIntervalSec <= 0 {
+		c.KV.ScanIntervalSec = 5
+	}
+	if c.KV.ScanIntervalSec < 1 {
+		c.KV.ScanIntervalSec = 1
+	}
+	// 端口复用嗅探窗口（0 = 关闭嗅探，纯 MySQL）
+	if c.MuxSniffMs < 0 {
+		c.MuxSniffMs = 0
+	}
+	if c.MuxSniffMs == 0 && c.KV.Enable {
+		c.MuxSniffMs = 300
 	}
 }
 

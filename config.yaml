@@ -84,6 +84,18 @@ security:
   encrypt: false
   passphrase: ""        # 启用时必填
 
+# 键值/队列（v1.2.0）：mode:redis 在 3309 同端口提供 RESP 服务（声明行/嗅探进入）
+# 详见 docs/键值队列.md
+kv:
+  enable: true            # RESP 服务开关（默认开；false = 3309 纯 MySQL、嗅探关闭）
+  max_memory_mb: 64       # 内存上限（0 = 不限）；超限按 eviction 策略处理
+  eviction: allkeys-lru   # allkeys-lru | volatile-lru | noeviction
+  scan_interval_sec: 5    # TTL 主动扫描周期（最低 1）
+
+# 端口复用嗅探窗口（v1.2.0）：等待客户端首包识别 mode:<service>/RESP/AMQP，
+# 超时无数据按 MySQL 处理（MySQL 客户端静默等握手）；高 RTT 客户端可调大
+mux_sniff_ms: 300
+
 # S3 对象存储（v1.1.0，可选模块）：AWS Signature V4 兼容，独立 HTTP(S) 监听器（不进 3309 复用）
 # 详见 docs/S3对象存储.md 与 docs/配置说明.md §2.10
 s3:

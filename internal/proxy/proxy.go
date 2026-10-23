@@ -2,9 +2,13 @@
 package proxy
 
 import (
+	"bufio"
 	"net"
+	"regexp"
 	"runtime/debug"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/server"
@@ -14,11 +18,164 @@ import (
 	"glaciertdb/internal/asyncq"
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/handler"
+	"glaciertdb/internal/kv"
 	"glaciertdb/internal/logx"
 	"glaciertdb/internal/meta"
 	"glaciertdb/internal/s3"
 	"glaciertdb/internal/sqlite"
 )
+
+// ---------------------------------------------------------------------------
+// 3309 端口复用（v1.2.0，FEATURE §0）：
+//   声明行 `mode:<service>`（连接级一次性）优先；否则协议嗅探——
+//   RESP 首字节（* + - : $）→ Redis；AMQP 魔数 → RabbitMQ；
+//   客户端静默等握手（嗅探窗口内无数据）→ MySQL（默认）。
+// ---------------------------------------------------------------------------
+
+var reModeLine = regexp.MustCompile(`(?i)^mode:(mysql|redis|rabbitmq)\s*$`)
+
+// bufferedConn Read 优先取嗅探缓冲（go-mysql/kv 复用同一条连接）。
+type bufferedConn struct {
+	net.Conn
+	br *bufio.Reader
+}
+
+func (b *bufferedConn) Read(p []byte) (int, error) { return b.br.Read(p) }
+
+// sniffConn 嗅探首包并分发；返回后 MySQL 路径继续用带缓冲的连接。
+func sniffConn(msrv *server.Server, raw net.Conn, cfg *config.Config, backend *sqlite.Backend,
+	reg *admin.Registry, aq *asyncq.Engine, store *auth.Store,
+	s3store *s3.Store, s3srv *s3.Server, kvs *kv.Store) {
+	remote := raw.RemoteAddr().String()
+	bc := &bufferedConn{Conn: raw, br: bufio.NewReader(raw)}
+
+	sniff := time.Duration(cfg.MuxSniffMs) * time.Millisecond
+	if sniff <= 0 || (!cfg.KV.Enable) {
+		// 纯 MySQL（嗅探关闭）
+		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+		return
+	}
+	_ = raw.SetReadDeadline(time.Now().Add(sniff))
+	first, ferr := bc.br.Peek(1)
+	_ = raw.SetReadDeadline(time.Time{})
+	if ferr != nil || len(first) == 0 {
+		// 窗口内无数据：客户端静默等握手 → MySQL
+		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+		return
+	}
+	switch first[0] {
+	case 'm', 'M':
+		// 可能是 mode:<service> 声明行；读到行尾判断
+		line := peekLine(bc.br)
+		if m := reModeLine.FindStringSubmatch(line); m != nil {
+			consumeModeLine(bc.br) // 声明行消费掉（连接级一次性）
+			switch strings.ToLower(m[1]) {
+			case "mysql":
+				serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+			case "redis":
+				serveRedis(bc, cfg, store, kvs, remote)
+			case "rabbitmq":
+				logx.Debugf("mux: rabbitmq mode from %s (v1.3.0 not implemented)", remote)
+				raw.Close()
+			}
+			return
+		}
+		// 非声明行：原样交 MySQL
+		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+	case '*', '+', '-', ':', '$':
+		serveRedis(bc, cfg, store, kvs, remote)
+	case 'A', 'a':
+		if line := peekLine(bc.br); strings.HasPrefix(line, "AMQP") {
+			logx.Debugf("mux: AMQP sniff from %s (v1.3.0 not implemented)", remote)
+			raw.Close()
+			return
+		}
+		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+	default:
+		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, remote)
+	}
+}
+
+// peekLine 读取一行但保留缓冲（不消费语义：mode 声明行由调用方确认后丢弃）。
+func peekLine(br *bufio.Reader) string {
+	// 用 Peek 累计到行尾（单行上限 256 字节）
+	for n := 1; n <= 256; n++ {
+		buf, err := br.Peek(n)
+		if len(buf) > 0 && buf[len(buf)-1] == '\n' {
+			return strings.TrimSpace(string(buf))
+		}
+		if err != nil {
+			return strings.TrimSpace(string(buf))
+		}
+	}
+	buf, _ := br.Peek(256)
+	return strings.TrimSpace(string(buf))
+}
+
+// consumeModeLine 丢弃已消费的声明行（mode:* 分发后调用）。
+func consumeModeLine(br *bufio.Reader) {
+	_, _ = br.ReadString('\n')
+}
+
+// serveRedis 进入 RESP 协议栈（v1.2.0）。
+func serveRedis(bc *bufferedConn, cfg *config.Config, store *auth.Store, kvs *kv.Store, remote string) {
+	if kvs == nil {
+		bc.Close()
+		return
+	}
+	consumeModeIfDeclared(bc.br)
+	logx.Debugf("kv: serve %s (resp)", remote)
+	kv.ServeConn(bc, kvs, store, cfg)
+}
+
+// consumeModeIfDeclared 若首行是 mode:redis 声明则消费掉。
+func consumeModeIfDeclared(br *bufio.Reader) {
+	if line := peekLine(br); reModeLine.MatchString(line) {
+		_, _ = br.ReadString('\n')
+	}
+}
+
+// serveMySQL MySQL 协议路径（原有逻辑）。
+func serveMySQL(srv *server.Server, raw net.Conn, cfg *config.Config, backend *sqlite.Backend,
+	reg *admin.Registry, aq *asyncq.Engine, store *auth.Store,
+	s3store *s3.Store, s3srv *s3.Server, kvs *kv.Store, remote string) {
+	h, err := handler.New(backend, cfg, remote, cfg.DefaultDB, reg, aq, store, s3store, s3srv, kvs)
+	if err != nil {
+		logx.Errorf("open sqlite session for %s: %v", remote, err)
+		raw.Close()
+		return
+	}
+	defer h.Close()
+	localAddr := raw.LocalAddr().String()
+	localAddrSeen.Store(localAddr, struct{}{})
+	h.SetAuthCacheInvalidator(func(u string) {
+		localAddrSeen.Range(func(k, _ any) bool {
+			srv.InvalidateCache(u, k.(string))
+			return true
+		})
+	})
+	authHandler := auth.NewHandler(store, remote)
+	mc, err := srv.NewCustomizedConn(&handshakeStatusConn{Conn: raw}, authHandler, h)
+	if err != nil {
+		logx.Debugf("handshake with %s failed: %v", remote, err)
+		return
+	}
+	h.BindConn(mc)
+	defer func() {
+		if r := recover(); r != nil {
+			logx.Debugf("connection %s panic recovered: %v\n%s", remote, r, debug.Stack())
+		}
+		if !mc.Closed() {
+			mc.Close()
+		}
+	}()
+	for {
+		if err := mc.HandleCommand(); err != nil {
+			logx.Debugf("connection %s closed: %v", remote, err)
+			return
+		}
+	}
+}
 
 // localAddrSeen 已观察到的服务端本地地址（caching_sha2 缓存 key 的 host 部分）。
 var localAddrSeen sync.Map
@@ -44,8 +201,8 @@ func newMySQLServer(cfg *config.Config) *server.Server {
 	return srv
 }
 
-// Run 阻塞监听并服务连接（s3store / s3srv 可为 nil：对象存储模块关闭）。
-func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store *s3.Store, s3srv *s3.Server) error {
+// Run 阻塞监听并服务连接（s3store / s3srv / kvs 可为 nil：对应模块关闭）。
+func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store *s3.Store, s3srv *s3.Server, kvs *kv.Store) error {
 	meta.MapSQLError = handler.MapSQLiteErr
 
 	reg := admin.NewRegistry()
@@ -56,14 +213,15 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 			cfg.AsyncQuery.MetricsIntervalSec, cfg.AsyncQuery.ResultTTLHours)
 	}
 
-	srv := newMySQLServer(cfg)
+	msrv := newMySQLServer(cfg)
 
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
 	}
-	logx.Infof("listening on %s (mysql protocol -> sqlite dir %s, default db=%s, user=%s)",
-		cfg.Listen, cfg.DBDir, cfg.DefaultDB, cfg.Auth.User)
+	logx.Infof("listening on %s (multiplex mysql%s -> sqlite dir %s, default db=%s, user=%s)",
+		cfg.Listen, map[bool]string{true: "+redis", false: ""}[cfg.KV.Enable],
+		cfg.DBDir, cfg.DefaultDB, cfg.Auth.User)
 
 	for {
 		c, err := ln.Accept()
@@ -71,70 +229,10 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 			logx.Errorf("accept: %v", err)
 			continue
 		}
-		go handleConn(srv, c, cfg, backend, reg, aq, store, s3store, s3srv)
+		go sniffConn(msrv, c, cfg, backend, reg, aq, store, s3store, s3srv, kvs)
 	}
 }
 
-func handleConn(srv *server.Server, raw net.Conn, cfg *config.Config, backend *sqlite.Backend,
-	reg *admin.Registry, aq *asyncq.Engine, store *auth.Store, s3store *s3.Store, s3srv *s3.Server) {
-	remote := raw.RemoteAddr().String()
-	logx.Debugf("new connection from %s", remote)
-	// 初始握手包的 status 位默认 0（无 AUTOCOMMIT），会导致 pymysql/SQLAlchemy
-	// 误判 autocommit=0 而不发 SET AUTOCOMMIT=0，事务语义错乱；此处改写首包补上该位
-	c := &handshakeStatusConn{Conn: raw}
-
-	// 连接数上限保护（超限直接断开，防内存失控）
-	if reg.Count() >= cfg.MaxConnections {
-		logx.Warnf("reject connection from %s: max_connections=%d reached", remote, cfg.MaxConnections)
-		raw.Close()
-		return
-	}
-
-	h, err := handler.New(backend, cfg, remote, cfg.DefaultDB, reg, aq, store, s3store, s3srv)
-	if err != nil {
-		logx.Errorf("open sqlite session for %s: %v", remote, err)
-		raw.Close()
-		return
-	}
-	defer h.Close()
-
-	// caching_sha2_password 缓存失效钩子：改密后按（user@LocalAddr）精确失效
-	//（go-mysql 缓存 key 含连接本地地址，需遍历已观察到的地址）
-	localAddr := raw.LocalAddr().String()
-	localAddrSeen.Store(localAddr, struct{}{})
-	h.SetAuthCacheInvalidator(func(u string) {
-		localAddrSeen.Range(func(k, _ any) bool {
-			srv.InvalidateCache(u, k.(string))
-			return true
-		})
-	})
-
-	// 认证走用户权限系统（v1.0.10）：每连接一个 Handler（捕获来源 IP），
-	// GetCredential 阶段完成 IP/账号锁定与 host 授权检查，失败/成功落审计并防爆破计数
-	authHandler := auth.NewHandler(store, remote)
-	mc, err := srv.NewCustomizedConn(c, authHandler, h)
-	if err != nil {
-		logx.Debugf("handshake with %s failed: %v", remote, err)
-		return
-	}
-	h.BindConn(mc)
-	defer func() {
-		// HandleCommand 出错路径会置 c.Conn=nil 并自行 Close，二次 Close 会 panic，需防护
-		if r := recover(); r != nil {
-			logx.Debugf("connection %s panic recovered: %v\n%s", remote, r, debug.Stack())
-		}
-		if !mc.Closed() {
-			mc.Close()
-		}
-	}()
-
-	for {
-		if err := mc.HandleCommand(); err != nil {
-			logx.Debugf("connection %s closed: %v", remote, err)
-			return
-		}
-	}
-}
 
 // handshakeStatusConn 在首个 server->client 写包（初始握手）的 status 字段上
 // 补 SERVER_STATUS_AUTOCOMMIT（0x0002），与真 MySQL 默认 autocommit=1 一致；
