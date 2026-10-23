@@ -56,8 +56,8 @@ RabbitMQ、MinIO）各自为政——安装、守护、备份、升级都是负�
 | **时序冷库** | 同 MySQL | `series`+`points` 聚簇 schema、时间谓词整数化、`GROUP BY time(N)`、**rollup 预聚合自动路由**、多核并行 | 时序数据库 |
 | **异步任务** | 同 MySQL | `SUBMIT QUERY` 秒回 job_id；AT / WINDOW / WHEN / EVERY 周期调度（含每月/每年）；四通道回调 + HMAC；**SCRIPT 后处理管道** | 异步任务 |
 | **S3 对象存储** | `:9000`（HTTP/S） | AWS SigV4（表头/预签名/aws-chunked）；**multipart 分片上传**、版本、对象锁、生命周期、限速、请求策略、上传回调、图片处理、计费 | S3对象存储 |
-| **Redis 键值/队列** | `:3309`（mode:redis） | RESP string/list；TTL 惰性+扫描；**SQLite 落盘重启无损**；每用户命名空间；LRU 淘汰 | 键值队列 |
-| **RabbitMQ 队列** | `:3309`（mode:rabbitmq） | AMQP 0-9-1：direct/fanout/topic、publish/consume/ack/nack/prefetch；消息与游标落盘重启不丢 | 消息队列 |
+| **Redis 键值/队列** | `:3309`（mode:redis） | RESP string/list；**BLPOP/BRPOP 阻塞弹出**；TTL 惰性+扫描；**SQLite 落盘重启无损**；每用户命名空间；LRU 淘汰 | 键值队列 |
+| **RabbitMQ 队列** | `:3309`（mode:rabbitmq） | AMQP 0-9-1：direct/fanout/topic、publish/consume/ack/nack/prefetch；**confirm 发布确认 + mandatory 回退**；消息与游标落盘重启不丢 | 消息队列 |
 | **运维与安全** | 全协议 | 用户权限（库/表/IP 授权）、防爆破自动锁、查询 QoS、caching_sha2_password、SQL 审计日志 | 本文 / 配置说明 |
 
 ---
@@ -163,6 +163,7 @@ AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked`），boto3 
 ### 6. Redis 键值/队列（v1.2.0，`kv.enable`）
 
 - RESP 服务（`mode:redis` 或嗅探）：string `GET/SET(EX·PX·NX·XX)/DEL/EXISTS/APPEND/INCR 族/MGET/MSET/KEYS/TYPE` + list 队列 `LPUSH/RPUSH/LPOP/RPOP/LLEN/LRANGE`；
+- **阻塞弹出（v1.3.2）**：`BLPOP/BRPOP key [key…] timeout`——按序取首个非空队列，Push 立即唤醒、超时返回空数组（`0` = 无限等待）；
 - **TTL**：惰性过期 + 定期扫描；**变更实时写 SQLite（`glacier_kv.db`）重启无损**；
 - **命名空间 = 登录账号**（跨用户不可见）；**内存治理**：`kv.max_memory_mb` + `allkeys-lru/volatile-lru/noeviction`；`SHOW KV STATS` / `kv_stats` 占用与命中率。
 
@@ -170,6 +171,7 @@ AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked`），boto3 
 
 - AMQP 0-9-1（pika / amqp091-go 互通）：exchange（**direct/fanout/topic**，`*`/`#` 通配）+ queue + binding；默认交换机直达；
 - `basic.publish/consume/ack/nack(requeue 重投 + redelivered)/reject/get/qos(prefetch)/cancel/recover`；
+- **发布确认与回退（v1.3.2）**：`confirm.select` 后逐条 `basic.ack`（失败 `basic.nack`）；`mandatory` 不可路由回退 `basic.return`（312 NO_ROUTE，内容原样）；
 - **消息与消费游标落 SQLite（`glacier_mq.db`）重启不丢**；断线未确认自动重入队；`SHOW QUEUES/SHOW EXCHANGES`；
 - 异步任务 `CALLBACK 'amqp://…'` 可指向本服务自回环。
 
@@ -317,7 +319,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 ## 🧪 测试与兼容性
 
 `tests/run_all.sh` 一键全量（Docker 编排：mysql:8 CLI + python:3.12 PyMySQL/SQLAlchemy/pika），
-当前 **19 个测试脚本 + KV/MQ 双重启持久化检查，全套 ALL TESTS PASSED（2026-10-23）**：
+当前 **20 个测试脚本 + KV/MQ 双重启持久化检查，全套 ALL TESTS PASSED（2026-10-23）**：
 
 | 覆盖 | 要点 |
 | --- | --- |
@@ -331,6 +333,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | Redis（69 项）+ 重启 | 命令集、TTL、命名空间隔离、LRU/noeviction、kv_stats；容器重启无损 |
 | RabbitMQ（28 项）+ 重启 | 路由语义、consume/ack/nack/prefetch、SHOW QUEUES、amqp 回调回环；消息重启不丢 |
 | v1.3.1（44 项） | multipart 分片上传全流程（复合 ETag/Abort/ListParts）、每月/每年调度（月尾 clamp）、PHP SCRIPT 错误路径 |
+| v1.3.2（13 项） | BLPOP/BRPOP 阻塞弹出（唤醒/超时/方向）、publisher confirm 逐条 ack、mandatory 回退 312 NO_ROUTE |
 
 ---
 
@@ -345,6 +348,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.2.0 | Redis 键值/队列（RESP / TTL / 落盘 / 命名空间 / 淘汰）+ 3309 端口复用 | ✅ |
 | v1.3.0 | RabbitMQ 队列（AMQP 0-9-1 / 路由 / 持久化 / 观测）——五件套愿景交付完毕 | ✅ |
 | v1.3.1 | S3 multipart 分片上传、每月/每年调度、SCRIPT PHP 运行时 | ✅ |
+| v1.3.2 | Redis BLPOP/BRPOP 阻塞弹出、AMQP confirm 发布确认 + mandatory 回退 | ✅ |
 
 各版本完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)；
 未排期候选与设计红线见 [FEATURE.md](FEATURE.md)。
@@ -357,8 +361,8 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 
 - 不支持预处理语句（`COM_STMT_*`），客户端走文本协议；不支持 TLS / XA / `LOAD DATA` / `LOCK TABLES` / 复制协议（公网暴露请前置认证代理）；
 - S3 multipart 为基础分片上传（无 UploadPartCopy / 未完成上传自动生命周期，未完成会话需 Abort 或 `DROP BUCKET FORCE` 回收）；单对象上限 `max_object_mb`；
-- Redis 为 RESP2（无 `HELLO`/RESP3、无 BLPOP 阻塞弹出、无事务/发布订阅）；
-- AMQP 为基本队列（无镜像/仲裁队列、无事务性队列、`basic.return` 未实现；pika 1.4.4 客户端 close() 有自身 bug，见消息队列手册）。
+- Redis 为 RESP2（无 `HELLO`/RESP3、无事务/发布订阅；BLPOP/BRPOP 单连接串行阻塞，`timeout=0` 无限等待）；
+- AMQP 为基本队列（无镜像/仲裁队列、无事务性队列；confirm 为逐条 ack、无 `immediate` 位；pika 1.4.4 客户端 close() 有自身 bug，见消息队列手册）。
 
 **语义层**
 

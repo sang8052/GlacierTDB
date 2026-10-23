@@ -129,5 +129,8 @@ func (w *RespWriter) BulkArray(items [][]byte) {
 	}
 }
 
+// NullArray 空数组（*-1，BLPOP/BRPOP 超时应答）。
+func (w *RespWriter) NullArray() { w.bw.WriteString("*-1\r\n") }
+
 // Flush 提交缓冲。
 func (w *RespWriter) Flush() error { return w.bw.Flush() }

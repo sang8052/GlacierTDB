@@ -23,12 +23,18 @@ type channelState struct {
 	unacked map[uint64]int64 // delivery-tag → message id
 	prefetch int
 	closed  bool
+	confirm bool   // Confirm.Select 已开启 publisher confirm（v1.3.2）
+	pubTag  uint64 // 发布序号（confirm 的 delivery-tag，v1.3.2）
 }
 
-// contentCollector Basic.Publish 内容收集（header + body 帧）。
+// contentCollector Basic.Publish 内容收集（header + body 帧 + 路由目标）。
 type contentCollector struct {
-	header contentHeader
-	buf    []byte
+	header    contentHeader
+	buf       []byte
+	exchange  string
+	rk        string
+	mandatory bool
+	pubTag    uint64
 }
 
 // connState 单条 AMQP 连接状态。
@@ -43,7 +49,6 @@ type connState struct {
 
 	channels   map[uint16]*channelState
 	collectors map[uint16]*contentCollector
-	pubTargets map[uint16][2]string // channel → (exchange, routing key)
 	frameMax   int
 	closed     bool
 }
@@ -63,7 +68,7 @@ func ServeConn(c net.Conn, store *Store, auths *auth.Store, cfg *config.Config) 
 	cs := &connState{
 		conn: c, store: store, auths: auths, cfg: cfg,
 		connID: connID, channels: map[uint16]*channelState{},
-		collectors: map[uint16]*contentCollector{}, pubTargets: map[uint16][2]string{},
+		collectors: map[uint16]*contentCollector{},
 		frameMax: 131072,
 	}
 	defer func() {
@@ -304,10 +309,18 @@ func (cs *connState) handleMethod(chNum uint16, m *methodMsg) bool {
 			cs.writeMethod(chNum, &methodMsg{class: 60, method: 31, args: []any{tag}})
 		}
 
-	case key(60, 40): // Publish
+	case key(60, 40): // Publish（mandatory 位保存到收集器，供 basic.return 回退，v1.3.2）
 		exchange, rk := toStr(m.args[1]), toStr(m.args[2])
-		cs.collectors[chNum] = &contentCollector{}
-		cs.pubTargets[chNum] = [2]string{exchange, rk}
+		mandatory := toBool(m.args[3])
+		ch := cs.channels[chNum]
+		if ch == nil {
+			ch = &channelState{num: chNum, unacked: map[uint64]int64{}, nextTag: 1}
+			cs.channels[chNum] = ch
+		}
+		ch.pubTag++
+		cs.collectors[chNum] = &contentCollector{
+			exchange: exchange, rk: rk, mandatory: mandatory, pubTag: ch.pubTag,
+		}
 
 	case key(60, 70): // Get
 		queue := toStr(m.args[1])
@@ -347,9 +360,18 @@ func (cs *connState) handleMethod(chNum uint16, m *methodMsg) bool {
 		cs.recoverChannel(chNum)
 		cs.writeMethod(chNum, &methodMsg{class: 60, method: 111, args: nil})
 
-	// ---- Confirm / Tx（最小实现）----
-	case key(85, 10):
-		cs.writeMethod(chNum, &methodMsg{class: 85, method: 11, args: nil})
+	// ---- Confirm / Tx ----
+	case key(85, 10): // Confirm.Select（v1.3.2：开启 publisher confirm，逐条 basic.ack）
+		noWait := toBool(m.args[0])
+		ch := cs.channels[chNum]
+		if ch == nil {
+			ch = &channelState{num: chNum, unacked: map[uint64]int64{}, nextTag: 1}
+			cs.channels[chNum] = ch
+		}
+		ch.confirm = true
+		if !noWait {
+			cs.writeMethod(chNum, &methodMsg{class: 85, method: 11, args: nil})
+		}
 	case key(90, 10):
 		cs.writeMethod(chNum, &methodMsg{class: 90, method: 11, args: nil})
 	case key(90, 20):
@@ -368,16 +390,32 @@ func (cs *connState) handleMethod(chNum uint16, m *methodMsg) bool {
 	return false
 }
 
-// finishPublish 内容收集完成 → 落盘。
+// finishPublish 内容收集完成 → 落盘；mandatory 不可路由回退（basic.return）+
+// publisher confirm 确认帧（basic.ack / basic.nack，v1.3.2）。
 func (cs *connState) finishPublish(chNum uint16, c *contentCollector) {
-	t := cs.pubTargets[chNum]
-	delete(cs.pubTargets, chNum)
 	props := c.header.props
 	if len(props) == 0 {
 		props = nil
 	}
-	if err := cs.store.Publish(cs.ns, t[0], t[1], props, c.buf, deliveryMode(props)); err != nil {
+	routed, err := cs.store.Publish(cs.ns, c.exchange, c.rk, props, c.buf, deliveryMode(props))
+	if err != nil {
 		logx.Debugf("mq: publish failed: %v", err)
+	}
+	// mandatory 回退（312 NO_ROUTE）：一条也没路由到队列 → 方法帧 + 原内容发回发布方
+	if c.mandatory && err == nil && routed == 0 {
+		cs.writeMethod(chNum, &methodMsg{class: 60, method: 50,
+			args: []any{uint16(312), "NO_ROUTE", c.exchange, c.rk}})
+		cs.writeContent(chNum, c.header, c.buf)
+	}
+	// publisher confirm：confirm 模式逐条确认（回退后仍 ack = 已处理；失败 nack）
+	if ch := cs.channels[chNum]; ch != nil && ch.confirm {
+		if err != nil {
+			cs.writeMethod(chNum, &methodMsg{class: 60, method: 120,
+				args: []any{uint64(c.pubTag), false, false}})
+		} else {
+			cs.writeMethod(chNum, &methodMsg{class: 60, method: 80,
+				args: []any{uint64(c.pubTag), false}})
+		}
 	}
 }
 

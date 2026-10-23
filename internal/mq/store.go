@@ -249,9 +249,10 @@ func (s *Store) countReady(ns, queue string) (int64, error) {
 // ---------------------------------------------------------------------------
 
 // Publish 发布消息（默认交换机 "" 直达队列名；direct/fanout/topic 路由）。
-func (s *Store) Publish(ns, exchange, routingKey string, props, payload []byte, persistent bool) error {
+// 返回投递到的队列数（0 = 不可路由，mandatory 回退判定用，v1.3.2）。
+func (s *Store) Publish(ns, exchange, routingKey string, props, payload []byte, persistent bool) (int, error) {
 	if s.maxMsg > 0 && int64(len(payload)) > s.maxMsg {
-		return fmt.Errorf("message size %d exceeds max_message_mb limit", len(payload))
+		return 0, fmt.Errorf("message size %d exceeds max_message_mb limit", len(payload))
 	}
 	s.mu.Lock()
 	queues := s.routeLocked(ns, exchange, routingKey)
@@ -264,7 +265,7 @@ func (s *Store) Publish(ns, exchange, routingKey string, props, payload []byte, 
 	s.mu.Unlock()
 	s.published.Add(1)
 	s.nudge()
-	return nil
+	return len(queues), nil
 }
 
 // routeLocked 解析路由目标队列（调用方持锁）。

@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"glaciertdb/internal/auth"
 	"glaciertdb/internal/config"
@@ -417,6 +419,39 @@ func ServeConn(c net.Conn, store *Store, auths *auth.Store, cfg *config.Config) 
 				} else {
 					w.BulkArray(items)
 				}
+			})
+
+		case "BLPOP", "BRPOP":
+			// BLPOP key [key ...] timeout（v1.3.2 阻塞弹出：超时返回空数组，Push 唤醒）
+			if len(rest) < 2 {
+				reply(func() { w.Error("ERR wrong number of arguments") })
+				continue
+			}
+			keys := rest[:len(rest)-1]
+			secs, err := strconv.ParseFloat(strings.TrimSpace(rest[len(rest)-1]), 64)
+			if err != nil {
+				reply(func() { w.Error("ERR timeout is not a float or out of range") })
+				continue
+			}
+			if secs < 0 {
+				reply(func() { w.Error("ERR timeout is negative") })
+				continue
+			}
+			var d time.Duration
+			if secs > 0 {
+				d = time.Duration(secs * float64(time.Second))
+			}
+			key, val, ok, perr := store.BlockPop(ns, keys, cmd == "BLPOP", d)
+			reply(func() {
+				if perr != nil {
+					w.Error(perr.Error())
+					return
+				}
+				if !ok {
+					w.NullArray() // 超时：*-1
+					return
+				}
+				w.BulkArray([][]byte{[]byte(key), val})
 			})
 
 		case "FLUSHDB", "FLUSHALL":

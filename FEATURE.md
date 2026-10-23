@@ -21,8 +21,6 @@
 | 候选 | 出处 | 说明 |
 | --- | --- | --- |
 | 时序冷压缩与固化 | docs/时序数据库.md | 明细保留期外分区 Gorilla chunk 压缩（5–10 倍）、`journal_mode=DELETE; VACUUM` 固化只读多实例 |
-| Redis 阻塞弹出 | v1.2.0 边界 | `BLPOP` / `BRPOP`（可选项） |
-| AMQP 回退与确认 | docs/消息队列.md | `basic.return`（mandatory 回退）、confirm ack 帧 |
 
 ---
 

@@ -2,6 +2,24 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.2.alpha] - 2026-10-23
+
+### 新增
+- **Redis 阻塞弹出（FEATURE 未排期候选项落地）**：`BLPOP key [key ...] timeout` / `BRPOP ...`——
+  - 按 key 参数顺序扫描，取首个非空 list 弹出一个元素（BLPOP 左端 / BRPOP 右端），应答 `[key, value]` 二元数组；全部为空则阻塞等待，任一 key 被 LPUSH/RPUSH **立即唤醒**（广播轮换通道，无轮询），超时返回空数组（RESP2 `*-1`）；
+  - `timeout` 支持小数秒，`0` = 无限等待；非 list 键按扫描顺序到达时 `WRONGTYPE`；负超时报错；
+  - 同 key 多个阻塞客户端按唤醒顺序竞争，未抢到者继续等待（Push 语义对齐 Redis）。
+- **AMQP 发布确认与 mandatory 回退（FEATURE 未排期候选项落地）**：
+  - **publisher confirm**：`confirm.select`（nowait 支持）后通道进入确认模式，每条 publish 按通道内发布序号逐条 `basic.ack`，发布失败（如超 `max_message_mb`）`basic.nack`——此前仅回 `confirm.select-ok` 不发确认帧；
+  - **basic.return**：`basic.publish` 带 `mandatory=true` 且路由到 0 条队列时，以 `basic.return`（**312 NO_ROUTE**，exchange / routing-key 原样）+ 原 header/body 回退发布方；confirm 模式下回退后仍 ack（已处理语义，对齐 RabbitMQ）；未知交换机按不可路由处理。
+
+### 修复
+- `docs/消息队列.md` 正文嵌入的 2 个 NUL 字节（AMQP 协议头魔数字面量）导致 grep 按二进制处理——改为转义写法。
+
+### 变更
+- `mq.Store.Publish` 返回值从 `error` 改为 `(路由队列数, error)`（回退判定用）；KV `Pop` 抽取 `popLocked` 供阻塞弹出复用；
+- `tests/test_v132.py` 新增 13 项（BLPOP/BRPOP 非阻塞命中·方向·多 key·Push 唤醒·超时·WRONGTYPE·非法超时；confirm 逐条 ack；mandatory 回退 312/内容原样·可路由不回退·confirm+回退并存）；`tests/run_all.sh` 纳入；全套回归 ALL TESTS PASSED（20 脚本 + KV/MQ 双重启持久化）。
+
 ## [1.3.1.alpha] - 2026-10-23
 
 ### 新增

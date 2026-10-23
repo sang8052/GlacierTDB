@@ -50,6 +50,8 @@ type Store struct {
 	evic string // allkeys-lru | volatile-lru | noeviction
 	clock uint64
 
+	blockCh chan struct{} // 阻塞弹出广播唤醒（Push 后轮换，v1.3.2）
+
 	expiredTotal atomic.Int64
 	evictedTotal atomic.Int64
 	ops          atomic.Int64
@@ -97,6 +99,7 @@ CREATE TABLE IF NOT EXISTS kv_list (
 		ns:       map[string]*namespace{},
 		maxB:     int64(cfg.KV.MaxMemoryMB) << 20,
 		evic:     cfg.KV.Eviction,
+		blockCh:  make(chan struct{}),
 		startTS:  time.Now(),
 	}
 	if s.evic == "" {
@@ -602,6 +605,7 @@ func (s *Store) Push(ns, key string, vals [][]byte, left bool) (int64, error) {
 	_, _ = s.db.Exec(`UPDATE kv_meta SET minseq=?, maxseq=?, updated_ts=? WHERE ns=? AND key=?`,
 		minS, maxS, time.Now().UnixMilli(), ns, key)
 	s.evictLocked(ns, key)
+	s.notifyPushLocked() // 唤醒阻塞弹出（BLPOP/BRPOP，v1.3.2）
 	return int64(len(e.items)), nil
 }
 
@@ -621,6 +625,11 @@ func (s *Store) Pop(ns, key string, left bool, count int) ([][]byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ops.Add(1)
+	return s.popLocked(ns, key, left, count)
+}
+
+// popLocked 弹出实现（调用方持 s.mu）。
+func (s *Store) popLocked(ns, key string, left bool, count int) ([][]byte, error) {
 	e := s.listLocked(ns, key)
 	if e == nil {
 		if s.nsGet(ns).entries[key] != nil {
@@ -661,6 +670,57 @@ func (s *Store) Pop(ns, key string, left bool, count int) ([][]byte, error) {
 		s.adjMem(ns, key, e, oldEst)
 	}
 	return out, nil
+}
+
+// BlockPop BLPOP/BRPOP（v1.3.2）：按 key 顺序尝试弹出一个元素（left=true 左弹），
+// 全部为空则阻塞等待 Push 唤醒或超时；timeout<=0 表示无限等待。
+// 返回 (key, value, ok)；ok=false 为超时。键持有非 list 值 → errWrongType。
+func (s *Store) BlockPop(ns string, keys []string, left bool, timeout time.Duration) (string, []byte, bool, error) {
+	deadline := time.Time{}
+	if timeout > 0 {
+		deadline = time.Now().Add(timeout)
+	}
+	for {
+		s.mu.Lock()
+		ch := s.blockCh // 先取唤醒通道再扫数据（持锁内），避免丢失唤醒
+		for _, key := range keys {
+			items, err := s.popLocked(ns, key, left, 1)
+			if err != nil {
+				s.mu.Unlock()
+				return "", nil, false, err
+			}
+			if len(items) > 0 {
+				s.mu.Unlock()
+				s.ops.Add(1)
+				return key, items[0], true, nil
+			}
+		}
+		s.mu.Unlock()
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			s.ops.Add(1)
+			return "", nil, false, nil
+		}
+		var wait <-chan time.Time
+		if !deadline.IsZero() {
+			t := time.NewTimer(time.Until(deadline))
+			wait = t.C
+			select {
+			case <-ch:
+				t.Stop()
+			case <-wait:
+				s.ops.Add(1)
+				return "", nil, false, nil
+			}
+			continue
+		}
+		<-ch // 无限等待：仅 Push 唤醒
+	}
+}
+
+// notifyPushLocked Push 后唤醒全部阻塞弹出者（轮换广播通道；调用方持 s.mu）。
+func (s *Store) notifyPushLocked() {
+	close(s.blockCh)
+	s.blockCh = make(chan struct{})
 }
 
 // LLen LLEN（键不存在 → 0；类型不符 → errWrongType）。
