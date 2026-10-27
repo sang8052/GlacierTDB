@@ -8,7 +8,7 @@
 
 > 🤖 **本项目全程由 GLM5.3 驱动。**
 
-**当前版本：v1.3.6.alpha** · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
+**当前版本：v1.3.7.alpha** · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
 （三平台 + SHA256SUMS）· 许可：MIT
 
 | 📄 文档 | 说明 |
@@ -55,7 +55,7 @@ RabbitMQ、MinIO）各自为政——安装、守护、备份、升级都是负�
 | **MySQL 网关** | `:3309`（默认） | MySQL 协议 + 标准 SQL，mysql CLI / Navicat / DBeaver / PyMySQL / SQLAlchemy / JDBC 直连；多库、事务、管理面 | 本文 / 系统SQL |
 | **时序冷库** | 同 MySQL | `series`+`points` 聚簇 schema、时间谓词整数化、`GROUP BY time(N)`、**rollup 预聚合自动路由**、多核并行 | 时序数据库 |
 | **异步任务** | 同 MySQL | `SUBMIT QUERY` 秒回 job_id；AT / WINDOW / WHEN / EVERY 周期调度（含每月/每年）；四通道回调 + HMAC；**SCRIPT 后处理管道** | 异步任务 |
-| **S3 对象存储** | `:9000`（HTTP/S） | AWS SigV4（表头/预签名/aws-chunked）；**multipart 分片上传**、版本、对象锁、生命周期、限速、请求策略、上传回调、图片处理、计费 | S3对象存储 |
+| **S3 对象存储** | `:9000`（HTTP/S） | AWS SigV4（表头/预签名/aws-chunked）；**multipart 分片上传**、版本、对象锁、生命周期、限速、请求策略、上传回调、**OpenCV 风格图片预处理（v1.3.7：画框/文字/圈线/灰度/模糊/旋转/翻转）**、计费 | S3对象存储 |
 | **Redis 键值/队列** | `:3309`（mode:redis） | RESP string/list；**BLPOP/BRPOP 阻塞弹出**；TTL 惰性+扫描；**SQLite 落盘重启无损**；每用户命名空间；LRU 淘汰 | 键值队列 |
 | **RabbitMQ 队列** | `:3309`（mode:rabbitmq） | AMQP 0-9-1：direct/fanout/topic、publish/consume/ack/nack/prefetch；**confirm 发布确认 + mandatory 回退**；消息与游标落盘重启不丢 | 消息队列 |
 | **运维与安全** | 全协议 | 用户权限（库/表/IP 授权）、防爆破自动锁、查询 QoS、caching_sha2_password、SQL 审计日志 | 本文 / 配置说明 |
@@ -350,6 +350,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.3.4（16 项） | RESP3 空值帧兼容（`_` null 协商，redis-py ≥8 空值不再挂死）+ RESP2 回归 |
 | v1.3.5（35 项） | UploadPartCopy、未完成上传自动回收、上限可解除；MULTI/EXEC、发布订阅、SCAN 真游标 |
 | v1.3.6（15 项） | 多租户强化（库可见性过滤/DEFAULT_DB/USE 1044/账号级 QPS·并发配额）+ S3 头（版本号·UUID） |
+| v1.3.7（17 项） | OpenCV 风格图片预处理（rectangle/text/circle/line/grayscale/blur/rotate/flip，GET/PUT/另存三链路） |
 | v1.3.3（111 项）+ 重启 | MySQL 8 兼容 M4（运算符/函数/DDL/维护语句/用户变量）、列类型映射（TEXT 落盘/查出还原/类型回放）、时序冷压缩固化（自动解冻）、MQTT ws+tcp 桥接、RabbitMQ 版本串可配置 |
 
 ---
@@ -370,6 +371,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.3.4 | RESP3 空值帧兼容（redis-py ≥8 空值不再挂死） | ✅ |
 | v1.3.5 | S3 拷贝分片/自动回收/上限解除；Redis 事务/发布订阅/SCAN 游标 | ✅ |
 | v1.3.6 | 多租户强化（库过滤/默认库/USE 校验/账号配额）+ S3 响应头 | ✅ |
+| v1.3.7 | OpenCV 风格图片预处理管道（绘制/滤镜/几何 + 处理另存） | ✅ |
 
 各版本完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)；
 未排期候选与设计红线见 [FEATURE.md](FEATURE.md)。

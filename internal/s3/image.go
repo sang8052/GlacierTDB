@@ -24,6 +24,9 @@ type imgParams struct {
 	Quality int    // jpeg 质量（1-100，默认 85）
 	Base64  bool   // GET: 转 base64 输出；PUT: body 为 base64（解码后二进制落盘）
 	DataURL bool   // base64 输出时带 data:image/...;base64, 前缀
+
+	Ops    []imgOp // OpenCV 风格操作管道（v1.3.7）：rectangle/text/circle/line/grayscale/blur/rotate/flip
+	SaveAs string  // POST 处理另存目标（bucket/key，v1.3.7；空 = 不另存）
 }
 
 // parseImgParams 从查询参数解析（x-gimg-*）。
@@ -76,6 +79,18 @@ func parseImgParams(q map[string][]string) (imgParams, bool) {
 			p.Format = "jpeg"
 		}
 	}
+	if v := first(q, "x-gimg-ops"); v != "" {
+		seen = true
+		ops, perr := parseOps(v)
+		if perr != nil {
+			return p, true // 语法错按无参数透传，具体报错由 processImage 给出
+		}
+		p.Ops = ops
+	}
+	if v := first(q, "x-gimg-save-as"); v != "" {
+		seen = true
+		p.SaveAs = v
+	}
 	if v := first(q, "x-gimg-quality"); v != "" {
 		seen = true
 		p.Quality, _ = strconv.Atoi(v)
@@ -120,7 +135,7 @@ func decodeBase64Body(data []byte) ([]byte, error) {
 // processImage 图片加工：解码 → 裁剪 → 缩放 → 编码（格式转换）→（可选）base64。
 // 非图片输入且无 base64 参数时报错；已是目标格式且无加工时原样返回。
 func processImage(data []byte, p imgParams) ([]byte, string, error) {
-	needTransform := !p.Crop.Empty() || p.ResizeW > 0 || p.ResizeH > 0 || p.Format != ""
+	needTransform := !p.Crop.Empty() || p.ResizeW > 0 || p.ResizeH > 0 || p.Format != "" || len(p.Ops) > 0
 	if !needTransform {
 		if p.Base64 {
 			return encodeBase64Out(data, "", p.DataURL), "text/plain; charset=utf-8", nil
@@ -139,6 +154,13 @@ func processImage(data []byte, p imgParams) ([]byte, string, error) {
 			return nil, "", fmt.Errorf("crop region %v outside image bounds %v", p.Crop, b)
 		}
 		src = subImage(src, r)
+	}
+	// OpenCV 风格操作管道（v1.3.7）：绘制/滤镜/几何（绘制坐标基于裁剪后画布）
+	if len(p.Ops) > 0 {
+		src, err = applyOps(src, p.Ops)
+		if err != nil {
+			return nil, "", err
+		}
 	}
 	// 缩放（双线性）
 	if p.ResizeW > 0 || p.ResizeH > 0 {

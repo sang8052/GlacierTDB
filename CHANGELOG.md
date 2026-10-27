@@ -2,6 +2,27 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.7.alpha] - 2026-10-27
+
+### 新增
+- **OpenCV 风格图片预处理管道（S3 `x-gimg-ops`，纯 Go 实现无 CGO）**：
+  - **操作集**（`|` 分隔管道，命名对齐 OpenCV）：`rectangle(x,y,w,h,R,G,B[,thickness])`
+    （`thickness=-1` 填充，对齐 `cv2.FILLED`）、`circle(cx,cy,r,...)`、`line(x1,y1,x2,y2,...)`、
+    `text('label',x,y,R,G,B[,scale])`（对齐 `cv2.putText`，引号内文本可含逗号）、`grayscale`
+    （`cv2.cvtColor` 加权灰度）、`blur(ksize)`（`cv2.blur` 均值滤波）、`rotate(90|180|270)`、
+    `flip(0|1|-1)`（`cv2.flip` 语义）；与既有 `x-gimg-crop/resize/format/quality` 组合，
+    执行顺序 crop → ops → resize → format；
+  - **三条链路**：GET 即时处理返回（预览）；PUT 上传即处理落盘（含 base64 直传）；
+    **POST `?x-gimg-ops=...&x-gimg-save-as=bucket/key`** 已有对象处理后另存新对象
+    （标注结果持久化）；
+  - **文字渲染**：默认内置 bitmap 字体（ASCII）；新配置 `s3.image_font` 指向 ttf/ttc
+    文件后经 opentype 加载，支持中文等 TrueType 字形（新依赖 `golang.org/x/image`）。
+
+### 变更
+- `tests/test_v137.py` 新增 17 项（Pillow 像素级断言：绘制着色/灰度一致/几何转置与互换/
+  blur 边界混合/PUT 落盘/POST 另存/错误路径）；`tests/run_all.sh` 纳入（pip 依赖加 pillow）；
+  全套回归 **ALL TESTS PASSED**（26 脚本 + 三重启持久化）。
+
 ## [1.3.6.alpha] - 2026-10-27
 
 ### 新增

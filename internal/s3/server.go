@@ -73,6 +73,7 @@ type Server struct {
 
 // NewServer 创建 S3 服务。
 func NewServer(cfg *config.Config, store *Store, auths *auth.Store) *Server {
+	SetImageFont(cfg.S3.ImageFont) // v1.3.7：图片文字 ttf 字体（空 = 内置 ASCII）
 	s := &Server{
 		cfg:   cfg,
 		store: store,
@@ -591,6 +592,12 @@ func (h *endpointHandler) handleObject(w http.ResponseWriter, r *http.Request, b
 			h.initiateMultipart(w, r, bucket, key, reqID)
 			return
 		}
+		// POST /{bucket}/{key}?x-gimg-ops=...&x-gimg-save-as=dstBucket/dstKey
+		// → 已有对象执行 OpenCV 风格管道后另存（v1.3.7）
+		if hasImg && img.SaveAs != "" {
+			h.imageProcessSave(w, r, bucket, key, img, owner, reqID)
+			return
+		}
 		writeErr(w, r, reqID, &s3Error{Code: "MethodNotAllowed", Status: 405, Msg: "The specified method is not allowed against this resource"})
 
 	case http.MethodGet, http.MethodHead:
@@ -664,12 +671,57 @@ func (h *endpointHandler) putObject(w http.ResponseWriter, r *http.Request, buck
 			writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: err.Error()})
 			return
 		}
+		// OpenCV 风格操作管道（v1.3.7）：上传即处理落盘
+		//（Base64 标志在此清掉：解码后处理、二进制落盘，防止 processImage 尾部再编码）
+		if len(img.Ops) > 0 || !img.Crop.Empty() || img.ResizeW > 0 || img.ResizeH > 0 || img.Format != "" {
+			procParams := img
+			procParams.Base64 = false
+			processed, ct, perr := processImage(decoded, procParams)
+			if perr != nil {
+				writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: perr.Error()})
+				return
+			}
+			decoded = processed
+			if ct != "" {
+				attrs.ContentType = ct
+			}
+		}
 		m, replaced, perr := h.srv.store.PutObject(bucket, key, bytes.NewReader(decoded), int64(len(decoded)), attrs)
 		if perr != nil {
 			writeErr(w, r, reqID, toS3Err(perr))
 			return
 		}
 		h.finishPut(w, r, bucket, key, m, replaced, owner, reqID)
+		return
+	}
+
+	// 二进制 PUT 带 OpenCV 操作管道（v1.3.7）：全读 → 处理 → 落盘
+	if len(img.Ops) > 0 || !img.Crop.Empty() || img.ResizeW > 0 || img.ResizeH > 0 || img.Format != "" {
+		var raw []byte
+		var rerr error
+		if h.srv.store.maxObject > 0 {
+			raw, rerr = io.ReadAll(io.LimitReader(hr, h.srv.store.maxObject*2))
+		} else {
+			raw, rerr = io.ReadAll(hr)
+		}
+		if rerr != nil {
+			writeErr(w, r, reqID, toS3Err(rerr))
+			return
+		}
+		processed, ct, perr := processImage(raw, img)
+		if perr != nil {
+			writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: perr.Error()})
+			return
+		}
+		if ct != "" {
+			attrs.ContentType = ct
+		}
+		m2, replaced2, perr2 := h.srv.store.PutObject(bucket, key, bytes.NewReader(processed), int64(len(processed)), attrs)
+		if perr2 != nil {
+			writeErr(w, r, reqID, toS3Err(perr2))
+			return
+		}
+		h.finishPut(w, r, bucket, key, m2, replaced2, owner, reqID)
 		return
 	}
 
@@ -700,7 +752,7 @@ func (h *endpointHandler) getObject(w http.ResponseWriter, r *http.Request, buck
 	headOnly := r.Method == http.MethodHead
 
 	// 图片加工链路（裁剪 / 缩放 / 格式转换 / base64 输出）需整体加工
-	if hasImg && (img.ResizeW > 0 || img.ResizeH > 0 || !img.Crop.Empty() || img.Format != "" || img.Base64) {
+	if hasImg && (img.ResizeW > 0 || img.ResizeH > 0 || !img.Crop.Empty() || img.Format != "" || img.Base64 || len(img.Ops) > 0) {
 		m, data, err := h.srv.store.GetObjectBytes(bucket, key, versionID)
 		if err != nil {
 			writeErr(w, r, reqID, toS3Err(err))
@@ -1175,4 +1227,38 @@ func genRequestUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
 	b[8] = (b[8] & 0x3f) | 0x80 // variant
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// imageProcessSave POST ?x-gimg-ops=...&x-gimg-save-as=b/k2 → 读源对象执行操作管道后另存（v1.3.7）。
+func (h *endpointHandler) imageProcessSave(w http.ResponseWriter, r *http.Request, bucket, key string,
+	img imgParams, owner, reqID string) {
+	if len(img.Ops) == 0 {
+		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400,
+			Msg: "x-gimg-save-as requires x-gimg-ops"})
+		return
+	}
+	dst := strings.TrimPrefix(img.SaveAs, "/")
+	dstBucket, dstKey := splitPathStyle(dst)
+	if dstBucket == "" || dstKey == "" {
+		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400,
+			Msg: "x-gimg-save-as expects bucket/key"})
+		return
+	}
+	_, data, err := h.srv.store.GetObjectBytes(bucket, key, "")
+	if err != nil {
+		writeErr(w, r, reqID, toS3Err(err))
+		return
+	}
+	out, ct, perr := processImage(data, img)
+	if perr != nil {
+		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: perr.Error()})
+		return
+	}
+	attrs := ObjectAttrs{ContentType: ct, Metadata: map[string]string{}}
+	m, replaced, perr2 := h.srv.store.PutObject(dstBucket, dstKey, bytes.NewReader(out), int64(len(out)), attrs)
+	if perr2 != nil {
+		writeErr(w, r, reqID, toS3Err(perr2))
+		return
+	}
+	h.finishPut(w, r, dstBucket, dstKey, m, replaced, owner, reqID)
 }

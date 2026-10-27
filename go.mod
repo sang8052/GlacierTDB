@@ -8,6 +8,7 @@ require (
 	github.com/rabbitmq/amqp091-go v1.10.0
 	github.com/segmentio/kafka-go v0.4.47
 	gopkg.in/yaml.v3 v3.0.1
+	golang.org/x/image v0.18.0 // 图片文字渲染（opentype 字体）
 )
 
 require (

@@ -137,6 +137,7 @@ s3:
   bucket_limits: {}         # 按桶覆盖，如 backup: { per_conn_bps: 1048576 }
   lifecycle_interval_sec: 3600   # 生命周期（自动删除）扫描周期
   callback_secret: ""       # 上传回调默认 HMAC 签名密钥（桶级 SET S3 CALLBACK 覆盖）
+  # image_font: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf  # 图片文字 ttf 字体（v1.3.7；空=内置 ASCII）
 
 log:
   level: info              # debug | info | warn | error

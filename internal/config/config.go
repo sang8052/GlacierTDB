@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.3.6.alpha"
+const GlacierVersion = "1.3.7.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -119,6 +119,7 @@ type S3Opts struct {
 	LifecycleIntervalSec int `yaml:"lifecycle_interval_sec"` // 生命周期（自动删除）扫描周期
 	AbortIncompleteDays  int `yaml:"abort_incomplete_days"`  // 未完成分片上传自动回收天数（v1.3.5；默认 7，0=关闭）
 	CallbackSecret  string   `yaml:"callback_secret"`        // 上传回调默认 HMAC 签名密钥
+	ImageFont       string   `yaml:"image_font"`             // 图片文字渲染 ttf 字体路径（v1.3.7；空 = 内置 ASCII）
 }
 
 // KVOpts Redis 键值/队列（v1.2.0，mode:redis 同端口 RESP 服务）。
