@@ -34,7 +34,9 @@ var (
 	reAdminShowQos  = regexp.MustCompile(`(?i)^SHOW\s+QOS\s*$`)
 
 	// ---- 用户权限管理（v1.0.10）----
-	reAdminCreateUser = regexp.MustCompile(`(?i)^CREATE\s+USER\s+'([^']{1,64})'(?:\s*@\s*'([^']{1,64})')?\s+IDENTIFIED\s+(?:WITH\s+([A-Za-z0-9_]+)\s+)?BY\s+'([^']{1,64})'(?:\s+(SUPER|READONLY|USER))?\s*$`)
+	reAdminCreateUser = regexp.MustCompile(`(?i)^CREATE\s+USER\s+'([^']{1,64})'(?:\s*@\s*'([^']{1,64})')?\s+IDENTIFIED\s+(?:WITH\s+([A-Za-z0-9_]+)\s+)?BY\s+'([^']{1,64})'(?:\s+(SUPER|READONLY|USER))?(?:\s+DEFAULT_DB\s+([A-Za-z0-9_\-]+))?\s*$`)
+	reAdminUserDB     = regexp.MustCompile(`(?i)^SET\s+USER\s+'?([A-Za-z0-9_\-]+)'?\s+DEFAULT_DB\s+([A-Za-z0-9_\-]+)\s*$`)
+	reAdminUserQoS    = regexp.MustCompile(`(?i)^SET\s+USER\s+'?([A-Za-z0-9_\-]+)'?\s+QOS\s+(QPS\s*=\s*(\d+)\s+CONCURRENCY\s*=\s*(\d+)|CONCURRENCY\s*=\s*(\d+)\s+QPS\s*=\s*(\d+)|QPS\s*=\s*(\d+)|CONCURRENCY\s*=\s*(\d+)|CLEAR)\s*$`)
 	reAdminDropUser   = regexp.MustCompile(`(?i)^DROP\s+USER\s+'([^']{1,64})'(?:\s*@\s*'[^']*')?\s*$`)
 	reAdminRenameUser = regexp.MustCompile(`(?i)^RENAME\s+USER\s+'([^']{1,64})'\s+TO\s+'([^']{1,64})'\s*$`)
 	reAdminAlterType  = regexp.MustCompile(`(?i)^ALTER\s+USER\s+'([^']{1,64})'\s+(SUPER|READONLY|USER)\s*$`)
@@ -223,6 +225,40 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		logx.Infof("auth password changed for %s via admin command (by conn %d)", target, h.connID)
 		return meta.OKResultPub(), true, nil
 
+	// SET USER 'name' DEFAULT_DB db / SET USER 'name' QOS ...（v1.3.6 多租户）
+	case reAdminUserDB.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminUserDB.FindStringSubmatch(q)
+		if err := h.auths.SetDefaultDB(m[1], m[2]); err != nil {
+			return nil, true, mysql.NewError(1105, err.Error())
+		}
+		logx.Infof("user %s default_db set to %s by conn %d", m[1], m[2], h.connID)
+		return meta.OKResultPub(), true, nil
+
+	case reAdminUserQoS.MatchString(q):
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
+		}
+		m := reAdminUserQoS.FindStringSubmatch(q)
+		switch {
+		case strings.EqualFold(m[2], "CLEAR"):
+			if err := h.auths.ClearQuota(m[1]); err != nil {
+				return nil, true, mysql.NewError(1105, err.Error())
+			}
+		default:
+			// 两种参数序 + 单参形态归一（组：QPS/CONC, CONC/QPS, QPS, CONC）
+			var qps, conc int64
+			fmt.Sscanf(m[3]+m[6]+m[7], "%d", &qps)
+			fmt.Sscanf(m[4]+m[5]+m[8], "%d", &conc)
+			if err := h.auths.SetQuota(m[1], qps, conc); err != nil {
+				return nil, true, mysql.NewError(1105, err.Error())
+			}
+			logx.Infof("user %s quota set: qps=%d concurrency=%d by conn %d", m[1], qps, conc, h.connID)
+		}
+		return meta.OKResultPub(), true, nil
+
 	case reAdminSetConc.MatchString(q):
 		if h.readonly {
 			return nil, true, roErr()
@@ -304,7 +340,7 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 				typ = auth.TypeReadonly
 			}
 		}
-		if err := h.auths.CreateUser(m[1], m[4], m[2], typ, m[3]); err != nil {
+		if err := h.auths.CreateUser(m[1], m[4], m[2], typ, m[3], m[6]); err != nil {
 			return nil, true, mysql.NewError(1396, "create user failed: "+err.Error())
 		}
 		logx.Infof("user %s@%s created (type=%s, plugin=%s) by conn %d", m[1], m[2], typ, m[3], h.connID)
@@ -475,7 +511,7 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 			cols = []string{"scope", "qps", "concurrency", "rows_per_sec", "passed", "queued", "rejected", "waiting", "avg_wait_ms"}
 			rows = h.qosRows()
 		case "users":
-			cols = []string{"username", "account_type", "default_db", "locked", "locked_until"}
+			cols = []string{"username", "account_type", "default_db", "qps", "concurrency", "locked", "locked_until"}
 			rows = h.userRows()
 		case "user_grants":
 			cols = []string{"username", "db_name", "table_name", "privs", "grant_option"}
@@ -718,7 +754,7 @@ func (h *Handler) qosRows() [][]any {
 func (h *Handler) userRows() [][]any {
 	var rows [][]any
 	for _, u := range h.auths.Users() {
-		rows = append(rows, []any{u.Username, u.Type, u.DefaultDB, b2s(u.Locked), u.LockedTo})
+		rows = append(rows, []any{u.Username, u.Type, u.DefaultDB, u.QPS, u.Concurrency, b2s(u.Locked), u.LockedTo})
 	}
 	return rows
 }

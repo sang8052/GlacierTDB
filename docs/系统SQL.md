@@ -115,6 +115,9 @@ SET DB_READ_THREADS backup = 0;       -- 0 = 删除覆盖，回到全局默认
 
 ```sql
 CREATE USER 'u1'@'%' IDENTIFIED BY 'pwd';          -- host 省略 = '%'；可加 SUPER/READONLY/USER
+CREATE USER 't1' IDENTIFIED BY 'pwd' USER DEFAULT_DB db_a;  -- 租户默认库（v1.3.6，登录即落该库）
+SET USER 't1' DEFAULT_DB db_b;                       -- 热改默认库（v1.3.6）
+SET USER 't1' QOS QPS=5 CONCURRENCY=2;              -- 账号级配额（v1.3.6；QPS/CONCURRENCY 单参亦可；CLEAR 清除）
 CREATE USER 'u2'@'192.168.1.%' IDENTIFIED BY 'pwd' READONLY;
 ALTER USER 'u1' IDENTIFIED BY 'newpwd';            -- 改密（= SET PASSWORD FOR 'u1'）
 ALTER USER 'u1' READONLY;                          -- 账号类型热切换 SUPER/READONLY/USER

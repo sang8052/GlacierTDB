@@ -98,6 +98,9 @@ func isEngines(*Ctx) ([]string, [][]any, error) {
 func isSchemata(ctx *Ctx) ([]string, [][]any, error) {
 	var rows [][]any
 	for _, d := range ctx.Sess.ListDatabases() {
+		if ctx.DBVisible != nil && !ctx.DBVisible(d) {
+			continue // 多租户：USER 类型账号仅见授权库（v1.3.6）
+		}
 		rows = append(rows, []any{"def", d, "utf8mb4", "utf8mb4_0900_ai_ci", nil})
 	}
 	return []string{"CATALOG_NAME", "SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME", "SQL_PATH"}, rows, nil

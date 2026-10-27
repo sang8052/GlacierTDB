@@ -42,6 +42,8 @@ type User struct {
 	DefaultDB string
 	Locked    bool
 	LockedTo  string // 自动锁定到期（空 = 无）
+	QPS        int64 // 账号级配额（v1.3.6；0 = 不限）
+	Concurrency int64
 }
 
 // HostRow IP 授权行。
@@ -96,6 +98,9 @@ type Store struct {
 
 	failMu sync.Mutex
 	fails  map[string][]time.Time // 窗口内失败时间戳（key: ip:<ip> / acct:<user>）
+
+	quotaMu    sync.Mutex
+	quotaCache map[string][2]int64 // 账号级配额缓存（v1.3.6；[qps, concurrency]）
 }
 
 // Open 打开系统库、建表并做首次迁移（users 表为空时从 bootstrap 升级）。
@@ -106,6 +111,7 @@ func Open(db *sql.DB, boot Bootstrap, lockCfg config.LockOpts) (*Store, error) {
 		boot:   boot,
 		client: &http.Client{Timeout: 10 * time.Second},
 		fails:  make(map[string][]time.Time),
+		quotaCache: map[string][2]int64{},
 	}
 	s.fw = newFirewallCtl(lockCfg.Firewall)
 	if _, err := db.Exec(`
@@ -141,6 +147,12 @@ CREATE TABLE IF NOT EXISTS login_attempts (
   username TEXT NOT NULL DEFAULT '',
   success  INTEGER NOT NULL DEFAULT 0,
   reason   TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS user_quotas (
+  username    TEXT PRIMARY KEY,
+  qps         INTEGER NOT NULL DEFAULT 0,
+  concurrency INTEGER NOT NULL DEFAULT 0,
+  updated_ts  TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS lock_state (
   lock_key   TEXT PRIMARY KEY,
@@ -491,7 +503,9 @@ func (s *Store) UnlockIP(ip string) error {
 
 // Users 全部账户。
 func (s *Store) Users() []User {
-	rows, err := s.db.Query(`SELECT username,password,account_type,default_db,locked,locked_until FROM users ORDER BY username`)
+	rows, err := s.db.Query(`SELECT u.username,u.password,u.account_type,u.default_db,u.locked,u.locked_until,
+		COALESCE(q.qps,0),COALESCE(q.concurrency,0)
+		FROM users u LEFT JOIN user_quotas q ON q.username=u.username ORDER BY u.username`)
 	if err != nil {
 		return nil
 	}
@@ -500,7 +514,7 @@ func (s *Store) Users() []User {
 	for rows.Next() {
 		var u User
 		var locked int
-		if err := rows.Scan(&u.Username, &u.Password, &u.Type, &u.DefaultDB, &locked, &u.LockedTo); err == nil {
+		if err := rows.Scan(&u.Username, &u.Password, &u.Type, &u.DefaultDB, &locked, &u.LockedTo, &u.QPS, &u.Concurrency); err == nil {
 			u.Locked = locked != 0
 			out = append(out, u)
 		}
@@ -595,7 +609,7 @@ func (s *Store) Locks() []LockRow {
 // ---------------------------------------------------------------------------
 
 // CreateUser 创建账户（默认 host '%'；plugin 空 = mysql_native_password）。
-func (s *Store) CreateUser(username, password, host, typ, plugin string) error {
+func (s *Store) CreateUser(username, password, host, typ, plugin, defaultDB string) error {
 	if username == "" || strings.ContainsAny(username, "'\"`") {
 		return fmt.Errorf("invalid user name %q", username)
 	}
@@ -613,7 +627,7 @@ func (s *Store) CreateUser(username, password, host, typ, plugin string) error {
 		host = "%"
 	}
 	if _, err := s.db.Exec(`INSERT INTO users(username,password,account_type,auth_plugin,default_db,created_ts,updated_ts) VALUES(?,?,?,?,?,?,?)`,
-		username, password, typ, plugin, "", now, now); err != nil {
+		username, password, typ, plugin, defaultDB, now, now); err != nil {
 		return err
 	}
 	_, err = s.db.Exec(`INSERT OR IGNORE INTO user_hosts(username,host_pattern) VALUES(?,?)`, username, host)
@@ -1030,4 +1044,95 @@ func runCmd(name string, args ...string) error {
 		return fmt.Errorf("%s %v: %v (%s)", name, args, err, truncateStr(string(out), 200))
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// 多租户增强（v1.3.6）：DEFAULT_DB / 库级授权探测 / 账号级配额
+// ---------------------------------------------------------------------------
+
+// SetDefaultDB 设置账号默认库（CREATE USER DEFAULT_DB / SET USER DEFAULT_DB）。
+func (s *Store) SetDefaultDB(username, db string) error {
+	res, err := s.db.Exec(`UPDATE users SET default_db=?, updated_ts=? WHERE username=?`,
+		db, time.Now().Format("2006-01-02 15:04:05"), username)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("unknown user '%s'", username)
+	}
+	return nil
+}
+
+// HasDBGrant 判断账号在指定库上是否有任意授权（USE 权限校验 / SHOW DATABASES 过滤用；
+// db_name='*' 的通配授权对任意库生效）。
+func (s *Store) HasDBGrant(username, db string) bool {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM user_grants WHERE username=? AND (db_name=? OR db_name='*')`,
+		username, db).Scan(&n)
+	return err == nil && n > 0
+}
+
+// GrantedDBs 账号被授权的库集合（'*' 通配时返回 nil 表示全部可见）。
+func (s *Store) GrantedDBs(username string) (map[string]bool, bool) {
+	set := map[string]bool{}
+	rows, err := s.db.Query(`SELECT db_name FROM user_grants WHERE username=?`, username)
+	if err != nil {
+		return nil, false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var db string
+		if rows.Scan(&db) == nil {
+			if db == "*" {
+				return nil, true // 通配全库
+			}
+			set[db] = true
+		}
+	}
+	return set, len(set) > 0
+}
+
+// SetQuota 设置账号级配额（qps/concurrency，0 = 不限；v1.3.6）。
+func (s *Store) SetQuota(username string, qps, concurrency int64) error {
+	if qps < 0 || concurrency < 0 {
+		return fmt.Errorf("quota values must be >= 0")
+	}
+	res, err := s.db.Exec(`INSERT INTO user_quotas(username,qps,concurrency,updated_ts) VALUES(?,?,?,?)
+		ON CONFLICT(username) DO UPDATE SET qps=excluded.qps, concurrency=excluded.concurrency, updated_ts=excluded.updated_ts`,
+		username, qps, concurrency, time.Now().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		return err
+	}
+	_ = res
+	s.quotaMu.Lock()
+	s.quotaCache[username] = [2]int64{qps, concurrency}
+	s.quotaMu.Unlock()
+	return nil
+}
+
+// ClearQuota 清除账号配额（恢复不限）。
+func (s *Store) ClearQuota(username string) error {
+	_, err := s.db.Exec(`DELETE FROM user_quotas WHERE username=?`, username)
+	s.quotaMu.Lock()
+	delete(s.quotaCache, username)
+	s.quotaMu.Unlock()
+	return err
+}
+
+// QuotaFor 取账号配额（内存缓存优先；0,0 = 不限）。
+func (s *Store) QuotaFor(username string) (qps, concurrency int64) {
+	s.quotaMu.Lock()
+	if q, ok := s.quotaCache[username]; ok {
+		s.quotaMu.Unlock()
+		return q[0], q[1]
+	}
+	s.quotaMu.Unlock()
+	var q, c int64
+	if err := s.db.QueryRow(`SELECT qps,concurrency FROM user_quotas WHERE username=?`, username).Scan(&q, &c); err != nil {
+		q, c = 0, 0
+	}
+	s.quotaMu.Lock()
+	s.quotaCache[username] = [2]int64{q, c}
+	s.quotaMu.Unlock()
+	return q, c
 }

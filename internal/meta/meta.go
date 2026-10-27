@@ -31,6 +31,11 @@ type Ctx struct {
 	ConnID  uint64
 	Remote  string
 	Sess    Querier
+
+	// 多租户过滤（v1.3.6；nil = 不限）：USER 类型账号按授权库过滤 SHOW DATABASES /
+	// information_schema.SCHEMATA；USE 切库前校验。
+	DBVisible func(db string) bool
+	CanUseDB  func(db string) error
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +340,11 @@ func HandleProbe(ctx *Ctx, q string) (res *Result, handled bool, err error) {
 	}
 	if m := reUse.FindStringSubmatch(q); m != nil {
 		db := strings.Trim(strings.TrimSpace(m[1]), "`\"';")
+		if ctx.CanUseDB != nil {
+			if err := ctx.CanUseDB(db); err != nil {
+				return nil, true, err
+			}
+		}
 		if err := ctx.Sess.Use(db); err != nil {
 			if strings.Contains(err.Error(), "transaction open") {
 				return nil, true, NewMySQLError(1192, err.Error())
@@ -474,6 +484,9 @@ func handleShow(ctx *Ctx, q string) (*Result, bool, error) {
 		}
 		for _, d := range ctx.Sess.ListDatabases() {
 			if pat != "" && !likeMatch(pat, d) {
+				continue
+			}
+			if ctx.DBVisible != nil && !ctx.DBVisible(d) {
 				continue
 			}
 			rows = append(rows, []any{d})

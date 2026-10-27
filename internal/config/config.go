@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.3.5.alpha"
+const GlacierVersion = "1.3.6.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -220,9 +220,9 @@ func Default() *Config {
 		ServerVersion: "8.99.999",
 		Auth: Auth{
 			User:             "glacier",
-			Password:         "iloveyou~",
+			Password:         "GlacierTDB@2026",
 			ReadOnlyUser:     "glacier_ro",
-			ReadOnlyPassword: "iloveyou~",
+			ReadOnlyPassword: "", // 默认只建 glacier 管理账号；需要只读账号时在此配置密码启用（v1.3.6）
 		},
 		MemoryLimitMB:  0,
 		MaxConnections: 64,

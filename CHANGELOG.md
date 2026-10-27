@@ -2,6 +2,20 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.6.alpha] - 2026-10-27
+
+### 新增
+- **多租户强化（补齐 4 项缺口）**：
+  - **库可见性过滤**：USER 类型账号 `SHOW DATABASES` / `information_schema.SCHEMATA` 仅显示被授权的库（`GRANT ... ON db.*` 授权集合；`ON *.*` 通配全库）——不再向租户泄露其他库存在性；
+  - **CREATE USER ... DEFAULT_DB**：`CREATE USER 't1' IDENTIFIED BY '...' USER DEFAULT_DB db_a`（或 `SET USER 't1' DEFAULT_DB db_a` 热改）——租户登录即落自己的库（不再落全局 `backup`）；
+  - **USE 权限校验**：USER 类型 `USE <db>` 无授权报 `1044 Access denied`（此前切库成功仅语句被拒）；
+  - **账号级配额**：`SET USER 't1' QOS QPS=5 CONCURRENCY=2`（或单参 / `CLEAR` 清除）——USER 类型每条语句按账号 QPS 最小间隔节流（等待语义）+ 并发执行上限（信号量），配额落系统库 `user_quotas` 热改即生效；`SHOW USERS` / `SELECT * FROM users` 新增 `qps` / `concurrency` 列。
+- **S3 响应头**：`Server: GlacierTDB/<版本号>`（如 `GlacierTDB/1.3.6.alpha`）；`x-amz-request-id` 由 12 位短随机改为 **36 位 UUID v4**。
+
+### 变更
+- **默认配置仅建一个管理账号**：`auth.password` 默认改为 `GlacierTDB@2026`；`readonly_password` 默认空 = **不创建** `glacier_ro`（需要只读账号时在配置中填密码启用）——此前默认 `iloveyou~` 并自动创建只读账号；
+- `tests/test_v136.py` 新增 15 项（可见性过滤 / DEFAULT_DB / USE 1044 / REVOKE-GRANT 回归 / QPS 节流与 CLEAR / S3 头）；全套回归 **ALL TESTS PASSED**（25 脚本 + 三重启持久化）。
+
 ## [1.3.5.alpha] - 2026-10-27
 
 ### 新增

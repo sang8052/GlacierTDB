@@ -13,10 +13,10 @@ memory_limit_mb: 0     # Go 运行时软内存上限（0 = 不限制）
 max_connections: 64    # 最大并发客户端连接数（超限直接断开）
 
 auth:
-  user: glacier            # 固定值，配置其他名字会被忽略
-  password: "changeme"     # mysql_native_password；管理面 SET PASSWORD 热改后以此文件为重启基线
+  user: glacier            # 固定值，配置其他名字会被忽略；默认仅此一个管理账号（v1.3.6）
+  password: "GlacierTDB@2026"   # 初始密码（首次启动引导进系统库；管理面 SET PASSWORD 热改后以此文件为重启基线）
   readonly_user: glacier_ro     # 只读账号（v1.0.9）：同等认证，仅允许查询与管理面查看
-  readonly_password: "changeme" # 只读账号密码；SET PASSWORD FOR glacier_ro='新密码' 热改；空 = 禁用只读登录
+  readonly_password: ""         # 默认禁用（空 = 不创建只读账号）；需要时填密码启用
 
 sqlite:
   synchronous: NORMAL      # OFF | NORMAL | FULL | EXTRA（持久化强度）

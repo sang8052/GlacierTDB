@@ -2,6 +2,7 @@ package s3
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
@@ -151,9 +152,9 @@ type endpointHandler struct {
 
 func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s := h.srv
-	reqID := genVersionID()[:12]
+	reqID := genRequestUUID()
 	w.Header().Set("x-amz-request-id", reqID)
-	w.Header().Set("Server", "GlacierTDB")
+	w.Header().Set("Server", "GlacierTDB/"+config.GlacierVersion)
 
 	// 计费导出接口（供计费系统拉取）
 	if strings.HasPrefix(r.URL.Path, "/_glacier/") {
@@ -1165,4 +1166,13 @@ func (c *hashCheckReader) Read(p []byte) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// genRequestUUID 请求 ID（UUID v4，36 字符；v1.3.6 起替代 12 位短随机）。
+func genRequestUUID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }

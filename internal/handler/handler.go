@@ -117,6 +117,12 @@ func (h *Handler) BindConn(mc *server.Conn) {
 		}
 	}
 	mc.SetStatus(mysql.SERVER_STATUS_AUTOCOMMIT)
+	// 多租户（v1.3.6）：账号配置了 DEFAULT_DB 则登录即落该库（GlacierTDB 管理库除外）
+	if u := mc.GetUser(); u != "" && h.session != nil && h.userType == auth.TypeUser && h.auths != nil {
+		if info, ok, _ := h.auths.Lookup(u); ok && info.DefaultDB != "" {
+			_ = h.session.Use(info.DefaultDB)
+		}
+	}
 	if h.registry != nil {
 		h.registry.Add(h.connID, h)
 	}
@@ -265,6 +271,9 @@ func (h *Handler) auditSQL(start time.Time, query string, res *mysql.Result, err
 // handleQueryInner 原查询处理主流程。
 func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 	start := time.Now()
+	// 账号级配额（v1.3.6）：QPS 节流 + 并发上限（USER 类型；无配额零开销）
+	releaseQuota := h.acquireUserQuota()
+	defer releaseQuota()
 	logx.Debugf("query [conn %d db=%s]: %s", h.connID, h.session.CurrentDB(), truncate(query, 300))
 	h.mu.Lock()
 	h.lastQuery = truncate(query, 200)
@@ -379,6 +388,25 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 		ConnID:  h.connID,
 		Remote:  h.remote,
 		Sess:    h.session,
+	}
+	// 多租户（v1.3.6）：USER 类型账号按授权过滤库可见性 + USE 切库校验
+	if h.userType == auth.TypeUser && h.auths != nil {
+		ctx.DBVisible = func(db string) bool {
+			vis, any := h.auths.GrantedDBs(h.user)
+			if !any {
+				return false
+			}
+			if vis == nil {
+				return true // '*' 通配全库
+			}
+			return vis[db]
+		}
+		ctx.CanUseDB = func(db string) error {
+			if !h.auths.HasDBGrant(h.user, db) {
+				return mysql.NewError(1044, "Access denied for user '"+h.user+"' to database '"+db+"'")
+			}
+			return nil
+		}
 	}
 
 	// 1) 探活/元语句
