@@ -2,6 +2,21 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.5.alpha] - 2026-10-27
+
+### 新增
+- **S3 限制清理**：
+  - **UploadPartCopy（分片拷贝）**：`PUT ?partNumber=N&uploadId=X` 携带 `x-amz-copy-source`（可带 `versionId`）从源对象拷贝分片，免网络重传；可选 `x-amz-copy-source-range: bytes=first-last`（闭区间）；应答为 `CopyPartResult` XML（ETag/LastModified 在 body）；拷贝分片与直传分片可混合 Complete；源不存在 `NoSuchKey`、越界 Range 400；
+  - **未完成上传自动生命周期回收**：新配置 `s3.abort_incomplete_days`（默认 7，0=关闭）——生命周期周期任务（`lifecycle_interval_sec`）自动 Abort 超龄未完成分片会话并回收分片存储；`SHOW SERVER CONFIG` 暴露 `s3.abort_incomplete_days`；
+  - **单对象上限可解除**：`s3.max_object_mb` 支持负值（如 `-1`）= 不限制（对象与分片大小校验全部放行，分块存储本为流式不受内存约束）；base64 图片直传路径同步适配。
+- **Redis 限制清理（kv 引擎重构为 session 化 dispatch）**：
+  - **事务**：`MULTI` / `EXEC` / `DISCARD`——命令入队应答 `QUEUED`，`EXEC` 返回逐条结果数组（数组元素可为任意帧；单条错误不中断后续）；嵌套 MULTI / 事务外 EXEC·DISCARD 报错；`WATCH` 明确报不支持（队列执行语义）；事务内推送帧一并写入应答数组保序；
+  - **发布订阅**：`SUBSCRIBE` / `UNSUBSCRIBE` / `PSUBSCRIBE` / `PUNSUBSCRIBE` / `PUBLISH`——确认帧 `[kind, name, :count]`（integer 计数）、消息帧 `[message, ch, payload]` / `[pmessage, pattern, ch, payload]`；同连接 channel+pattern 双收（Redis 语义）；`PUBLISH` 返回去重接收连接数；按命名空间隔离（跨账号不可见）；连接断开自动注销；
+  - **SCAN 真游标**：`SCAN cursor [MATCH p] [COUNT n] [TYPE t]`——排序快照 + 索引游标，每批返回 COUNT（默认 10，上限 10000）个匹配 key，游标推进直至 0；遍历期间写入可能漏见/重见（Redis 游标语义允许）；`redis-cli --scan` / `scan_iter` 多批遍历实测与 `KEYS` 等价。
+
+### 变更
+- `tests/test_v135.py` 新增 35 项（UploadPartCopy 整对象/Range/越界/混合合并、会话滞留与自动回收配置、MULTI/EXEC 全语义、发布订阅全链路含 redis-py pubsub、SCAN 游标遍历）；`tests/run_all.sh` 纳入；全套回归 **ALL TESTS PASSED**（24 脚本 + 三重启持久化）。
+
 ## [1.3.4.alpha] - 2026-10-27
 
 ### 修复

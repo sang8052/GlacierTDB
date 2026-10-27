@@ -82,7 +82,8 @@ type Store struct {
 
 	inlineMax int64
 	chunkSize int64
-	maxObject int64
+	maxObject             int64
+	abortIncompleteDays   int
 
 	limits       config.S3Limit
 	bucketLimits map[string]config.S3Limit
@@ -101,6 +102,7 @@ func Open(backend *sqlite.Backend, cfg *config.Config) (*Store, error) {
 		inlineMax:    int64(cfg.S3.InlineMaxKB) << 10,
 		chunkSize:    int64(cfg.S3.ChunkKB) << 10,
 		maxObject:    int64(cfg.S3.MaxObjectMB) << 20,
+		abortIncompleteDays: cfg.S3.AbortIncompleteDays,
 		limits:       cfg.S3.Limits,
 		bucketLimits: cfg.S3.BucketLimits,
 	}
@@ -640,6 +642,11 @@ func (s *Store) RunLifecycle() int {
 	}
 	if deleted > 0 {
 		logx.Infof("s3: lifecycle deleted %d expired objects", deleted)
+	}
+	// 未完成分片上传自动回收（v1.3.5：s3.abort_incomplete_days，默认 7 天）
+	if n := s.AbortStaleUploads(s.abortIncompleteDays); n > 0 {
+		logx.Infof("s3: lifecycle aborted %d stale multipart uploads (>%dd)", n, s.abortIncompleteDays)
+		deleted += n
 	}
 	return deleted
 }

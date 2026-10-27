@@ -8,7 +8,7 @@
 
 > 🤖 **本项目全程由 GLM5.3 驱动。**
 
-**当前版本：v1.3.4.alpha** · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
+**当前版本：v1.3.5.alpha** · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
 （三平台 + SHA256SUMS）· 许可：MIT
 
 | 📄 文档 | 说明 |
@@ -155,7 +155,7 @@ AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked`），boto3 
 
 - 一 bucket 一表（`glacier_s3.db`）+ 大对象分块；桶从属用户、命名空间隔离；
 - **AK/SK**：AK 32 位 `AS` 前缀 / SK 48 位 `SK` 前缀，签发/轮换/禁用/吊销（SK 明文仅一次可见）；
-- PUT/GET/HEAD/DELETE/COPY、ListObjects V1/V2、ListObjectVersions；**multipart 分片上传**（Initiate/UploadPart/Complete/Abort/ListParts/ListMultipartUploads，复合 ETag 对齐 S3 语义）；
+- PUT/GET/HEAD/DELETE/COPY、ListObjects V1/V2、ListObjectVersions；**multipart 分片上传**（Initiate/UploadPart/Complete/Abort/ListParts/ListMultipartUploads，复合 ETag 对齐 S3 语义）；**UploadPartCopy 拷贝分片（v1.3.5）**——`x-amz-copy-source [+range]` 服务端拷贝免重传，与直传分片混合合并；**未完成上传自动回收**（`s3.abort_incomplete_days`，默认 7 天）；**单对象上限可解除**（`max_object_mb: -1` 不限制，分块存储流式）；
 - **多版本 + 对象锁（WORM/legal hold）+ 生命周期自动删除**；
 - **下载限速**：单连接 / 用户总带宽（多连接合并）/ 并发上限；**请求策略**（UA/IP/Referer/自定义 header 条件）；**上传回调**（HMAC 签名）；
 - **图片处理**：裁剪 / 缩放 / 格式转换 / base64 输出与直传；
@@ -165,6 +165,8 @@ AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked`），boto3 
 ### 6. Redis 键值/队列（v1.2.0，`kv.enable`）
 
 - RESP 服务（`mode:redis` 或嗅探）：string `GET/SET(EX·PX·NX·XX)/DEL/EXISTS/APPEND/INCR 族/MGET/MSET/KEYS/TYPE` + list 队列 `LPUSH/RPUSH/LPOP/RPOP/LLEN/LRANGE`；
+- **事务与发布订阅（v1.3.5）**：`MULTI/EXEC/DISCARD`（EXEC 返回逐条结果数组）；`SUBSCRIBE/PSUBSCRIBE/PUBLISH`（message/pmessage 推送、同连接 channel+pattern 双收、按账号命名空间隔离）；
+- **SCAN 真游标（v1.3.5）**：`SCAN cursor [MATCH][COUNT][TYPE]` 每批 COUNT 个、游标推进，`--scan`/`scan_iter` 多批遍历与 `KEYS` 等价；
 - **阻塞弹出（v1.3.2）**：`BLPOP/BRPOP key [key…] timeout`——按序取首个非空队列，Push 立即唤醒、超时返回空数组（`0` = 无限等待）；
 - **HELLO/SCAN（v1.3.3）**：`HELLO` 最小应答（server map + `proto:2`，**redis-py ≥ 8 默认 RESP3 握手直连可用**）；`SCAN cursor [MATCH][COUNT][TYPE]` 单批全量 + 游标恒 0（`redis-cli --scan` / `scan_iter` 可用）；**RESP3 空值兼容（v1.3.4）**——`HELLO 3` 连接的空值应答发 RESP3 null 帧 `_`（redis-py ≥8 的 GET miss/MGET/BLPOP 超时不再挂死），RESP2 连接维持 `$-1`/`*-1`；
 - **TTL**：惰性过期 + 定期扫描；**变更实时写 SQLite（`glacier_kv.db`）重启无损**；
@@ -346,6 +348,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.3.1（44 项） | multipart 分片上传全流程（复合 ETag/Abort/ListParts）、每月/每年调度（月尾 clamp）、PHP SCRIPT 错误路径 |
 | v1.3.2（13 项） | BLPOP/BRPOP 阻塞弹出（唤醒/超时/方向）、publisher confirm 逐条 ack、mandatory 回退 312 NO_ROUTE |
 | v1.3.4（16 项） | RESP3 空值帧兼容（`_` null 协商，redis-py ≥8 空值不再挂死）+ RESP2 回归 |
+| v1.3.5（35 项） | UploadPartCopy、未完成上传自动回收、上限可解除；MULTI/EXEC、发布订阅、SCAN 真游标 |
 | v1.3.3（111 项）+ 重启 | MySQL 8 兼容 M4（运算符/函数/DDL/维护语句/用户变量）、列类型映射（TEXT 落盘/查出还原/类型回放）、时序冷压缩固化（自动解冻）、MQTT ws+tcp 桥接、RabbitMQ 版本串可配置 |
 
 ---
@@ -364,6 +367,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.3.2 | Redis BLPOP/BRPOP 阻塞弹出、AMQP confirm 发布确认 + mandatory 回退 | ✅ |
 | v1.3.3 | MySQL 8 兼容 M4、列类型映射、时序冷压缩固化、MQTT（ws/tcp）接入 + 版本串可配置 | ✅ |
 | v1.3.4 | RESP3 空值帧兼容（redis-py ≥8 空值不再挂死） | ✅ |
+| v1.3.5 | S3 拷贝分片/自动回收/上限解除；Redis 事务/发布订阅/SCAN 游标 | ✅ |
 
 各版本完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)；
 未排期候选与设计红线见 [FEATURE.md](FEATURE.md)。
@@ -376,7 +380,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 
 - 不支持预处理语句（`COM_STMT_*`），客户端走文本协议；不支持 TLS / XA / `LOAD DATA` / `LOCK TABLES` / 复制协议（公网暴露请前置认证代理）；
 - S3 multipart 为基础分片上传（无 UploadPartCopy / 未完成上传自动生命周期，未完成会话需 Abort 或 `DROP BUCKET FORCE` 回收）；单对象上限 `max_object_mb`；
-- Redis 为 RESP2（`HELLO` 应答 `proto:2` 自动降级不升级 RESP3；无事务/发布订阅；BLPOP/BRPOP 单连接串行阻塞，`timeout=0` 无限等待；SCAN 为单批全量简化实现）；
+- Redis 为 RESP2（`HELLO` 应答 `proto:2` 自动降级不升级 RESP3；BLPOP/BRPOP 单连接串行阻塞，`timeout=0` 无限等待；事务为队列执行语义无 WATCH；SCAN 为快照游标——遍历期间写入可能漏见/重见）；
 - AMQP 为基本队列（无镜像/仲裁队列、无事务性队列；confirm 为逐条 ack、无 `immediate` 位；pika 1.4.4 客户端 close() 有自身 bug，见消息队列手册）。
 
 **语义层**

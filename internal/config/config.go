@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.3.4.alpha"
+const GlacierVersion = "1.3.5.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -117,6 +117,7 @@ type S3Opts struct {
 	Limits          S3Limit  `yaml:"limits"`                 // 全局限速 / 并发
 	BucketLimits    map[string]S3Limit `yaml:"bucket_limits"` // 按 bucket 覆盖（字段非 0 生效）
 	LifecycleIntervalSec int `yaml:"lifecycle_interval_sec"` // 生命周期（自动删除）扫描周期
+	AbortIncompleteDays  int `yaml:"abort_incomplete_days"`  // 未完成分片上传自动回收天数（v1.3.5；默认 7，0=关闭）
 	CallbackSecret  string   `yaml:"callback_secret"`        // 上传回调默认 HMAC 签名密钥
 }
 
@@ -429,9 +430,9 @@ func (c *Config) Fill() {
 		if c.S3.Region == "" {
 			c.S3.Region = "*" // 默认任意 region（客户端可传可不传）
 		}
-		if c.S3.MaxObjectMB <= 0 {
+		if c.S3.MaxObjectMB == 0 {
 			c.S3.MaxObjectMB = 512
-		}
+		} // 显式负值（如 -1）放行 = 不限制（v1.3.5）
 		if c.S3.InlineMaxKB <= 0 {
 			c.S3.InlineMaxKB = 64
 		}
@@ -443,6 +444,12 @@ func (c *Config) Fill() {
 		}
 		if c.S3.BucketLimits == nil {
 			c.S3.BucketLimits = map[string]S3Limit{}
+		}
+		if c.S3.AbortIncompleteDays == 0 {
+			c.S3.AbortIncompleteDays = 7
+		}
+		if c.S3.AbortIncompleteDays < 0 {
+			c.S3.AbortIncompleteDays = 0
 		}
 		if c.S3.LifecycleIntervalSec <= 0 {
 			c.S3.LifecycleIntervalSec = 3600

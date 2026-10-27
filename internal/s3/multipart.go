@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 // 分片上传（multipart，v1.3.1）：
@@ -120,6 +121,11 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, r io.Re
 		return "", &s3Error{Code: "IncompleteBody", Status: 400,
 			Msg: "You did not provide the number of bytes specified by the Content-Length HTTP header"}
 	}
+	return s.writePart(bucket, key, uploadID, partNumber, data)
+}
+
+// writePart 分片落盘公共路径：同 partNumber 重传覆盖（S3 语义：最后一次为准）。
+func (s *Store) writePart(bucket, key, uploadID string, partNumber int, data []byte) (string, error) {
 	sum := md5.Sum(data)
 	etag := hex.EncodeToString(sum[:])
 
@@ -132,7 +138,6 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, r io.Re
 	if err != nil {
 		return "", err
 	}
-	// 同 partNumber 重传覆盖旧分片（S3 语义：最后一次上传为准）
 	tbl := chunkTableFor(b.TableName)
 	if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id='' AND seq=?`, tbl),
 		mpuKeyPrefix+uploadID, partNumber); err != nil {
@@ -149,6 +154,68 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, r io.Re
 	}
 	s.addUsageLocked(b.Owner, bucket, "PUT", int64(len(data)), 0)
 	return etag, nil
+}
+
+// UploadPartCopy 拷贝分片（v1.3.5）：从源对象（可带 versionId）读取指定字节区间
+// 作为分片内容，不经过网络重传。rng 为 nil = 整对象。返回（分片 ETag, LastModified）。
+func (s *Store) UploadPartCopy(bucket, key, uploadID string, partNumber int,
+	srcBucket, srcKey, srcVersion string, start, end int64, hasRange bool) (string, string, error) {
+	if partNumber < 1 || partNumber > maxParts {
+		return "", "", &s3Error{Code: "InvalidArgument", Status: 400,
+			Msg: fmt.Sprintf("Part number must be an integer between 1 and %d", maxParts)}
+	}
+	if _, err := s.uploadLocked(bucket, key, uploadID); err != nil {
+		return "", "", err
+	}
+	meta, data, err := s.GetObjectBytes(srcBucket, srcKey, srcVersion)
+	if err != nil {
+		return "", "", err
+	}
+	if hasRange {
+		if start < 0 || end < start || end >= meta.Size {
+			return "", "", &s3Error{Code: "InvalidArgument", Status: 400,
+				Msg: fmt.Sprintf("Range bytes=%d-%d is invalid for source size %d", start, end, meta.Size)}
+		}
+		data = data[start : end+1]
+	}
+	if s.maxObject > 0 && int64(len(data)) > s.maxObject {
+		return "", "", &s3Error{Code: "EntityTooLarge", Status: 400,
+			Msg: fmt.Sprintf("Part size %d exceeds max_object_mb limit %d", len(data), s.maxObject>>20)}
+	}
+	etag, err := s.writePart(bucket, key, uploadID, partNumber, data)
+	if err != nil {
+		return "", "", err
+	}
+	return etag, nowTS(), nil
+}
+
+// AbortStaleUploads 回收超龄未完成分片上传会话（v1.3.5：s3.abort_incomplete_days
+// 自动生命周期），返回回收会话数。
+func (s *Store) AbortStaleUploads(days int) int {
+	if days <= 0 {
+		return 0
+	}
+	cutoff := time.Now().AddDate(0, 0, -days).Format("2006-01-02 15:04:05")
+	rows, err := s.db.Query(`SELECT bucket, key, upload_id FROM s3_uploads WHERE created_ts < ?`, cutoff)
+	if err != nil {
+		return 0
+	}
+	type stale struct{ bucket, key, id string }
+	var list []stale
+	for rows.Next() {
+		var st stale
+		if err := rows.Scan(&st.bucket, &st.key, &st.id); err == nil {
+			list = append(list, st)
+		}
+	}
+	rows.Close()
+	n := 0
+	for _, st := range list {
+		if err := s.AbortMultipart(st.bucket, st.key, st.id); err == nil {
+			n++
+		}
+	}
+	return n
 }
 
 // CompleteMultipart 合并分片完成上传：按 part 顺序走对象两段式写入（inline/chunk），

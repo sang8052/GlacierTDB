@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -646,7 +647,13 @@ func (h *endpointHandler) putObject(w http.ResponseWriter, r *http.Request, buck
 
 	// base64 图片直传：解码后二进制落盘
 	if hasImg && img.Base64 {
-		raw, err := io.ReadAll(io.LimitReader(hr, h.srv.store.maxObject*2))
+		var raw []byte
+		var err error
+		if h.srv.store.maxObject > 0 {
+			raw, err = io.ReadAll(io.LimitReader(hr, h.srv.store.maxObject*2))
+		} else {
+			raw, err = io.ReadAll(hr) // 不限上限（v1.3.5：max_object_mb 负值）
+		}
 		if err != nil {
 			writeErr(w, r, reqID, toS3Err(err))
 			return
@@ -870,6 +877,11 @@ func (h *endpointHandler) uploadPart(w http.ResponseWriter, r *http.Request, buc
 			Msg: "partNumber must be a positive integer"})
 		return
 	}
+	// UploadPartCopy（v1.3.5）：PUT ?partNumber 带 x-amz-copy-source → 从源对象拷贝分片
+	if src := r.Header.Get("X-Amz-Copy-Source"); src != "" {
+		h.uploadPartCopy(w, r, bucket, key, uploadID, partNumber, src, reqID)
+		return
+	}
 	body := io.Reader(r.Body)
 	chunked := payloadHash == payloadStreaming ||
 		strings.Contains(strings.ToLower(r.Header.Get("Content-Encoding")), "aws-chunked")
@@ -891,6 +903,47 @@ func (h *endpointHandler) uploadPart(w http.ResponseWriter, r *http.Request, buc
 	}
 	w.Header().Set("ETag", "\""+etag+"\"")
 	w.WriteHeader(http.StatusOK)
+}
+
+// uploadPartCopy PUT ?partNumber + x-amz-copy-source → UploadPartCopy（v1.3.5）。
+// 可选 x-amz-copy-source-range: bytes=first-last（闭区间）；响应为 CopyPartResult XML。
+func (h *endpointHandler) uploadPartCopy(w http.ResponseWriter, r *http.Request, bucket, key, uploadID string,
+	partNumber int, src, reqID string) {
+	src = strings.TrimPrefix(src, "/")
+	srcBucket, srcKey := splitPathStyle(src)
+	srcVersion := ""
+	if i := strings.Index(srcKey, "?"); i >= 0 {
+		for _, kv := range strings.Split(srcKey[i+1:], "&") {
+			if strings.HasPrefix(kv, "versionId=") {
+				srcVersion = strings.TrimPrefix(kv, "versionId=")
+			}
+		}
+		srcKey = srcKey[:i]
+	}
+	start, end := int64(0), int64(0)
+	hasRange := false
+	if cr := r.Header.Get("X-Amz-Copy-Source-Range"); cr != "" {
+		m := regexp.MustCompile(`^bytes=(\d+)-(\d+)$`).FindStringSubmatch(strings.TrimSpace(cr))
+		if m == nil {
+			writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400,
+				Msg: "The x-amz-copy-source-range value is invalid"})
+			return
+		}
+		start, _ = strconv.ParseInt(m[1], 10, 64)
+		end, _ = strconv.ParseInt(m[2], 10, 64)
+		hasRange = true
+	}
+	etag, lastMod, err := h.srv.store.UploadPartCopy(bucket, key, uploadID, partNumber,
+		srcBucket, srcKey, srcVersion, start, end, hasRange)
+	if err != nil {
+		writeErr(w, r, reqID, toS3Err(err))
+		return
+	}
+	writeXML(w, http.StatusOK, struct {
+		XMLName      xml.Name `xml:"CopyPartResult"`
+		LastModified string   `xml:"LastModified"`
+		ETag         string   `xml:"ETag"`
+	}{LastModified: lastMod, ETag: "\"" + etag + "\""}, reqID, false)
 }
 
 // completeMultipart POST /{bucket}/{key}?uploadId=... → CompleteMultipartUpload。

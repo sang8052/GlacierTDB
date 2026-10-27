@@ -553,6 +553,7 @@ func (h *Handler) serverConfigRows() [][]any {
 		{"mqtt.enable", b2s(cfg.MQ.Enable && cfg.MQ.MQTT.Enable)},
 		{"mqtt.listen", cfg.MQ.MQTT.Listen},
 		{"mqtt.ws_path", cfg.MQ.MQTT.WsPath},
+		{"s3.abort_incomplete_days", fmt.Sprintf("%d", cfg.S3.AbortIncompleteDays)},
 		{"timeseries.cold_after_days", fmt.Sprintf("%d", cfg.Timeseries.ColdAfterDays)},
 		{"auth.user", cfg.Auth.User},
 		{"auth.readonly_user", cfg.Auth.ReadOnlyUser},
