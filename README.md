@@ -8,7 +8,7 @@
 
 > 🤖 **本项目全程由 GLM5.3 驱动。**
 
-**当前版本：v1.3.7.alpha** · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
+**当前版本：v1.3.8.alpha** · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
 （三平台 + SHA256SUMS）· 许可：MIT
 
 | 📄 文档 | 说明 |
@@ -351,6 +351,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.3.5（35 项） | UploadPartCopy、未完成上传自动回收、上限可解除；MULTI/EXEC、发布订阅、SCAN 真游标 |
 | v1.3.6（15 项） | 多租户强化（库可见性过滤/DEFAULT_DB/USE 1044/账号级 QPS·并发配额）+ S3 头（版本号·UUID） |
 | v1.3.7（17 项） | OpenCV 风格图片预处理（rectangle/text/circle/line/grayscale/blur/rotate/flip，GET/PUT/另存三链路） |
+| v1.3.8（1 项+重启） | 底层文件默认加密（adiantum·固定口令）+ 存量明文库自动迁移 + 依赖全量升级 |
 | v1.3.3（111 项）+ 重启 | MySQL 8 兼容 M4（运算符/函数/DDL/维护语句/用户变量）、列类型映射（TEXT 落盘/查出还原/类型回放）、时序冷压缩固化（自动解冻）、MQTT ws+tcp 桥接、RabbitMQ 版本串可配置 |
 
 ---
@@ -372,6 +373,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.3.5 | S3 拷贝分片/自动回收/上限解除；Redis 事务/发布订阅/SCAN 游标 | ✅ |
 | v1.3.6 | 多租户强化（库过滤/默认库/USE 校验/账号配额）+ S3 响应头 | ✅ |
 | v1.3.7 | OpenCV 风格图片预处理管道（绘制/滤镜/几何 + 处理另存） | ✅ |
+| v1.3.8 | 底层文件默认加密 + 存量自动迁移；依赖全量升级（amqp091 1.16 等） | ✅ |
 
 各版本完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)；
 未排期候选与设计红线见 [FEATURE.md](FEATURE.md)。
@@ -397,7 +399,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 
 - 单实例单写者（红线：不做多机/复制）；`db_dir` 必须可写；
 - 无 TLS、无列级权限——仅限内网可信环境；
-- 备份 = 拷贝 `db_dir`（务必含 `glacier.json` / `glacier_s3.key` / `glacier_rsa.pem` 等密钥文件，见部署运维手册）。
+- 备份 = 拷贝 `db_dir`（务必含 `glacier.json` / `glacier_s3.key` / `glacier_rsa.pem` 等密钥文件，见部署运维手册）；底层文件默认 adiantum 加密（固定口令，v1.3.8），备份包即密文，恢复需同版本服务。
 
 ---
 

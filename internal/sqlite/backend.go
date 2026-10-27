@@ -123,8 +123,12 @@ func NewBackend(cfg *config.Config) (*Backend, error) {
 		return nil, fmt.Errorf("security.encrypt 开启时必须配置 security.passphrase")
 	}
 	if b.encrypt {
+		// v1.3.8：存量明文库自动迁移（VACUUM INTO adiantum 加密库 → 校验 → 原子替换），
+		// 不再拒绝启动；明文原件保留为 <db>.db.old-plaintext，由运维确认后删除。
 		if bad, err := b.detectPlaintextDBs(); err == nil && len(bad) > 0 {
-			return nil, fmt.Errorf("目录中存在未加密的库 %v；加密模式要求空目录或已加密库（新库自动加密，存量迁移工具见 FEATURE.md）", bad)
+			if err := b.migratePlaintextDBs(bad); err != nil {
+				return nil, fmt.Errorf("明文库自动加密迁移失败: %w", err)
+			}
 		}
 	}
 
@@ -715,7 +719,10 @@ func (b *Backend) openFileRetry(file string, attempts int) (*sql.DB, error) {
 //   Windows 绝对路径 H:/dir/x.db  → file:///H:/dir/x.db（反斜杠已 ToSlash）
 //   相对路径        data/x.db     → file:data/x.db
 // 路径按 RFC3986 百分号编码（空格/中文/特殊字符），避免 url.URL 把盘符当 host。
-func (b *Backend) dsnFor(file string) string {
+func (b *Backend) dsnFor(file string) string { return b.dsnForMode(file, b.encrypt) }
+
+// dsnForMode 生成 DSN（encrypt=false 强制明文——迁移时打开明文源库用）。
+func (b *Backend) dsnForMode(file string, encrypt bool) string {
 	// 无条件把反斜杠转正斜杠：filepath.ToSlash 仅在 Windows 运行时生效，
 	// 而 DSN 生成必须与目标平台无关（Linux 宿主上生成 Windows 路径也要正确）
 	p := strings.ReplaceAll(filepath.Clean(file), "\\", "/")
@@ -736,7 +743,7 @@ func (b *Backend) dsnFor(file string) string {
 	//   H:/x.db     → file:H:/x.db        （Windows API 原生接受正斜杠盘符路径）
 	// 带三斜杠的 file:///H:/x 在 wazero VFS 下会被解析成 POSIX 路径 "/H:/..."，
 	// 报 CreateFile /H:: 语法错误，故禁用 authority 形式。
-	if b.encrypt {
+	if encrypt {
 		// textkey 必须先于其它 pragma（连接后立即生效）
 		kv := url.Values{}
 		kv.Add("vfs", "adiantum")
@@ -805,3 +812,110 @@ func fileSize(p string) int64 {
 
 // CloseAll 释放后端（CLI 模式用）。
 func (b *Backend) CloseAll() {}
+
+// ---------------------------------------------------------------------------
+// 存量明文库自动加密迁移（v1.3.8）
+// ---------------------------------------------------------------------------
+
+// migratePlaintextDBs 将明文库迁移为 adiantum 加密库：
+// checkpoint WAL → VACUUM INTO 加密临时库 → integrity_check + 对象数校验 →
+// 原子替换（明文原件保留为 <db>.db.old-plaintext）。
+func (b *Backend) migratePlaintextDBs(files []string) error {
+	for _, name := range files {
+		f := filepath.Join(b.dir, name) // detectPlaintextDBs 返回纯文件名——必须落回绝对路径
+		start := time.Now()
+		src, err := driver.Open(b.dsnForMode(f, false))
+		if err != nil {
+			return fmt.Errorf("open plaintext %s: %w", f, err)
+		}
+		if _, err := src.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+			src.Close()
+			return fmt.Errorf("checkpoint %s: %w", f, err)
+		}
+		var objsBefore int
+		if err := src.QueryRow("SELECT count(*) FROM sqlite_master").Scan(&objsBefore); err != nil {
+			src.Close()
+			return fmt.Errorf("count %s: %w", f, err)
+		}
+		tmp := f + ".migrating"
+		_ = os.Remove(tmp)
+		encURI := "file:" + uriPathPct(filepath.ToSlash(filepath.Clean(tmp))) +
+			"?vfs=adiantum&textkey=" + url.QueryEscape(b.passphrase)
+		if _, err := src.Exec("VACUUM INTO ?", encURI); err != nil {
+			src.Close()
+			return fmt.Errorf("vacuum-into %s: %w", f, err)
+		}
+		src.Close()
+
+		// 加密打开校验（integrity + 对象数一致）
+		vdb, err := driver.Open(b.dsnForMode(tmp, true))
+		if err != nil {
+			return fmt.Errorf("verify open %s: %w", tmp, err)
+		}
+		var ok string
+		var objsAfter int
+		verr := vdb.QueryRow("PRAGMA integrity_check").Scan(&ok)
+		if verr == nil {
+			verr = vdb.QueryRow("SELECT count(*) FROM sqlite_master").Scan(&objsAfter)
+		}
+		vdb.Close()
+		if verr != nil || ok != "ok" || objsAfter != objsBefore {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("verify %s failed (integrity=%q objs %d/%d): %v", f, ok, objsAfter, objsBefore, verr)
+		}
+
+		logx.Debugf("migrate %s: vacuum ok, objs %d/%d, tmp exists=%v", f, objsAfter, objsBefore, fileExists(tmp))
+		// 原子替换：明文原件 → .old-plaintext，加密临时 → 正名
+		bak := f + ".old-plaintext"
+		_ = os.Remove(bak)
+		if err := os.Rename(f, bak); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("backup %s: %w", f, err)
+		}
+		if err := os.Rename(tmp, f); err != nil {
+			_ = os.Rename(bak, f) // 回滚
+			_ = os.Remove(tmp)
+			return fmt.Errorf("swap %s: %w", f, err)
+		}
+		_ = os.Remove(f + "-wal")
+		_ = os.Remove(f + "-shm")
+		logx.Debugf("migrate %s: swapped, bak exists=%v new header=%x", f, fileExists(bak), fileHead(f))
+		logx.Warnf("security: 明文库已自动加密迁移 %s（%d 对象，耗时 %s）；明文原件保留于 %s，确认后请删除",
+			filepath.Base(f), objsAfter, time.Since(start).Round(time.Millisecond), filepath.Base(bak))
+	}
+	return nil
+}
+
+// uriPathPct DSN 路径段的 RFC3986 百分号编码（VACUUM INTO 目标 URI 用）。
+func uriPathPct(p string) string {
+	var sb strings.Builder
+	for _, r := range p {
+		switch {
+		case r == '/' || r == ':' || r == '-' || r == '_' || r == '.' || r == '~',
+			r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			sb.WriteRune(r)
+		default:
+			for _, c := range []byte(string(r)) {
+				fmt.Fprintf(&sb, "%%%02X", c)
+			}
+		}
+	}
+	return sb.String()
+}
+
+// fileExists / fileHead 迁移调试辅助（v1.3.8）。
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+func fileHead(p string) []byte {
+	f, err := os.Open(p)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	b := make([]byte, 8)
+	n, _ := f.Read(b)
+	return b[:n]
+}

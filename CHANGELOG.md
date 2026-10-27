@@ -2,6 +2,29 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.8.alpha] - 2026-10-27
+
+### 新增
+- **底层文件默认静态加密（adiantum VFS，固定口令 `GlacierTDB`）**：
+  - 默认 `security.encrypt: true`——所有 `.db` 底层文件（业务库 + 全部系统库）落盘即密文，
+    SQLite/Navicat 等工具直接打开文件只能看到密文（文件头非 `SQLite format 3`），数据仅经
+    3309 协议层口令登录后透明读写；显式 `encrypt: false` 可关闭；
+  - **存量明文库启动自动迁移**：检测到明文库时不再拒绝启动——逐库执行
+    `wal_checkpoint → VACUUM INTO 加密临时库 → integrity_check + 对象数一致性校验 →
+    原子替换`，全程带真实对象数日志；明文原件保留为 `<db>.db.old-plaintext`
+    （确认后删除，防误迁移兜底），校验失败自动回滚不影响原库；
+  - 实测：6 库测试数据卷（含 34 对象业务库）自动迁移后全协议功能正常，容器重启数据完好。
+
+### 变更
+- **Go 依赖全量升级（安全修复）**：`rabbitmq/amqp091-go` v1.10.0→**v1.16.0**、
+  `segmentio/kafka-go` v0.4.47→**v0.4.51**、`golang.org/x/image` v0.18.0→**v0.47.0**、
+  `golang.org/x/crypto` v0.57.0→**v0.58.0**、`pingcap/tidb/pkg/parser`→**2026-10-27 版**、
+  `ncruces/go-sqlite3-wasm/v6` v6.3.35304→**v6.3.35401**（间接依赖 x/net·x/sys·x/text·
+  compress 等随升）；go 指令 1.26→**1.27.3**（构建 GOTOOLCHAIN=auto 自动拉取工具链，
+  Dockerfile 已适配）；`go-mysql` v1.16.0 与 `ncruces/go-sqlite3` v0.35.6 已是最新；
+- `tests/test_v138.py` 新增（加密模式建表/KV + `--check-restart` 加密重启持久化）并纳入
+  `tests/run_all.sh`；全套回归 **ALL TESTS PASSED**（27 脚本 + 四重启持久化）。
+
 ## [1.3.7.alpha] - 2026-10-27
 
 ### 新增

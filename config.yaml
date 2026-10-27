@@ -80,11 +80,11 @@ lock:
   notify_url: ""           # 登录失败/锁定事件 HTTP 异步告警（空=关闭）
   notify_secret: ""        # 告警 HMAC 签名密钥
 
-# 静态加密（adiantum，防外部程序直接读 .db 文件）；首次启用要求空目录或已加密库
+# 静态加密（adiantum，防 SQLite/Navicat 等工具直接读 .db 文件）；v1.3.8 起默认开启，
+# 存量明文库启动时自动迁移（原件保留为 <db>.db.old-plaintext，确认后删除）
 security:
-  encrypt: false
-  passphrase: ""        # 启用时必填
-
+  encrypt: true
+  passphrase: "GlacierTDB"  # 默认固定口令（可改）；所有 .db 落盘即密文，协议层透明读写
 # 键值/队列（v1.2.0）：mode:redis 在 3309 同端口提供 RESP 服务（声明行/嗅探进入）
 # 详见 docs/键值队列.md
 kv:

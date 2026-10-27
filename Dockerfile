@@ -6,7 +6,7 @@ ARG HTTPS_PROXY=
 ARG NO_PROXY=localhost,127.0.0.1
 ENV GOPROXY=https://goproxy.cn,direct \
     CGO_ENABLED=0 \
-    GOTOOLCHAIN=local
+    GOTOOLCHAIN=auto
 WORKDIR /src
 COPY . .
 RUN go mod tidy && go build -trimpath -ldflags="-s -w" -o /out/glaciertdb .

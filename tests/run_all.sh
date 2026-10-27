@@ -176,6 +176,7 @@ echo "---- test_v134.py ----"; python /tests/test_v134.py || rc=1
 echo "---- test_v135.py ----"; python /tests/test_v135.py || rc=1
 echo "---- test_v136.py ----"; python /tests/test_v136.py || rc=1
 echo "---- test_v137.py ----"; python /tests/test_v137.py || rc=1
+echo "---- test_v138.py ----"; python /tests/test_v138.py || rc=1
 exit $rc
 EOF
 )
@@ -215,6 +216,11 @@ if docker restart "$PROXY" >/dev/null 2>&1; then
         record "test_v133 restart persistence : PASS"
     else
         record "test_v133 restart persistence : FAIL"
+    fi
+    if docker run --rm --network "$NET" -v "$TESTS_DIR":/tests:ro "$PY_IMG" bash -c         "pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple PyMySQL >/dev/null 2>&1 && python /tests/test_v138.py --check-restart"; then
+        record "test_v138 encrypted restart persistence : PASS"
+    else
+        record "test_v138 encrypted restart persistence : FAIL"
     fi
 else
     echo "[FAIL] docker restart $PROXY 失败"
