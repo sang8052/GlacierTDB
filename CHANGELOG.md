@@ -2,6 +2,18 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.9.alpha] - 2026-10-27
+
+### 变更
+- **版本基调转折**：1.3.x 系列已完成 FEATURE 整合（MySQL 网关 / 时序冷库 / S3 /
+  Redis / RabbitMQ / MQTT / 多租户 / 静态加密全量交付）——**后续版本转向稳定性维护与
+  BUG 调试**，不再新增大特性（README 首页已声明）；`FEATURE.md` 删除（规划归档完成，
+  历史见 CHANGELOG）。
+- **数据目录分类存储**：`<db_dir>/sys/` 存系统库（glacier_auth / s3 / kv / mq / meta），
+  `<db_dir>/user/` 存用户业务库——启动时自动创建子目录并**归类存量平铺库**（含 -wal/-shm
+  随迁，幂等），`ListDatabases` / 明文检测 / VACUUM CLI 同步适配；根目录兼容残留库。
+- 全套回归 **ALL TESTS PASSED**（27 脚本 + 四重启持久化，加密卷 + 新布局）。
+
 ## [1.3.8.alpha] - 2026-10-27
 
 ### 新增

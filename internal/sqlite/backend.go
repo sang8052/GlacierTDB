@@ -136,6 +136,7 @@ func NewBackend(cfg *config.Config) (*Backend, error) {
 	if err != nil || !st.IsDir() {
 		return nil, fmt.Errorf("db dir %s 不存在或不是目录", b.dir)
 	}
+	b.migrateLegacyLayout() // v1.3.9：存量平铺库归类入 sys/ 与 user/
 	b.loadAuthOverride() // 管理面改过的密码优先于配置文件
 	b.authMu.RLock()
 	cfg.Auth.Password = b.authPassword
@@ -158,7 +159,49 @@ func NewBackend(cfg *config.Config) (*Backend, error) {
 	return b, nil
 }
 
-func (b *Backend) fileFor(db string) string { return filepath.Join(b.dir, db+".db") }
+// 数据目录分类（v1.3.9）：系统库入 <db_dir>/sys/，用户库入 <db_dir>/user/。
+const (
+	SysDir  = "sys"  // 系统库子目录（glacier_auth / glacier_s3 / glacier_kv / glacier_mq / glacier_meta）
+	UserDir = "user" // 用户业务库子目录
+)
+
+func (b *Backend) fileFor(db string) string {
+	sub := UserDir
+	if isSystemDB(db) {
+		sub = SysDir
+	}
+	return filepath.Join(b.dir, sub, db+".db")
+}
+
+// migrateLegacyLayout 存量平铺库自动归类（v1.3.9）：根目录 *.db 按类别挪入
+// sys/ 或 user/（幂等；.old-plaintext / .migrating 等非 .db 文件不动）。
+func (b *Backend) migrateLegacyLayout() {
+	for _, sub := range []string{SysDir, UserDir} {
+		_ = os.MkdirAll(filepath.Join(b.dir, sub), 0o755)
+	}
+	entries, err := os.ReadDir(b.dir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".db") {
+			continue
+		}
+		db := strings.TrimSuffix(name, ".db")
+		target := b.fileFor(db)
+		if _, err := os.Stat(target); err == nil {
+			continue // 已存在（上次迁移过）：保守跳过
+		}
+		src := filepath.Join(b.dir, name)
+		if err := os.Rename(src, target); err == nil {
+			// -wal/-shm 跟随搬迁
+			_ = os.Rename(src+"-wal", target+"-wal")
+			_ = os.Rename(src+"-shm", target+"-shm")
+			logx.Infof("layout: 归类存量库 %s → %s/", name, filepath.Base(filepath.Dir(target)))
+		}
+	}
+}
 
 func (b *Backend) openFile(file string) (*sql.DB, error) {
 	// driver.Open（带连接初始化钩子）：每个物理连接注册 MD5/SHA/LEFT/RIGHT/
@@ -238,21 +281,28 @@ func (s *Session) DropDatabase(name string) error { return s.backend.DropDatabas
 
 // ListDatabases 列出目录下所有库（.db 文件名；系统库 glacier_auth 不对客户端暴露）。
 func (b *Backend) ListDatabases() []string {
-	entries, err := os.ReadDir(b.dir)
-	if err != nil {
-		return nil
-	}
 	var out []string
-	for _, e := range entries {
-		name := e.Name()
-		if strings.HasSuffix(name, ".db") {
-			db := strings.TrimSuffix(name, ".db")
-			if isSystemDB(db) {
+	seen := map[string]bool{}
+	add := func(dir string) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".db") {
 				continue
 			}
+			db := strings.TrimSuffix(name, ".db")
+			if isSystemDB(db) || seen[db] {
+				continue
+			}
+			seen[db] = true
 			out = append(out, db)
 		}
 	}
+	add(filepath.Join(b.dir, UserDir)) // v1.3.9：用户库在 user/
+	add(b.dir)                         // 兼容根目录残留
 	sort.Strings(out)
 	return out
 }
@@ -755,26 +805,41 @@ func (b *Backend) dsnForMode(file string, encrypt bool) string {
 
 // detectPlaintextDBs 找出目录中的明文库（文件头 == "SQLite format 3\x00"）。
 func (b *Backend) detectPlaintextDBs() ([]string, error) {
-	entries, err := os.ReadDir(b.dir)
-	if err != nil {
+	var out []string
+	scan := func(dir string) error {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".db") {
+				continue
+			}
+			f, err := os.Open(filepath.Join(dir, name))
+			if err != nil {
+				continue
+			}
+			hdr := make([]byte, 16)
+			n, _ := f.Read(hdr)
+			f.Close()
+			if n == 16 && string(hdr) == "SQLite format 3\x00" {
+				out = append(out, filepath.Join(dir, name))
+			}
+		}
+		return nil
+	}
+	if err := scan(filepath.Join(b.dir, SysDir)); err != nil {
 		return nil, err
 	}
-	var out []string
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, ".db") {
-			continue
-		}
-		f, err := os.Open(filepath.Join(b.dir, name))
-		if err != nil {
-			continue
-		}
-		hdr := make([]byte, 16)
-		n, _ := f.Read(hdr)
-		f.Close()
-		if n == 16 && string(hdr) == "SQLite format 3\x00" {
-			out = append(out, name)
-		}
+	if err := scan(filepath.Join(b.dir, UserDir)); err != nil {
+		return nil, err
+	}
+	if err := scan(b.dir); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -821,8 +886,7 @@ func (b *Backend) CloseAll() {}
 // checkpoint WAL → VACUUM INTO 加密临时库 → integrity_check + 对象数校验 →
 // 原子替换（明文原件保留为 <db>.db.old-plaintext）。
 func (b *Backend) migratePlaintextDBs(files []string) error {
-	for _, name := range files {
-		f := filepath.Join(b.dir, name) // detectPlaintextDBs 返回纯文件名——必须落回绝对路径
+	for _, f := range files { // detectPlaintextDBs 已返回绝对路径（sys/ 或 user/ 下）
 		start := time.Now()
 		src, err := driver.Open(b.dsnForMode(f, false))
 		if err != nil {

@@ -95,7 +95,7 @@ func main() {
 		var dbNames []string
 		if *vacuumDB != "" {
 			dbNames = []string{*vacuumDB}
-		} else if gs, _ := filepath.Glob(filepath.Join(cfg.DBDir, "*.db")); len(gs) > 0 {
+		} else if gs, _ := filepath.Glob(filepath.Join(cfg.DBDir, "user", "*.db")); len(gs) > 0 {
 			for _, g := range gs {
 				dbNames = append(dbNames, strings.TrimSuffix(filepath.Base(g), ".db"))
 			}

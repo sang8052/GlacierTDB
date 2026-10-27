@@ -8,7 +8,10 @@
 
 > 🤖 **本项目全程由 GLM5.3 驱动。**
 
-**当前版本：v1.3.8.alpha** · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
+**当前版本：v1.3.9.alpha**
+
+> **版本基调（v1.3.9 起）**：1.3.x 系列已完成 FEATURE 整合（MySQL 网关 / 时序冷库 / S3 / Redis / RabbitMQ / MQTT / 多租户 / 静态加密全量交付）；
+> 后续版本转向**稳定性维护与 BUG 调试**，不再新增大特性。 · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
 （三平台 + SHA256SUMS）· 许可：MIT
 
 | 📄 文档 | 说明 |
@@ -21,7 +24,6 @@
 | [docs/键值队列.md](docs/键值队列.md) | 键值/队列：mode:redis、RESP 命令集、TTL、命名空间、内存治理 |
 | [docs/消息队列.md](docs/消息队列.md) | 消息队列：mode:rabbitmq、AMQP 0-9-1、路由语义、持久化、观测 |
 | [docs/部署运维.md](docs/部署运维.md) | 部署（Docker/裸机/systemd）、升级、备份恢复、监控、故障排查 |
-| [FEATURE.md](FEATURE.md) | 版本路线规划（只放规划；已完成见 CHANGELOG） |
 | [CHANGELOG.md](CHANGELOG.md) | 更新日志（各版本完整变更明细） |
 
 ---
@@ -352,6 +354,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.3.6（15 项） | 多租户强化（库可见性过滤/DEFAULT_DB/USE 1044/账号级 QPS·并发配额）+ S3 头（版本号·UUID） |
 | v1.3.7（17 项） | OpenCV 风格图片预处理（rectangle/text/circle/line/grayscale/blur/rotate/flip，GET/PUT/另存三链路） |
 | v1.3.8（1 项+重启） | 底层文件默认加密（adiantum·固定口令）+ 存量明文库自动迁移 + 依赖全量升级 |
+| v1.3.9 | FEATURE 整合收官：版本转向稳定性维护；数据目录分类（sys/ + user/） |
 | v1.3.3（111 项）+ 重启 | MySQL 8 兼容 M4（运算符/函数/DDL/维护语句/用户变量）、列类型映射（TEXT 落盘/查出还原/类型回放）、时序冷压缩固化（自动解冻）、MQTT ws+tcp 桥接、RabbitMQ 版本串可配置 |
 
 ---
@@ -374,9 +377,10 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.3.6 | 多租户强化（库过滤/默认库/USE 校验/账号配额）+ S3 响应头 | ✅ |
 | v1.3.7 | OpenCV 风格图片预处理管道（绘制/滤镜/几何 + 处理另存） | ✅ |
 | v1.3.8 | 底层文件默认加密 + 存量自动迁移；依赖全量升级（amqp091 1.16 等） | ✅ |
+| v1.3.9 | FEATURE 收官·转向稳定性维护；数据目录 sys/user 分类 | ✅ |
 
 各版本完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)；
-未排期候选与设计红线见 [FEATURE.md](FEATURE.md)。
+历史版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)。
 
 ---
 
@@ -399,7 +403,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 
 - 单实例单写者（红线：不做多机/复制）；`db_dir` 必须可写；
 - 无 TLS、无列级权限——仅限内网可信环境；
-- 备份 = 拷贝 `db_dir`（务必含 `glacier.json` / `glacier_s3.key` / `glacier_rsa.pem` 等密钥文件，见部署运维手册）；底层文件默认 adiantum 加密（固定口令，v1.3.8），备份包即密文，恢复需同版本服务。
+- 备份 = 拷贝 `db_dir`（务必含 `glacier.json` / `glacier_s3.key` / `glacier_rsa.pem` 等密钥文件，见部署运维手册）；底层文件默认 adiantum 加密（固定口令，v1.3.8），备份包即密文，恢复需同版本服务；库文件分类存放：`sys/`（系统库）与 `user/`（用户库，v1.3.9 起自动归类）。
 
 ---
 
@@ -425,7 +429,7 @@ GlacierTDB/
 ├── schema/timeseries.sql # 时序标准 schema
 ├── docs/                 # 八册手册（配置/系统SQL/时序/异步/S3/键值/消息/部署运维）
 ├── tests/                # 黑盒测试（22 脚本 + run_all.sh 编排 + 重启持久化检查）
-├── Dockerfile  docker-compose.yml  LICENSE  README.md  FEATURE.md  CHANGELOG.md
+├── Dockerfile  docker-compose.yml  LICENSE  README.md  CHANGELOG.md
 ```
 
 ## 🔧 技术栈
