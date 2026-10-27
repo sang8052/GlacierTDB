@@ -129,6 +129,10 @@ func ServeConn(c net.Conn, store *Store, auths *auth.Store, cfg *config.Config) 
 				reply(func() { w.Error("NOPROTO unsupported protocol version") })
 				continue
 			}
+			// RESP3 协商（v1.3.4，反馈①-补）：HELLO 3 的客户端解析器为 RESP3——
+			// 空值帧改发 `_`（RESP3 null），防 `$-1`/`*-1` 被按「读 -1 字节」挂死；
+			// 协议本身仍 RESP2（HELLO 应答 proto 恒 2，非空值帧两种解析器兼容）。
+			w.Resp3 = protover == "3"
 			if hasAuth {
 				// HELLO 内嵌认证：default 走单密码路径，其余按账号
 				args := []string{auser, apass}

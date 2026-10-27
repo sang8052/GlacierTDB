@@ -2,6 +2,21 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.4.alpha] - 2026-10-27
+
+### 修复
+- **空值应答挂死 RESP3 客户端（反馈①-补）**：v1.3.3 的 HELLO 修复让 redis-py ≥8（默认 RESP3
+  解析器）可直连，但空值仍回 RESP2 帧——RESP3 解析器对 `$-1` 按「读 -1 字节」处理，
+  `GET` miss / `MGET` 部分 miss / `BLPOP` 超时 / `LPOP` 空列表等一切空值应答挂死至 socket 超时：
+  - 修复：`HELLO 3` 协商后该连接的空值应答改发 RESP3 统一 null 帧 `_`（`RespWriter.Resp3` 标志）；
+    协议本体仍 RESP2（HELLO 应答 `proto` 恒 2，非空值帧两种解析器帧格式相同）；
+  - RESP2 连接（未 HELLO / `HELLO 2` / `protocol=2`）空值语义维持 `$-1` / `*-1` 不变；
+  - `GET miss 0ms 返回 None`（v1.3.3 实测挂死）、`MGET [b'x', None]`、`BLPOP 超时 None` 实测通过。
+
+### 变更
+- `tests/test_v134.py` 新增 16 项（RESP3 空值全场景 + 帧形态 `_`/`$-1` 双路断言 + RESP2 回归）；
+  `tests/run_all.sh` 纳入；全套回归 **ALL TESTS PASSED**（23 脚本 + 三重启持久化）。
+
 ## [1.3.3.alpha] - 2026-10-23
 
 ### 新增

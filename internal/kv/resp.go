@@ -85,6 +85,10 @@ func (r *RespReader) ReadCommand() ([]string, error) {
 // RespWriter RESP2 应答写入器（每条命令一次 Flush）。
 type RespWriter struct {
 	bw *bufio.Writer
+	// Resp3：对端曾以 HELLO 3 握手（redis-py ≥8 默认 RESP3 解析器）——该类解析器
+	// 读 `$-1` 会按“读 -1 字节”挂死，故空值应答改发 RESP3 统一 null 帧 `_`
+	// （v1.3.4，反馈①-补）；未 HELLO/HELLO 2 的 RESP2 连接维持 $-1/*-1。
+	Resp3 bool
 }
 
 // NewRespWriter 构造写入器。
@@ -107,10 +111,10 @@ func (w *RespWriter) Error(msg string) {
 // Int :n 形式。
 func (w *RespWriter) Int(n int64) { fmt.Fprintf(w.bw, ":%d\r\n", n) }
 
-// Bulk $.. 形式（nil → $-1）。
+// Bulk $.. 形式（nil → $-1；Resp3 连接 → `_` 统一 null，防 RESP3 解析器挂死）。
 func (w *RespWriter) Bulk(b []byte) {
 	if b == nil {
-		w.bw.WriteString("$-1\r\n")
+		w.Null()
 		return
 	}
 	fmt.Fprintf(w.bw, "$%d\r\n", len(b))
@@ -129,8 +133,23 @@ func (w *RespWriter) BulkArray(items [][]byte) {
 	}
 }
 
-// NullArray 空数组（*-1，BLPOP/BRPOP 超时应答）。
-func (w *RespWriter) NullArray() { w.bw.WriteString("*-1\r\n") }
+// NullArray 空数组（*-1，BLPOP/BRPOP 超时应答；Resp3 连接 → `_` 统一 null）。
+func (w *RespWriter) NullArray() {
+	if w.Resp3 {
+		w.bw.WriteString("_\r\n")
+		return
+	}
+	w.bw.WriteString("*-1\r\n")
+}
+
+// Null 空值应答：RESP2 `$-1` / RESP3 `_`（按连接协商形态，v1.3.4）。
+func (w *RespWriter) Null() {
+	if w.Resp3 {
+		w.bw.WriteString("_\r\n")
+		return
+	}
+	w.bw.WriteString("$-1\r\n")
+}
 
 // ScanReply SCAN 应答：[cursor, [keys...]]（cursor 为 bulk、keys 为数组，真实 Redis 形态，v1.3.3）。
 func (w *RespWriter) ScanReply(cursor string, keys [][]byte) {

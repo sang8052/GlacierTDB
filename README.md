@@ -8,7 +8,7 @@
 
 > 🤖 **本项目全程由 GLM5.3 驱动。**
 
-**当前版本：v1.3.3.alpha** · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
+**当前版本：v1.3.4.alpha** · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
 （三平台 + SHA256SUMS）· 许可：MIT
 
 | 📄 文档 | 说明 |
@@ -166,7 +166,7 @@ AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked`），boto3 
 
 - RESP 服务（`mode:redis` 或嗅探）：string `GET/SET(EX·PX·NX·XX)/DEL/EXISTS/APPEND/INCR 族/MGET/MSET/KEYS/TYPE` + list 队列 `LPUSH/RPUSH/LPOP/RPOP/LLEN/LRANGE`；
 - **阻塞弹出（v1.3.2）**：`BLPOP/BRPOP key [key…] timeout`——按序取首个非空队列，Push 立即唤醒、超时返回空数组（`0` = 无限等待）；
-- **HELLO/SCAN（v1.3.3）**：`HELLO` 最小应答（server map + `proto:2`，**redis-py ≥ 8 默认 RESP3 握手直连可用**）；`SCAN cursor [MATCH][COUNT][TYPE]` 单批全量 + 游标恒 0（`redis-cli --scan` / `scan_iter` 可用）；
+- **HELLO/SCAN（v1.3.3）**：`HELLO` 最小应答（server map + `proto:2`，**redis-py ≥ 8 默认 RESP3 握手直连可用**）；`SCAN cursor [MATCH][COUNT][TYPE]` 单批全量 + 游标恒 0（`redis-cli --scan` / `scan_iter` 可用）；**RESP3 空值兼容（v1.3.4）**——`HELLO 3` 连接的空值应答发 RESP3 null 帧 `_`（redis-py ≥8 的 GET miss/MGET/BLPOP 超时不再挂死），RESP2 连接维持 `$-1`/`*-1`；
 - **TTL**：惰性过期 + 定期扫描；**变更实时写 SQLite（`glacier_kv.db`）重启无损**；
 - **命名空间 = 登录账号**（跨用户不可见）；**内存治理**：`kv.max_memory_mb` + `allkeys-lru/volatile-lru/noeviction`；`SHOW KV STATS` / `kv_stats` 占用与命中率。
 
@@ -345,6 +345,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | RabbitMQ（28 项）+ 重启 | 路由语义、consume/ack/nack/prefetch、SHOW QUEUES、amqp 回调回环；消息重启不丢 |
 | v1.3.1（44 项） | multipart 分片上传全流程（复合 ETag/Abort/ListParts）、每月/每年调度（月尾 clamp）、PHP SCRIPT 错误路径 |
 | v1.3.2（13 项） | BLPOP/BRPOP 阻塞弹出（唤醒/超时/方向）、publisher confirm 逐条 ack、mandatory 回退 312 NO_ROUTE |
+| v1.3.4（16 项） | RESP3 空值帧兼容（`_` null 协商，redis-py ≥8 空值不再挂死）+ RESP2 回归 |
 | v1.3.3（111 项）+ 重启 | MySQL 8 兼容 M4（运算符/函数/DDL/维护语句/用户变量）、列类型映射（TEXT 落盘/查出还原/类型回放）、时序冷压缩固化（自动解冻）、MQTT ws+tcp 桥接、RabbitMQ 版本串可配置 |
 
 ---
@@ -362,6 +363,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | v1.3.1 | S3 multipart 分片上传、每月/每年调度、SCRIPT PHP 运行时 | ✅ |
 | v1.3.2 | Redis BLPOP/BRPOP 阻塞弹出、AMQP confirm 发布确认 + mandatory 回退 | ✅ |
 | v1.3.3 | MySQL 8 兼容 M4、列类型映射、时序冷压缩固化、MQTT（ws/tcp）接入 + 版本串可配置 | ✅ |
+| v1.3.4 | RESP3 空值帧兼容（redis-py ≥8 空值不再挂死） | ✅ |
 
 各版本完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)；
 未排期候选与设计红线见 [FEATURE.md](FEATURE.md)。
