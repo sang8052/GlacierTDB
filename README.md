@@ -8,10 +8,11 @@
 
 > 🤖 **本项目全程由 GLM5.3 驱动。**
 
-**当前版本：v1.3.9.alpha**
+**当前版本：v1.3.10.beta**
 
-> **版本基调（v1.3.9 起）**：1.3.x 系列已完成 FEATURE 整合（MySQL 网关 / 时序冷库 / S3 / Redis / RabbitMQ / MQTT / 多租户 / 静态加密全量交付）；
-> 后续版本转向**稳定性维护与 BUG 调试**，不再新增大特性。 · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
+> **版本基调（v1.3.10 起）**：FEATURE 整合已收官（MySQL 网关 / 时序冷库 / S3 / Redis / RabbitMQ / MQTT / 多租户 / 静态加密全量交付）；
+> **自 1.3.10 版本开始，项目转向稳定性更新**——以性能优化、BUG 修复与运维体验为主，不再新增大特性。
+> · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
 （三平台 + SHA256SUMS）· 许可：MIT
 
 | 📄 文档 | 说明 |
@@ -57,10 +58,10 @@ RabbitMQ、MinIO）各自为政——安装、守护、备份、升级都是负�
 | **MySQL 网关** | `:3309`（默认） | MySQL 协议 + 标准 SQL，mysql CLI / Navicat / DBeaver / PyMySQL / SQLAlchemy / JDBC 直连；多库、事务、管理面 | 本文 / 系统SQL |
 | **时序冷库** | 同 MySQL | `series`+`points` 聚簇 schema、时间谓词整数化、`GROUP BY time(N)`、**rollup 预聚合自动路由**、多核并行 | 时序数据库 |
 | **异步任务** | 同 MySQL | `SUBMIT QUERY` 秒回 job_id；AT / WINDOW / WHEN / EVERY 周期调度（含每月/每年）；四通道回调 + HMAC；**SCRIPT 后处理管道** | 异步任务 |
-| **S3 对象存储** | `:9000`（HTTP/S） | AWS SigV4（表头/预签名/aws-chunked）；**multipart 分片上传**、版本、对象锁、生命周期、限速、请求策略、上传回调、**OpenCV 风格图片预处理（v1.3.7：画框/文字/圈线/灰度/模糊/旋转/翻转）**、计费 | S3对象存储 |
+| **S3 对象存储** | `:9000`（HTTP/S） | AWS SigV4（表头/预签名/aws-chunked 含新版 CRC32 trailer 编码）；**multipart 分片上传**、版本、对象锁、生命周期、限速、请求策略、上传回调、**OpenCV 风格图片预处理（画框/文字/圈线/灰度/模糊/旋转/翻转；多核提速 + 结果磁盘缓存）**、计费 | S3对象存储 |
 | **Redis 键值/队列** | `:3309`（mode:redis） | RESP string/list；**BLPOP/BRPOP 阻塞弹出**；TTL 惰性+扫描；**SQLite 落盘重启无损**；每用户命名空间；LRU 淘汰 | 键值队列 |
 | **RabbitMQ 队列** | `:3309`（mode:rabbitmq） | AMQP 0-9-1：direct/fanout/topic、publish/consume/ack/nack/prefetch；**confirm 发布确认 + mandatory 回退**；消息与游标落盘重启不丢 | 消息队列 |
-| **运维与安全** | 全协议 | 用户权限（库/表/IP 授权）、防爆破自动锁、查询 QoS、caching_sha2_password、SQL 审计日志 | 本文 / 配置说明 |
+| **运维与安全** | 全协议 | 用户权限（库/表/IP 授权）、防爆破自动锁（**本机回环永不锁定** + CLI 解锁）、查询 QoS、caching_sha2_password、SQL 审计日志 | 本文 / 配置说明 |
 
 ---
 
@@ -123,7 +124,7 @@ PRAGMA cache_size   = -256;     -- 每连接 256 KB
 
 - 完整握手 / 认证 / 结果集封包；**登录算法**：`mysql_native_password`（默认）+ **`caching_sha2_password` / `sha256_password`**（MySQL 8 默认算法，`auth.auth_plugin` 全局配置或 `CREATE USER … IDENTIFIED WITH <plugin>` 账号级，RSA 全认证 + 改密自动失效登录缓存）；
 - **探活语句应答表**：`SELECT @@version/@@sql_mode…`、`SHOW TABLES/COLUMNS/INDEX/CREATE TABLE/VARIABLES/PROCESSLIST…`、`SET NAMES`、`USE`、`DO 0`、`/* ping */` 逐条应答；未覆盖 `SHOW` 一律兜底空结果集；`information_schema`（21 表）/ `mysql.user` / `performance_schema` / `sys` 直接应答（支持列投影与 WHERE）；
-- **方言改写**（保守：匹配不上原样透传）：`NOW()/CURDATE()/UNIX_TIMESTAMP()/LAST_INSERT_ID()/TRUNCATE`、`NOW() ± INTERVAL n UNIT`、`GROUP BY time(N)`、日期字符串谓词整数化、`DESC 表`、`库名.表` 前缀剥除、`LIMIT o,n`、`CONCAT/IF/RAND/UUID`、`INSERT IGNORE`、**`ON DUPLICATE KEY UPDATE`（含 `VALUES(col)`）**、`FOR UPDATE` 剥离、DDL 类型映射（MySQL 建表直接粘贴）、转义序列反转义、JSON `->`/`->>` 改写；**M4 批（v1.3.3）**：`&&/||/!/XOR/DIV/RLIKE/BINARY/0x…/N'…'`、`DATE_ADD 族/EXTRACT/TRIM 方向/POSITION/GROUP_CONCAT SEPARATOR/CAST/CONVERT`、`ALTER ADD·DROP INDEX/MODIFY/CHANGE`、`RENAME TABLE`、`INSERT … SET`、`UPDATE/DELETE … ORDER BY … LIMIT`、`ANALYZE/CHECK/OPTIMIZE/REPAIR/CHECKSUM TABLE`、用户变量 `@a`；
+- **方言改写**（保守：匹配不上原样透传）：`NOW()/CURDATE()/UNIX_TIMESTAMP()/LAST_INSERT_ID()/TRUNCATE`、`NOW() ± INTERVAL n UNIT`、`GROUP BY time(N)`、日期字符串谓词整数化、`DESC 表`、`库名.表` 前缀剥除、`LIMIT o,n`、`CONCAT/IF/RAND/UUID`、`INSERT IGNORE`、**`ON DUPLICATE KEY UPDATE`（含 `VALUES(col)`）**、`FOR UPDATE` 剥离、DDL 类型映射（MySQL 建表直接粘贴）、转义序列反转义、JSON `->`/`->>` 改写；**M4 批**：`&&/||/!/XOR/DIV/RLIKE/BINARY/0x…/N'…'`、`DATE_ADD 族/EXTRACT/TRIM 方向/POSITION/GROUP_CONCAT SEPARATOR/CAST/CONVERT`、`ALTER ADD·DROP INDEX/MODIFY/CHANGE`、`RENAME TABLE`、`INSERT … SET`、`UPDATE/DELETE … ORDER BY … LIMIT`、`ANALYZE/CHECK/OPTIMIZE/REPAIR/CHECKSUM TABLE`、用户变量 `@a`；
 - **Go 标量函数**（任意表达式位置可用）：`MD5/SHA1/SHA2/SHA256`、`LEFT/RIGHT`、`SUBSTRING_INDEX`、`DATEDIFF/TIMESTAMPDIFF`、`DATE_FORMAT`（含周编号族 `%U %u %V %v %X %x`）、`CONCAT_WS/LPAD/RPAD`；JSON：`JSON_LENGTH/CONTAINS/KEYS/SEARCH/MERGE_PATCH`（原生 `JSON_EXTRACT` 等直通）；Geo：`ST_Distance/ST_Distance_Sphere/ST_Within/ST_Contains/ST_Intersects/ST_AsText/ST_GeomFromText/ST_AsGeoJSON/ST_MakePoint…`（WKT/WKB/GeoJSON 自动识别）；
 - **事务与语义对齐**：`BEGIN/COMMIT/ROLLBACK/SAVEPOINT`、`SET AUTOCOMMIT=0` 惰性隐式事务、`insert_id/affected_rows` 回填、错误码映射（1064/1290/1142/3119/1040…）；
 - **多核并行查询**：① 单表可合并聚合（COUNT/SUM/MIN/MAX/AVG）hint `/*+ PARALLEL(n) */` 或 `scan_rows` 阈值自动触发；② `GROUP BY series_id, time(N)` 按 series 取模分片并行、Go 侧按桶合并；③ 明细导出按 rowid 区间并行 scan、顺序发送；`EXPLAIN PARALLEL` 查看拆分计划。
@@ -132,8 +133,8 @@ PRAGMA cache_size   = -256;     -- 每连接 256 KB
 
 - 标准 schema（[schema/timeseries.sql](schema/timeseries.sql)）：`series` 维表 + `points(series_id, ts, val)` 聚簇事实表（`ts` = epoch ms）；tag 表达式索引；
 - **rollup 多粒度预聚合**：写 `points` 同遍落 `points_m1/h1/d1` 汇总表（INSERT 触发器）；带时间范围的聚合查询自动路由「汇总表满桶 + 原始表边缘桶」UNION，取最粗可用粒度——**结果与全量扫精确一致**（边缘桶回退原始行）；存量回填 `REBUILD ROLLUP <db>`；
-- **冷压缩与固化（v1.3.3）**：`COMPRESS COLD points BEFORE <time> [STEP n DAY|HOUR]` 按块 gzip 固化进 `points_cold`（字节级无损，实测压缩比 ~3.8），`THAW COLD` / `SHOW COLD` 配套；**读写透明**——查询触及冻结区间自动解冻、写入撞冻结区间自动重试；解冻期间摘除 rollup 触发器保证汇总不重复计数；`timeseries.cold_after_days` 后台自动固化策略；
-- **列类型映射（v1.3.3）**：DOUBLE/FLOAT/DECIMAL 以 TEXT 落盘（防浮点 15 位格式化截断，17 位有效数字精确往返），查出按系统库 `glacier_meta` 的映射自动还原 float64 并回放 MySQL 类型码；WHERE/ORDER BY 自动 `CAST(col AS REAL)` 保数值语义；SHOW COLUMNS/CREATE TABLE/information_schema 回放建表时的原始类型；
+- **冷压缩与固化**：`COMPRESS COLD points BEFORE <time> [STEP n DAY|HOUR]` 按块 gzip 固化进 `points_cold`（字节级无损，实测压缩比 ~3.8），`THAW COLD` / `SHOW COLD` 配套；**读写透明**——查询触及冻结区间自动解冻、写入撞冻结区间自动重试；解冻期间摘除 rollup 触发器保证汇总不重复计数；`timeseries.cold_after_days` 后台自动固化策略；
+- **列类型映射**：DOUBLE/FLOAT/DECIMAL 以 TEXT 落盘（防浮点 15 位格式化截断，17 位有效数字精确往返），查出按系统库 `glacier_meta` 的映射自动还原 float64 并回放 MySQL 类型码；WHERE/ORDER BY 自动 `CAST(col AS REAL)` 保数值语义；SHOW COLUMNS/CREATE TABLE/information_schema 回放建表时的原始类型；
 - 回填 ETL 规范、`EXPLAIN QUERY PLAN` 索引命中实测、压缩固化详见 [docs/时序数据库.md](docs/时序数据库.md)。
 
 ### 3. 异步任务引擎
@@ -147,43 +148,44 @@ PRAGMA cache_size   = -256;     -- 每连接 256 KB
 ### 4. 运维与安全
 
 - **用户权限系统**：账号入库（`glacier_auth.db`），`CREATE USER/GRANT/REVOKE/SHOW GRANTS/SET PASSWORD`，库级 + 表级 + IP（CIDR）授权，账号类型 SUPER/READONLY/USER 热切换；默认超级用户 `glacier` + 只读 `glacier_ro`；
-- **防爆破**：登录失败窗口计数自动锁 IP/账号（三模式、指数升级、持久化重启不解除）；可选 ufw/iptables/firewall-cmd 系统层封锁；登录失败 HTTP 告警；`SHOW LOGIN ATTEMPTS/SHOW LOCKED/UNLOCK`；
+- **防爆破**：登录失败窗口计数自动锁 IP/账号（三模式、指数升级、持久化重启不解除）；**本机回环地址（127.x / ::1 / localhost）永不锁定**——本机客户端密码配错不会把自己锁死在管理面之外；可选 ufw/iptables/firewall-cmd 系统层封锁（同样豁免回环）；登录失败 HTTP 告警；`SHOW LOGIN ATTEMPTS/SHOW LOCKED/UNLOCK`，以及**命令行解锁** `glaciertdb -unlock-user <账号>` / `-unlock-ip <IP>` / `-show-locks`（服务运行中旁路可用，无需停机）；
 - **查询 QoS**：全系统 + 单库两级配额（qps/concurrency/rows_per_sec，wait/reject）；`SET QOS` 热改、`SHOW QOS` 实时统计；
 - **SQL 审计日志**：`log.sql_log_file` JSON 行（语句/状态/耗时/行数/连接），100MB 轮转；慢查询日志标注 QoS 排队。
 
-### 5. S3 对象存储（v1.1.0，`s3.enable` 开启）
+### 5. S3 对象存储（`s3.enable` 开启）
 
-AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked`），boto3 / aws-cli / MinIO Client 直连：
+AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked` 流式——含新版 botocore / AWS CLI 默认的
+`STREAMING-*-TRAILER` CRC32 校验和编码，boto3 默认配置可直连），boto3 / aws-cli / MinIO Client 直连：
 
 - 一 bucket 一表（`glacier_s3.db`）+ 大对象分块；桶从属用户、命名空间隔离；
 - **AK/SK**：AK 32 位 `AS` 前缀 / SK 48 位 `SK` 前缀，签发/轮换/禁用/吊销（SK 明文仅一次可见）；
-- PUT/GET/HEAD/DELETE/COPY、ListObjects V1/V2、ListObjectVersions；**multipart 分片上传**（Initiate/UploadPart/Complete/Abort/ListParts/ListMultipartUploads，复合 ETag 对齐 S3 语义）；**UploadPartCopy 拷贝分片（v1.3.5）**——`x-amz-copy-source [+range]` 服务端拷贝免重传，与直传分片混合合并；**未完成上传自动回收**（`s3.abort_incomplete_days`，默认 7 天）；**单对象上限可解除**（`max_object_mb: -1` 不限制，分块存储流式）；
+- PUT/GET/HEAD/DELETE/COPY、ListObjects V1/V2、ListObjectVersions；**multipart 分片上传**（Initiate/UploadPart/Complete/Abort/ListParts/ListMultipartUploads，复合 ETag 对齐 S3 语义）；**UploadPartCopy 拷贝分片**——`x-amz-copy-source [+range]` 服务端拷贝免重传，与直传分片混合合并；**未完成上传自动回收**（`s3.abort_incomplete_days`，默认 7 天）；**单对象上限可解除**（`max_object_mb: -1` 不限制，分块存储流式）；
 - **多版本 + 对象锁（WORM/legal hold）+ 生命周期自动删除**；
 - **下载限速**：单连接 / 用户总带宽（多连接合并）/ 并发上限；**请求策略**（UA/IP/Referer/自定义 header 条件）；**上传回调**（HMAC 签名）；
-- **图片处理**：裁剪 / 缩放 / 格式转换 / base64 输出与直传；
+- **图片处理**：裁剪 / 缩放 / 格式转换 / base64 输出与直传；**OpenCV 风格 ops 管道多核提速**（可分离滑窗模糊、逐像素直写，大图管道从秒级降到亚秒级）+ **处理结果磁盘缓存**（`<db_dir>/sys/gimg_cache/`，键含对象 etag/version，覆盖自动失效，LRU 容量回收 `s3.image_cache_mb`）；响应观测头 `X-Using-Time` / `X-Gimg-Ops-Time` / `X-Gimg-Cache`；ops 裸名合法（`grayscale` ≡ `grayscale()`），非法管道显式 400 不再静默透传；
 - **网络**：region 通配（`'*'`）、virtual-host + path-style、多 endpoint、每 endpoint 泛域名证书 + bucket 自定义域名独立证书（SNI 分发、替换热加载）；
 - **计费**：`s3_usage` 按 用户 × 桶记账（请求数/字节/存储/对象数），SQL 直查 + `EXPORT S3 USAGE` + HTTP `/_glacier/s3/usage` 导出。
 
-### 6. Redis 键值/队列（v1.2.0，`kv.enable`）
+### 6. Redis 键值/队列（`kv.enable`）
 
 - RESP 服务（`mode:redis` 或嗅探）：string `GET/SET(EX·PX·NX·XX)/DEL/EXISTS/APPEND/INCR 族/MGET/MSET/KEYS/TYPE` + list 队列 `LPUSH/RPUSH/LPOP/RPOP/LLEN/LRANGE`；
-- **事务与发布订阅（v1.3.5）**：`MULTI/EXEC/DISCARD`（EXEC 返回逐条结果数组）；`SUBSCRIBE/PSUBSCRIBE/PUBLISH`（message/pmessage 推送、同连接 channel+pattern 双收、按账号命名空间隔离）；
-- **SCAN 真游标（v1.3.5）**：`SCAN cursor [MATCH][COUNT][TYPE]` 每批 COUNT 个、游标推进，`--scan`/`scan_iter` 多批遍历与 `KEYS` 等价；
-- **阻塞弹出（v1.3.2）**：`BLPOP/BRPOP key [key…] timeout`——按序取首个非空队列，Push 立即唤醒、超时返回空数组（`0` = 无限等待）；
-- **HELLO/SCAN（v1.3.3）**：`HELLO` 最小应答（server map + `proto:2`，**redis-py ≥ 8 默认 RESP3 握手直连可用**）；`SCAN` 真游标（v1.3.5：每批 COUNT 个、游标推进）；**RESP3 空值兼容（v1.3.4）**——`HELLO 3` 连接的空值应答发 RESP3 null 帧 `_`（redis-py ≥8 的 GET miss/MGET/BLPOP 超时不再挂死），RESP2 连接维持 `$-1`/`*-1`；
+- **事务与发布订阅**：`MULTI/EXEC/DISCARD`（EXEC 返回逐条结果数组）；`SUBSCRIBE/PSUBSCRIBE/PUBLISH`（message/pmessage 推送、同连接 channel+pattern 双收、按账号命名空间隔离）；
+- **SCAN 真游标**：`SCAN cursor [MATCH][COUNT][TYPE]` 每批 COUNT 个、游标推进，`--scan`/`scan_iter` 多批遍历与 `KEYS` 等价；
+- **阻塞弹出**：`BLPOP/BRPOP key [key…] timeout`——按序取首个非空队列，Push 立即唤醒、超时返回空数组（`0` = 无限等待）；
+- **HELLO / RESP3 空值兼容**：`HELLO` 最小应答（server map + `proto:2`，**redis-py ≥ 8 默认 RESP3 握手直连可用**）；`HELLO 3` 连接的空值应答发 RESP3 null 帧 `_`（redis-py ≥8 的 GET miss/MGET/BLPOP 超时不再挂死），RESP2 连接维持 `$-1`/`*-1`；
 - **TTL**：惰性过期 + 定期扫描；**变更实时写 SQLite（`glacier_kv.db`）重启无损**；
 - **命名空间 = 登录账号**（跨用户不可见）；**内存治理**：`kv.max_memory_mb` + `allkeys-lru/volatile-lru/noeviction`；`SHOW KV STATS` / `kv_stats` 占用与命中率。
 
-### 7. RabbitMQ 队列（v1.3.0，`mq.enable`）
+### 7. RabbitMQ 队列（`mq.enable`）
 
 - AMQP 0-9-1（pika / amqp091-go 互通）：exchange（**direct/fanout/topic**，`*`/`#` 通配）+ queue + binding；默认交换机直达；
 - `basic.publish/consume/ack/nack(requeue 重投 + redelivered)/reject/get/qos(prefetch)/cancel/recover`；
-- **发布确认与回退（v1.3.2）**：`confirm.select` 后逐条 `basic.ack`（失败 `basic.nack`）；`mandatory` 不可路由回退 `basic.return`（312 NO_ROUTE，内容原样）；
+- **发布确认与回退**：`confirm.select` 后逐条 `basic.ack`（失败 `basic.nack`）；`mandatory` 不可路由回退 `basic.return`（312 NO_ROUTE，内容原样）；
 - **消息与消费游标落 SQLite（`glacier_mq.db`）重启不丢**；断线未确认自动重入队；`SHOW QUEUES/SHOW EXCHANGES`；
 - 异步任务 `CALLBACK 'amqp://…'` 可指向本服务自回环；
-- **RabbitMQ 版本串可配置（v1.3.3）**：`mq.server_version`（默认 3.13.0），Connection.Start 原样上报。
+- **RabbitMQ 版本串可配置**：`mq.server_version`（默认 3.13.0），Connection.Start 原样上报。
 
-### 8. MQTT 接入（v1.3.3，`mq.mqtt.enable`）
+### 8. MQTT 接入（`mq.mqtt.enable`）
 
 - MQTT 3.1 / 3.1.1，**TCP + WebSocket** 双传输：3309 复用（CONNECT 首包嗅探 0x1x / HTTP Upgrade `/mqtt` / `mode:mqtt` 声明行），可选独立监听 `mq.mqtt.listen`；
 - 桥接 RabbitMQ：topic `a/b/c` ↔ routing key `a.b.c`（`mqtt` topic 交换机），订阅过滤器 `+`/`#` ↔ `*`/`#`，与 AMQP 客户端双向互通；
@@ -199,19 +201,19 @@ AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked`），boto3 
 ```sql
 -- 观测
 SHOW SERVER CONFIG; SHOW CLIENTS; SHOW TRANSACTIONS; KILL <id>;
--- 账号与权限（v1.0.10）
+-- 账号与权限
 CREATE USER 'u1'@'%' IDENTIFIED [WITH caching_sha2_password] BY 'pwd';
 GRANT SELECT ON backup.* TO 'u1';  SHOW GRANTS FOR 'u1';  DROP USER 'u1';
 -- 防爆破
 SHOW LOGIN ATTEMPTS LIMIT 50;  SHOW LOCKED;  UNLOCK ACCOUNT u1;  UNLOCK ALL;
 -- QoS / 并发热改
 SET QOS GLOBAL QPS = 500;  SHOW QOS;  SET GLOBAL_THREADS = 32;
--- 时序 rollup（v1.1.1）
+-- 时序 rollup
 REBUILD ROLLUP backup;
--- 键值 / 消息队列观测（v1.2.0 / v1.3.0）
+-- 键值 / 消息队列观测
 SHOW KV STATS;  SET KV MAX_MEMORY 64;  SET KV EVICTION allkeys-lru;
 SHOW QUEUES;  SHOW EXCHANGES;
--- S3 对象存储（v1.1.0）
+-- S3 对象存储
 CREATE BUCKET demo OWNER 'glacier' VERSIONING ON;   SHOW BUCKETS;
 CREATE S3 KEY FOR 'glacier';                        SHOW S3 KEYS;
 SHOW S3 USAGE;  EXPORT S3 USAGE TO 'usage.csv';     SHOW S3 OBJECTS demo LIMIT 20;
@@ -232,7 +234,8 @@ SELECT * FROM s3_usage WHERE owner = 'glacier';
 # https://github.com/sang8052/GlacierTDB/releases
 # 每个版本含：glaciertdb-linux-amd64 / linux-arm64 / windows-amd64.exe + config.example.yaml + SHA256SUMS
 sha256sum -c SHA256SUMS
-./glaciertdb-linux-amd64 -config config.example.yaml -db-dir /srv/glacier/data
+# 配置文件与二进制同目录时无需 -config：默认依次查找 ./config.yaml → exe 同目录 → /app/config.yaml
+./glaciertdb-linux-amd64 -db-dir /srv/glacier/data
 ```
 
 ### 方式二：Docker Compose
@@ -310,31 +313,36 @@ auth:
 
 concurrency: { global_threads: 0, per_db_read_threads: 0 }   # 读并发 / 写单库互斥
 parallel_query: { workers: 0, scan_rows: 1000000 }           # 并行触发
-rollup: { disable: false }             # 时序预聚合（v1.1.1）
+rollup: { disable: false }             # 时序预聚合
 qos: { on_exceed: wait, global: { qps: 0, concurrency: 0, rows_per_sec: 0 } }
 lock: { enable: true, mode: mixed, window_sec: 300, max_failures: 5 }   # 防爆破
 
 async_query: { enable: true, workers: 2 }      # 异步任务（AT/WINDOW/WHEN/EVERY/SCRIPT）
-kv: { enable: true, max_memory_mb: 64, eviction: allkeys-lru }          # Redis（v1.2.0）
-mq: { enable: true, max_message_mb: 32 }                               # RabbitMQ（v1.3.0）
-s3:                                        # 对象存储（v1.1.0，默认关闭）
+mysql: { enable: true }                        # MySQL 协议面（false = 3309 不再服务 MySQL）
+kv: { enable: true, max_memory_mb: 64, eviction: allkeys-lru }          # Redis
+mq: { enable: true, max_message_mb: 32 }                               # RabbitMQ
+s3:                                        # 对象存储（默认关闭）
   enable: false
   region: "*"
   endpoints: [{ listen: "0.0.0.0:9000" }]
   limits: { per_conn_bps: 0, per_user_bps: 0, per_user_conns: 0 }
+  image_cache: true                        # 图片预处理结果磁盘缓存（sys/gimg_cache/）
+  image_cache_mb: 1024                     # 缓存容量上限（LRU 淘汰；-1 不限）
 
 sqlite: { synchronous: NORMAL, busy_timeout_ms: 5000, cache_size_kb: 256, max_result_rows: 1000000 }
 log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 ```
 
-所有项均可省略走默认；命令行 `-config` / `-db-dir` / `-listen` 覆盖，`-vacuum` 离线真空。
+所有项均可省略走默认；命令行 `-config` / `-db-dir` / `-listen` 覆盖（`-config` 缺省依次查找
+`./config.yaml` → exe 同目录 → `/app/config.yaml`）；`-vacuum` 离线真空；`-unlock-user` / `-unlock-ip` /
+`-show-locks` 防爆破解锁与查看（服务运行中旁路可用）。
 
 ---
 
 ## 🧪 测试与兼容性
 
 `tests/run_all.sh` 一键全量（Docker 编排：mysql:8 CLI + python:3.12 PyMySQL/SQLAlchemy/pika），
-当前 **20 个测试脚本 + KV/MQ 双重启持久化检查，全套 ALL TESTS PASSED（2026-10-23）**：
+**全套 ALL TESTS PASSED（2026-10-27）**——黑盒脚本 + 四组重启持久化 + 回环/CLI/mysql.enable 专项检查：
 
 | 覆盖 | 要点 |
 | --- | --- |
@@ -342,20 +350,14 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | 并发 / 多库 / 管理面 | 跨库写并行、同库排队、KILL、改密热生效、information_schema、Navicat 兼容 |
 | 时序 / 并行 | INTERVAL/日期谓词整数化、time(N) 桶化、EXPLAIN 索引命中、80 万行并行对拍、GROUP BY 分片并行、明细并行 |
 | 异步任务 | AT/WINDOW/WHEN/EVERY/PAUSE、四通道回调 + HMAC、分片回调、SCRIPT 后处理 |
-| v1.0.10（51 项） | QoS、每周调度、用户权限、防爆破锁定、JSON 运算符、Geo ST_* |
-| S3（69 项） | SigV4/预签名、版本/对象锁/生命周期、限速、策略、图片、virtual-host、计费、上传回调 |
-| v1.1.1（37 项） | rollup 精确性对拍、REBUILD、M3 兼容、caching_sha2 登录/缓存失效 |
-| Redis（69 项）+ 重启 | 命令集、TTL、命名空间隔离、LRU/noeviction、kv_stats；容器重启无损 |
-| RabbitMQ（28 项）+ 重启 | 路由语义、consume/ack/nack/prefetch、SHOW QUEUES、amqp 回调回环；消息重启不丢 |
-| v1.3.1（44 项） | multipart 分片上传全流程（复合 ETag/Abort/ListParts）、每月/每年调度（月尾 clamp）、PHP SCRIPT 错误路径 |
-| v1.3.2（13 项） | BLPOP/BRPOP 阻塞弹出（唤醒/超时/方向）、publisher confirm 逐条 ack、mandatory 回退 312 NO_ROUTE |
-| v1.3.4（16 项） | RESP3 空值帧兼容（`_` null 协商，redis-py ≥8 空值不再挂死）+ RESP2 回归 |
-| v1.3.5（35 项） | UploadPartCopy、未完成上传自动回收、上限可解除；MULTI/EXEC、发布订阅、SCAN 真游标 |
-| v1.3.6（15 项） | 多租户强化（库可见性过滤/DEFAULT_DB/USE 1044/账号级 QPS·并发配额）+ S3 头（版本号·UUID） |
-| v1.3.7（17 项） | OpenCV 风格图片预处理（rectangle/text/circle/line/grayscale/blur/rotate/flip，GET/PUT/另存三链路） |
-| v1.3.8（1 项+重启） | 底层文件默认加密（adiantum·固定口令）+ 存量明文库自动迁移 + 依赖全量升级 |
-| v1.3.9 | FEATURE 整合收官：版本转向稳定性维护；数据目录分类（sys/ + user/） |
-| v1.3.3（111 项）+ 重启 | MySQL 8 兼容 M4（运算符/函数/DDL/维护语句/用户变量）、列类型映射（TEXT 落盘/查出还原/类型回放）、时序冷压缩固化（自动解冻）、MQTT ws+tcp 桥接、RabbitMQ 版本串可配置 |
+| QoS / 权限 / 函数 | QoS 配额、每周调度、用户权限、防爆破锁定、JSON 运算符、Geo ST_* |
+| S3 对象存储 | SigV4/预签名、版本/对象锁/生命周期、限速、策略、virtual-host、计费、上传回调、multipart 全流程、UploadPartCopy、自动回收 |
+| 图片管道 | OpenCV 风格 ops（rectangle/text/circle/line/grayscale/blur/rotate/flip，GET/PUT/另存三链路）、**结果磁盘缓存 miss/hit/失效、裸名 op、非法管道 400、计时头** |
+| Redis + 重启 | 命令集、TTL、命名空间隔离、LRU/noeviction、kv_stats、MULTI/EXEC、发布订阅、SCAN 游标、RESP3 空值帧；容器重启无损 |
+| RabbitMQ + 重启 | 路由语义、consume/ack/nack/prefetch、confirm/mandatory、SHOW QUEUES、amqp 回调回环；消息重启不丢 |
+| MySQL 8 兼容 / 列类型 / MQTT | 运算符/函数/DDL/维护语句/用户变量、列类型映射（TEXT 落盘/查出还原/类型回放）、时序冷压缩固化（自动解冻）、MQTT ws+tcp 桥接 |
+| 多租户 / 加密 | 库可见性过滤/DEFAULT_DB/USE 1044/账号级配额；底层文件加密（adiantum）+ 存量自动迁移 + 加密重启持久化 |
+| v1.3.10 专项 | **本机回环防爆破豁免（40 次错误密码后本机仍可登录）、CLI -unlock-user/-show-locks（服务运行中）、mysql.enable=false 不监听 3309 冒烟** |
 
 ---
 
@@ -363,24 +365,9 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 
 | 版本 | 主题 | 状态 |
 | --- | --- | --- |
-| v1.0.3 – v1.0.9 | MySQL 网关打磨：探活/方言/函数、异步引擎、多核并行、VACUUM/目录锁/静态加密、转义修复、只读账号 | ✅ |
-| v1.0.10 | 查询 QoS、每周调度 + PAUSE/RESUME、用户权限系统 + 防爆破、JSON、Geo | ✅ |
-| v1.1.0 | S3 对象存储（SigV4 / 版本 / 对象锁 / 限速 / 策略 / 证书 / 计费） | ✅ |
-| v1.1.1 | 存量余项全清（rollup / 分片并行 / 明细并行 / SCRIPT / M3）+ caching_sha2_password | ✅ |
-| v1.2.0 | Redis 键值/队列（RESP / TTL / 落盘 / 命名空间 / 淘汰）+ 3309 端口复用 | ✅ |
-| v1.3.0 | RabbitMQ 队列（AMQP 0-9-1 / 路由 / 持久化 / 观测）——五件套愿景交付完毕 | ✅ |
-| v1.3.1 | S3 multipart 分片上传、每月/每年调度、SCRIPT PHP 运行时 | ✅ |
-| v1.3.2 | Redis BLPOP/BRPOP 阻塞弹出、AMQP confirm 发布确认 + mandatory 回退 | ✅ |
-| v1.3.3 | MySQL 8 兼容 M4、列类型映射、时序冷压缩固化、MQTT（ws/tcp）接入 + 版本串可配置 | ✅ |
-| v1.3.4 | RESP3 空值帧兼容（redis-py ≥8 空值不再挂死） | ✅ |
-| v1.3.5 | S3 拷贝分片/自动回收/上限解除；Redis 事务/发布订阅/SCAN 游标 | ✅ |
-| v1.3.6 | 多租户强化（库过滤/默认库/USE 校验/账号配额）+ S3 响应头 | ✅ |
-| v1.3.7 | OpenCV 风格图片预处理管道（绘制/滤镜/几何 + 处理另存） | ✅ |
-| v1.3.8 | 底层文件默认加密 + 存量自动迁移；依赖全量升级（amqp091 1.16 等） | ✅ |
-| v1.3.9 | FEATURE 收官·转向稳定性维护；数据目录 sys/user 分类 | ✅ |
+| v1.3.10 | **稳定性更新首个版本**：图片管道多核提速 + 结果磁盘缓存；防爆破本机回环豁免 + CLI 解锁；`mysql.enable` 开关；默认配置路径 `config.yaml`；boto3 CRC32 trailer 兼容 | ✅ |
 
-各版本完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)；
-历史版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)。
+历史版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)。
 
 ---
 
@@ -389,21 +376,21 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 **协议层**
 
 - 不支持预处理语句（`COM_STMT_*`），客户端走文本协议；不支持 TLS / XA / `LOAD DATA` / `LOCK TABLES` / 复制协议（公网暴露请前置认证代理）；
-- S3 multipart 完整支持 **UploadPartCopy 拷贝分片**（`x-amz-copy-source [+range]`，v1.3.5）与**未完成会话自动回收**（`s3.abort_incomplete_days`，默认 7 天，0=关闭）；单对象上限 `max_object_mb`（**`-1` = 不限制**，v1.3.5）；
+- S3 multipart 完整支持 **UploadPartCopy 拷贝分片**（`x-amz-copy-source [+range]`)）与**未完成会话自动回收**（`s3.abort_incomplete_days`，默认 7 天，0=关闭）；单对象上限 `max_object_mb`（**`-1` = 不限制**)）；
 - Redis 为 RESP2（`HELLO` 应答 `proto:2` 自动降级不升级 RESP3；BLPOP/BRPOP 单连接串行阻塞，`timeout=0` 无限等待；事务为队列执行语义无 WATCH；SCAN 为快照游标——遍历期间写入可能漏见/重见）；
 - AMQP 为基本队列（无镜像/仲裁队列、无事务性队列；confirm 为逐条 ack、无 `immediate` 位；pika 1.4.4 客户端 close() 有自身 bug，见消息队列手册）。
 
 **语义层**
 
 - 系统库兼容层为常用表只读应答，非全量 MySQL 系统库；库间无跨库 JOIN；
-- `DROP DATABASE` 直接删文件不可恢复；`DECIMAL`/浮点经**列类型映射**（v1.3.3，系统库 `glacier_meta`）以 TEXT 精确落盘、查出按 MySQL 类型回放（存量旧表无映射时维持原样）；`ALTER TABLE` 支持 ADD/DROP INDEX·MODIFY·CHANGE·RENAME TABLE 等（v1.3.3），仍受 SQLite 能力集约束；
+- `DROP DATABASE` 直接删文件不可恢复；`DECIMAL`/浮点经**列类型映射**（系统库 `glacier_meta`）以 TEXT 精确落盘、查出按 MySQL 类型回放（存量旧表无映射时维持原样）；`ALTER TABLE` 支持 ADD/DROP INDEX·MODIFY·CHANGE·RENAME TABLE 等，仍受 SQLite 能力集约束；
 - rollup 仅覆盖标准 `points` schema 与可合并聚合，含 `val` 谓词等形态自动回退全量扫（语义优先）。
 
 **部署层**
 
 - 单实例单写者（红线：不做多机/复制）；`db_dir` 必须可写；
 - 无 TLS、无列级权限——仅限内网可信环境；
-- 备份 = 拷贝 `db_dir`（务必含 `glacier.json` / `glacier_s3.key` / `glacier_rsa.pem` 等密钥文件，见部署运维手册）；底层文件默认 adiantum 加密（固定口令，v1.3.8），备份包即密文，恢复需同版本服务；库文件分类存放：`sys/`（系统库）与 `user/`（用户库，v1.3.9 起自动归类）。
+- 备份 = 拷贝 `db_dir`（务必含 `glacier.json` / `glacier_s3.key` / `glacier_rsa.pem` 等密钥文件，见部署运维手册）；底层文件默认 adiantum 加密（固定口令)），备份包即密文，恢复需同版本服务；库文件分类存放：`sys/`（系统库）与 `user/`（用户库，自动归类）。
 
 ---
 
@@ -411,16 +398,16 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 
 ```
 GlacierTDB/
-├── main.go               # 入口：配置/后端/监听启动（含 -vacuum CLI）
-├── config.yaml           # 带注释配置样例（全部配置段）
+├── main.go               # 入口：配置/后端/监听启动（-vacuum / -unlock-user / -unlock-ip / -show-locks CLI）
+├── config.yaml           # 带注释配置样例（全部配置段；默认配置路径即 config.yaml）
 ├── internal/
-│   ├── proxy/            # 3309 端口复用（mode 声明 + 嗅探）与连接生命周期
+│   ├── proxy/            # 3309 端口复用（mode 声明 + 嗅探 + mysql.enable 门控）与连接生命周期
 │   ├── handler/          # MySQL Handler：探活→改写→并行/rollup→透传→审计 + 管理面 SQL
 │   ├── meta/             # 探活应答表 + 方言改写 + 系统库兼容层
 │   ├── sqlite/           # 多库后端、每库写锁、读限流、Go 标量函数（含 JSON/Geo）
-│   ├── auth/             # 用户权限系统（GRANT / 防爆破 / caching_sha2 RSA 密钥）
+│   ├── auth/             # 用户权限系统（GRANT / 防爆破[回环豁免] / caching_sha2 RSA 密钥）
 │   ├── asyncq/           # 异步任务引擎（调度 / 回调 / SCRIPT 后处理）
-│   ├── s3/               # S3 对象存储（SigV4 / 桶 / 版本 / 限速 / 证书 / 计费）
+│   ├── s3/               # S3 对象存储（SigV4 / 桶 / 版本 / 限速 / 证书 / 计费 / 图片管道+缓存）
 │   ├── kv/               # Redis 键值/队列（RESP / TTL / 落盘 / 淘汰 / HELLO/SCAN）
 │   ├── mq/               # RabbitMQ 队列（AMQP 0-9-1 / 路由 / 持久化）
 │   ├── mqtt/             # MQTT 接入（tcp/ws / 桥接 mq / 保留消息 / 遗嘱）
@@ -428,7 +415,7 @@ GlacierTDB/
 │   ├── admin/  dirlock/  config/  logx/
 ├── schema/timeseries.sql # 时序标准 schema
 ├── docs/                 # 八册手册（配置/系统SQL/时序/异步/S3/键值/消息/部署运维）
-├── tests/                # 黑盒测试（22 脚本 + run_all.sh 编排 + 重启持久化检查）
+├── tests/                # 黑盒测试（全家桶 + run_all.sh 编排 + 重启持久化/回环/CLI 检查）
 ├── Dockerfile  docker-compose.yml  LICENSE  README.md  CHANGELOG.md
 ```
 

@@ -26,6 +26,7 @@ import (
 	"image/png"
 	"math"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,6 +49,7 @@ type imgOp struct {
 }
 
 // parseOps 解析操作管道（'|' 分隔；text 的文本参数用单引号包裹可含逗号）。
+// 裸名（如 grayscale，无括号）视为零参调用 —— 与文档写法兼容，不再静默忽略。
 func parseOps(s string) ([]imgOp, error) {
 	var ops []imgOp
 	for _, seg := range strings.Split(s, "|") {
@@ -56,11 +58,16 @@ func parseOps(s string) ([]imgOp, error) {
 			continue
 		}
 		open := strings.IndexByte(seg, '(')
-		if open < 0 || !strings.HasSuffix(seg, ")") {
-			return nil, fmt.Errorf("bad op %q (want name(args))", seg)
+		name, argstr := "", ""
+		if open < 0 {
+			name = strings.ToLower(strings.TrimSpace(seg)) // 裸名 ≡ name()
+		} else {
+			if !strings.HasSuffix(seg, ")") {
+				return nil, fmt.Errorf("bad op %q (want name(args))", seg)
+			}
+			name = strings.ToLower(strings.TrimSpace(seg[:open]))
+			argstr = seg[open+1 : len(seg)-1]
 		}
-		name := strings.ToLower(strings.TrimSpace(seg[:open]))
-		argstr := seg[open+1 : len(seg)-1]
 		if _, known := opFuncs[name]; !known {
 			return nil, fmt.Errorf("unknown image op %q", name)
 		}
@@ -130,6 +137,49 @@ func toRGBA(src image.Image) *image.RGBA {
 	return out
 }
 
+// parallelBands 把 [0,total) 切成至多 8 个带并行执行（小任务直接单线程）。
+// 图像像素级处理的公共并行骨架（v1.3.10 提速：多核摊平逐像素循环）。
+func parallelBands(total int, fn func(lo, hi int)) {
+	if total <= 0 {
+		return
+	}
+	procs := runtime.GOMAXPROCS(0)
+	if procs > 8 {
+		procs = 8
+	}
+	if procs <= 1 || total < 1<<20 { // <1M 像素：并行开销不划算
+		fn(0, total)
+		return
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < procs; i++ {
+		lo := total * i / procs
+		hi := total * (i + 1) / procs
+		if lo >= hi {
+			continue
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			fn(lo, hi)
+		}(lo, hi)
+	}
+	wg.Wait()
+}
+
+// setRGBAFast 越界保护的 RGBA 像素直写（替代 image.Set 接口调用）。
+func setRGBAFast(img *image.RGBA, x, y int, c color.RGBA) {
+	b := img.Bounds()
+	if x < b.Min.X || x >= b.Max.X || y < b.Min.Y || y >= b.Max.Y {
+		return
+	}
+	off := img.PixOffset(x, y)
+	img.Pix[off] = c.R
+	img.Pix[off+1] = c.G
+	img.Pix[off+2] = c.B
+	img.Pix[off+3] = c.A
+}
+
 func colorArg(args []string, i int) (color.RGBA, error) {
 	if i+2 >= len(args) {
 		return color.RGBA{}, fmt.Errorf("color needs R,G,B args")
@@ -167,9 +217,9 @@ func opRectangle(src image.Image, args []string) (image.Image, error) {
 	x0, y0 := b.Min.X+x, b.Min.Y+y
 	x1, y1 := x0+w, y0+h
 	if thick < 0 { // FILLED
-		for yy := y0; yy < y1; yy++ {
-			for xx := x0; xx < x1; xx++ {
-				img.Set(xx, yy, c)
+		for yy := maxInt(y0, b.Min.Y); yy < minInt(y1, b.Max.Y); yy++ {
+			for xx := maxInt(x0, b.Min.X); xx < minInt(x1, b.Max.X); xx++ {
+				setRGBAFast(img, xx, yy, c)
 			}
 		}
 		return img, nil
@@ -177,12 +227,12 @@ func opRectangle(src image.Image, args []string) (image.Image, error) {
 	// 四边描线（对齐 cv2.rectangle 线宽语义）
 	for t := 0; t < thick; t++ {
 		for xx := x0; xx <= x1; xx++ {
-			img.Set(xx, y0+t, c)
-			img.Set(xx, y1-t, c)
+			setRGBAFast(img, xx, y0+t, c)
+			setRGBAFast(img, xx, y1-t, c)
 		}
 		for yy := y0; yy <= y1; yy++ {
-			img.Set(x0+t, yy, c)
-			img.Set(x1-t, yy, c)
+			setRGBAFast(img, x0+t, yy, c)
+			setRGBAFast(img, x1-t, yy, c)
 		}
 	}
 	return img, nil
@@ -214,7 +264,7 @@ func opCircle(src image.Image, args []string) (image.Image, error) {
 		for yy := -r; yy <= r; yy++ {
 			for xx := -r; xx <= r; xx++ {
 				if float64(xx*xx+yy*yy) <= rr*rr {
-					img.Set(cx+xx, cy+yy, c)
+					setRGBAFast(img, cx+xx, cy+yy, c)
 				}
 			}
 		}
@@ -228,10 +278,10 @@ func opCircle(src image.Image, args []string) (image.Image, error) {
 		for deg := 0.0; deg <= 360.0; deg += 0.25 {
 			rad := deg * math.Pi / 180
 			for ri := rr; ri <= rrOut; ri += 0.5 {
-				img.Set(cx+int(math.Round(ri*math.Cos(rad))), cy+int(math.Round(ri*math.Sin(rad))), c)
+				setRGBAFast(img, cx+int(math.Round(ri*math.Cos(rad))), cy+int(math.Round(ri*math.Sin(rad))), c)
 			}
-			_ = prev
 		}
+		_ = prev
 	}
 	return img, nil
 }
@@ -268,7 +318,7 @@ func opLine(src image.Image, args []string) (image.Image, error) {
 	for {
 		for ex := -expand; ex <= expand; ex++ {
 			for ey := -expand; ey <= expand; ey++ {
-				img.Set(x1+ex, y1+ey, c)
+				setRGBAFast(img, x1+ex, y1+ey, c)
 			}
 		}
 		if x1 == x2 && y1 == y2 {
@@ -292,6 +342,20 @@ func abs(n int) int {
 		return -n
 	}
 	return n
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // ---------------------------------------------------------------------------
@@ -382,60 +446,192 @@ func opGrayscale(src image.Image, _ []string) (image.Image, error) {
 	b := src.Bounds()
 	img := toRGBA(src)
 	out := image.NewRGBA(b)
-	for y := b.Min.Y; y < b.Max.Y; y++ {
-		for x := b.Min.X; x < b.Max.X; x++ {
-			r, g, bl, a := img.At(x, y).RGBA()
-			gray := uint32(0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(bl>>8))
-			if gray > 255 {
-				gray = 255
+	w := b.Dx()
+	// v1.3.10 提速：Pix 直写 + 行带并行（原逐像素 At/Set 接口调用，大图慢一个数量级）
+	parallelBands(b.Dy(), func(lo, hi int) {
+		for row := lo; row < hi; row++ {
+			so := img.PixOffset(b.Min.X, b.Min.Y+row)
+			do := out.PixOffset(b.Min.X, b.Min.Y+row)
+			for col := 0; col < w; col++ {
+				r := float64(img.Pix[so])
+				g := float64(img.Pix[so+1])
+				bl := float64(img.Pix[so+2])
+				gray := uint32(0.299*r + 0.587*g + 0.114*bl)
+				if gray > 255 {
+					gray = 255
+				}
+				out.Pix[do] = uint8(gray)
+				out.Pix[do+1] = uint8(gray)
+				out.Pix[do+2] = uint8(gray)
+				out.Pix[do+3] = img.Pix[so+3]
+				so += 4
+				do += 4
 			}
-			out.SetRGBA(x, y, color.RGBA{uint8(gray), uint8(gray), uint8(gray), uint8(a >> 8)})
 		}
-	}
+	})
 	return out, nil
 }
 
+// opBlur 均值滤波（cv2.blur）：可分离两遍滑动窗口（水平 → 垂直），每像素 O(1)
+// 而非 O(k²)；边界窗口仅计有效像素（与原逐点实现语义一致）。中间结果用
+// 16.16 定点避免两遍整除的舍入漂移（与精确二维均值误差 ≤ 1 LSB）。
 func opBlur(src image.Image, args []string) (image.Image, error) {
 	k := atoiArg(args, 0, 3)
 	if k < 1 || k > 51 || k%2 == 0 {
 		return nil, fmt.Errorf("blur ksize must be odd 1..51")
 	}
 	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
 	img := toRGBA(src)
-	out := image.NewRGBA(b)
 	half := k / 2
-	for y := b.Min.Y; y < b.Max.Y; y++ {
-		for x := b.Min.X; x < b.Max.X; x++ {
-			var sr, sg, sb, sa, n uint64
-			for dy := -half; dy <= half; dy++ {
-				for dx := -half; dx <= half; dx++ {
-					xx, yy := x+dx, y+dy
-					if xx < b.Min.X || xx >= b.Max.X || yy < b.Min.Y || yy >= b.Max.Y {
-						continue
-					}
-					r, g, bl, a := img.At(xx, yy).RGBA()
-					sr += uint64(r >> 8)
-					sg += uint64(g >> 8)
-					sb += uint64(bl >> 8)
-					sa += uint64(a >> 8)
-					n++
+
+	// 第一遍（水平）：tmp[通道] = round(sum * 65536 / nx)（255*51*65536 ≈ 8.5e8，uint32 可容）
+	tmp := make([]uint32, w*h*4)
+	parallelBands(h, func(lo, hi int) {
+		for row := lo; row < hi; row++ {
+			base := img.PixOffset(b.Min.X, b.Min.Y+row)
+			trow := tmp[row*w*4:]
+			var sr, sg, sb, sa uint64
+			l, r := 0, minInt(half, w-1) // x=0 的窗口 [0, half]
+			for x := 0; x <= r; x++ {
+				sr += uint64(img.Pix[base+x*4])
+				sg += uint64(img.Pix[base+x*4+1])
+				sb += uint64(img.Pix[base+x*4+2])
+				sa += uint64(img.Pix[base+x*4+3])
+			}
+			for x := 0; x < w; x++ {
+				nx := uint64(r - l + 1)
+				o := x * 4
+				trow[o] = uint32((sr*65536 + nx/2) / nx)
+				trow[o+1] = uint32((sg*65536 + nx/2) / nx)
+				trow[o+2] = uint32((sb*65536 + nx/2) / nx)
+				trow[o+3] = uint32((sa*65536 + nx/2) / nx)
+				if r+1 < w { // 右端纳入新列
+					r++
+					sr += uint64(img.Pix[base+r*4])
+					sg += uint64(img.Pix[base+r*4+1])
+					sb += uint64(img.Pix[base+r*4+2])
+					sa += uint64(img.Pix[base+r*4+3])
+				}
+				if x >= half && l < x-half+1 { // 左端移出旧列
+					sr -= uint64(img.Pix[base+l*4])
+					sg -= uint64(img.Pix[base+l*4+1])
+					sb -= uint64(img.Pix[base+l*4+2])
+					sa -= uint64(img.Pix[base+l*4+3])
+					l++
 				}
 			}
-			if n == 0 {
-				n = 1
-			}
-			out.SetRGBA(x, y, color.RGBA{uint8(sr / n), uint8(sg / n), uint8(sb / n), uint8(sa / n)})
 		}
-	}
+	})
+
+	// 第二遍（垂直）：列带并行，行窗口滑动累加，round(sum/ny) 后右移 16 位
+	out := image.NewRGBA(image.Rect(0, 0, w, h))
+	rowBytes := w * 4
+	parallelBands(w, func(clo, chi int) {
+		nb := (chi - clo) * 4
+		acc := make([]uint64, nb)
+		t, bt := 0, minInt(half, h-1) // y=0 的窗口 [0, half]
+		for i := 0; i <= bt; i++ {
+			trow := tmp[i*rowBytes:]
+			for j := 0; j < nb; j++ {
+				acc[j] += uint64(trow[clo*4+j])
+			}
+		}
+		for y := 0; y < h; y++ {
+			ny := uint64(bt - t + 1)
+			drow := out.Pix[y*rowBytes:]
+			for j := 0; j < nb; j++ {
+				drow[clo*4+j] = uint8(((acc[j]+ny/2)/ny + 0x8000) >> 16)
+			}
+			if bt+1 < h {
+				bt++
+				trow := tmp[bt*rowBytes:]
+				for j := 0; j < nb; j++ {
+					acc[j] += uint64(trow[clo*4+j])
+				}
+			}
+			if y >= half && t < y-half+1 {
+				trow := tmp[t*rowBytes:]
+				for j := 0; j < nb; j++ {
+					acc[j] -= uint64(trow[clo*4+j])
+				}
+				t++
+			}
+		}
+	})
 	return out, nil
 }
 
 func opRotate(src image.Image, args []string) (image.Image, error) {
 	deg := atoiArg(args, 0, 90)
 	switch ((deg % 360) + 360) % 360 {
+	case 90, 180, 270:
+	case 0:
+		return src, nil
+	default:
+		return nil, fmt.Errorf("rotate supports 90/180/270 only")
+	}
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	// RGBA 快速路径：按字节直拷（v1.3.10 提速，大图约一个数量级）
+	if s, ok := src.(*image.RGBA); ok {
+		ow, oh := w, h
+		if deg != 180 {
+			ow, oh = h, w
+		}
+		out := image.NewRGBA(image.Rect(0, 0, ow, oh))
+		ss := s.Stride
+		ds := out.Stride
+		switch deg {
+		case 90: // out(h-1-y, x) = src(x, y)：按输出行顺序直写
+			parallelBands(ow, func(lo, hi int) { // 输出行 = 源列 x
+				for x := lo; x < hi; x++ {
+					so := s.PixOffset(b.Min.X+x, b.Min.Y)
+					for y := 0; y < h; y++ {
+						si := so + y*ss
+						di := x*ds + (h-1-y)*4
+						out.Pix[di] = s.Pix[si]
+						out.Pix[di+1] = s.Pix[si+1]
+						out.Pix[di+2] = s.Pix[si+2]
+						out.Pix[di+3] = s.Pix[si+3]
+					}
+				}
+			})
+		case 180: // 行倒序 + 行内逆序
+			parallelBands(oh, func(lo, hi int) {
+				for y := lo; y < hi; y++ {
+					so := s.PixOffset(b.Min.X, b.Min.Y+h-1-y)
+					do := y * ds
+					for x := 0; x < w; x++ {
+						si := so + (w-1-x)*4
+						out.Pix[do] = s.Pix[si]
+						out.Pix[do+1] = s.Pix[si+1]
+						out.Pix[do+2] = s.Pix[si+2]
+						out.Pix[do+3] = s.Pix[si+3]
+						do += 4
+					}
+				}
+			})
+		default: // 270：out(y, w-1-x) = src(x, y)
+			parallelBands(ow, func(lo, hi int) { // 输出行 = w-1-x → x = ow-1-行
+				for xr := lo; xr < hi; xr++ {
+					x := ow - 1 - xr
+					so := s.PixOffset(b.Min.X+x, b.Min.Y)
+					for y := 0; y < h; y++ {
+						si := so + y*ss
+						di := xr*ds + y*4
+						out.Pix[di] = s.Pix[si]
+						out.Pix[di+1] = s.Pix[si+1]
+						out.Pix[di+2] = s.Pix[si+2]
+						out.Pix[di+3] = s.Pix[si+3]
+					}
+				}
+			})
+		}
+		return out, nil
+	}
+	switch ((deg % 360) + 360) % 360 {
 	case 90:
-		b := src.Bounds()
-		w, h := b.Dx(), b.Dy()
 		out := image.NewRGBA(image.Rect(0, 0, h, w))
 		for y := 0; y < h; y++ {
 			for x := 0; x < w; x++ {
@@ -444,8 +640,6 @@ func opRotate(src image.Image, args []string) (image.Image, error) {
 		}
 		return out, nil
 	case 180:
-		b := src.Bounds()
-		w, h := b.Dx(), b.Dy()
 		out := image.NewRGBA(image.Rect(0, 0, w, h))
 		for y := 0; y < h; y++ {
 			for x := 0; x < w; x++ {
@@ -453,9 +647,7 @@ func opRotate(src image.Image, args []string) (image.Image, error) {
 			}
 		}
 		return out, nil
-	case 270:
-		b := src.Bounds()
-		w, h := b.Dx(), b.Dy()
+	default:
 		out := image.NewRGBA(image.Rect(0, 0, h, w))
 		for y := 0; y < h; y++ {
 			for x := 0; x < w; x++ {
@@ -463,17 +655,46 @@ func opRotate(src image.Image, args []string) (image.Image, error) {
 			}
 		}
 		return out, nil
-	case 0:
-		return src, nil
 	}
-	return nil, fmt.Errorf("rotate supports 90/180/270 only")
 }
 
 func opFlip(src image.Image, args []string) (image.Image, error) {
 	code := atoiArg(args, 0, 1)
+	switch code {
+	case 0, 1, -1:
+	default:
+		return nil, fmt.Errorf("flip code must be 0|1|-1")
+	}
 	b := src.Bounds()
 	w, h := b.Dx(), b.Dy()
 	out := image.NewRGBA(image.Rect(0, 0, w, h))
+	if s, ok := src.(*image.RGBA); ok { // 快速路径：字节直拷
+		ds := out.Stride
+		parallelBands(h, func(lo, hi int) {
+			for y := lo; y < hi; y++ {
+				sy := y // 源行
+				if code == 0 || code == -1 {
+					sy = h - 1 - y
+				}
+				so := s.PixOffset(b.Min.X, b.Min.Y+sy)
+				do := y * ds
+				switch code {
+				case 1, -1: // 水平 / 双向：行内逆序（双向的行倒序已在 sy 中处理）
+					for x := 0; x < w; x++ {
+						si := so + (w-1-x)*4
+						out.Pix[do] = s.Pix[si]
+						out.Pix[do+1] = s.Pix[si+1]
+						out.Pix[do+2] = s.Pix[si+2]
+						out.Pix[do+3] = s.Pix[si+3]
+						do += 4
+					}
+				default: // 0 垂直：仅行倒序（上面 sy 已处理），行内正序
+					copy(out.Pix[do:do+w*4], s.Pix[so:so+w*4])
+				}
+			}
+		})
+		return out, nil
+	}
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			sx, sy := x, y
@@ -484,8 +705,6 @@ func opFlip(src image.Image, args []string) (image.Image, error) {
 				sx = w - 1 - x
 			case -1: // 双向
 				sx, sy = w-1-x, h-1-y
-			default:
-				return nil, fmt.Errorf("flip code must be 0|1|-1")
 			}
 			out.Set(x, y, src.At(b.Min.X+sx, b.Min.Y+sy))
 		}

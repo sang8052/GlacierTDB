@@ -93,7 +93,12 @@ kv:
   eviction: allkeys-lru   # allkeys-lru | volatile-lru | noeviction
   scan_interval_sec: 5    # TTL 主动扫描周期（最低 1）
 
-# 端口复用嗅探窗口（v1.2.0）：等待客户端首包识别 mode:<service>/RESP/AMQP，
+# MySQL 协议服务（3309 复用端口上的 MySQL 面）
+mysql:
+  enable: true            # false = 3309 不再服务 MySQL（RESP/AMQP/MQTT 不受影响；
+                          #        mysql/kv/mq 全关时不监听 3309，适合纯 S3 等独立部署）
+
+# 端口复用嗅探窗口：等待客户端首包识别 mode:<service>/RESP/AMQP，
 # 超时无数据按 MySQL 处理（MySQL 客户端静默等握手）；高 RTT 客户端可调大
 mux_sniff_ms: 300
 
@@ -114,8 +119,8 @@ timeseries:
   cold_after_days: 0      # 数据年龄超过 N 天自动冷压缩（0 = 关闭自动策略，仅手动）
   cold_scan_min_sec: 600  # 后台扫描周期（最低 60）
 
-# S3 对象存储（v1.1.0，可选模块）：AWS Signature V4 兼容，独立 HTTP(S) 监听器（不进 3309 复用）
-# 详见 docs/S3对象存储.md 与 docs/配置说明.md §2.10
+# S3 对象存储（可选模块）：AWS Signature V4 兼容，独立 HTTP(S) 监听器（不进 3309 复用）
+# 详见 docs/S3对象存储.md 与 docs/配置说明.md
 s3:
   enable: false             # 开关（默认关）
   region: "*"               # '*' / 空 = 客户端任意 region 或不传；具体值 = 签名 scope 必须一致
@@ -137,7 +142,9 @@ s3:
   bucket_limits: {}         # 按桶覆盖，如 backup: { per_conn_bps: 1048576 }
   lifecycle_interval_sec: 3600   # 生命周期（自动删除）扫描周期
   callback_secret: ""       # 上传回调默认 HMAC 签名密钥（桶级 SET S3 CALLBACK 覆盖）
-  # image_font: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf  # 图片文字 ttf 字体（v1.3.7；空=内置 ASCII）
+  # image_font: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf  # 图片文字 ttf 字体（空=内置 ASCII）
+  image_cache: true         # 图片预处理结果磁盘缓存（GET 加工链路；<db_dir>/sys/gimg_cache/）
+  image_cache_mb: 1024      # 缓存容量上限（MB；超出按最久未用淘汰；-1 = 不限）
 
 log:
   level: info              # debug | info | warn | error

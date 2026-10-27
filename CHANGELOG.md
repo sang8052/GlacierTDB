@@ -2,6 +2,52 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.10.beta] - 2026-10-27
+
+> **版本基调转折**：自 1.3.10 起项目转向**稳定性更新**（性能优化 / BUG 修复 / 运维体验），
+> 不再新增大特性（README 首页已声明）。
+
+### 新增
+- **图片预处理提速与结果缓存**（S3 `x-gimg-*` 链路）：
+  - **多核提速**：`blur` 改为可分离两遍滑动窗口（每像素 O(1)，与核大小无关，16.16 定点
+    中间量抑制两遍舍入漂移）；`grayscale` / `rotate` / `flip` / `resize` 走 RGBA 字节
+    直读直写路径；全部像素级操作按行带并行（≤8 带）——4096×3072 大图多步管道由约 8 秒
+    降至亚秒级；
+  - **结果磁盘缓存**：GET 加工结果落盘 `<db_dir>/sys/gimg_cache/`，键 = sha256(对象身份 +
+    参数规范化串)——对象覆盖/删除自动失效；并发同参数请求单飞只处理一次；容量 `s3.image_cache_mb`
+    （默认 1024，`-1` 不限）超限按最久未用淘汰；`s3.image_cache` 可关；
+  - **观测响应头**：`X-Using-Time`（请求整体耗时）/ `X-Gimg-Ops-Time`（管道纯处理耗时）/
+    `X-Gimg-Cache: miss|hit`；
+  - **语法修正**（坑 8）：ops 裸名合法（`grayscale` ≡ `grayscale()`）；非法管道
+    （未知 op / 括号不闭合 / 参数非法）显式 400 `InvalidArgument`，不再静默透传原图。
+- **防爆破本机回环豁免**（坑 2 场景）：127.x.x.x / ::1 / localhost **永不锁定**（计数、落锁、
+  防火墙封锁三层全豁免）——本机客户端密码配错不会把 127.0.0.1 锁死在管理面之外；
+  登录审计照记、账号维度计数不受影响。
+- **CLI 旁路解锁**：`glaciertdb -unlock-user <账号>` / `-unlock-ip <IP>` / `-show-locks`——
+  直连 `glacier_auth` 系统库做小事务（WAL 多进程并发安全、不抢目录锁），**服务运行中可用**；
+  账号被锁无法登录管理面时的自救通道。
+- **`mysql.enable` 配置项**：false 时 3309 不再服务 MySQL（RESP/AMQP/MQTT 不受影响）；
+  与 `kv.enable` / `mq.enable` 同时关闭时不监听 3309，进程保持运行（纯 S3 等独立端口部署形态）。
+
+### 修复
+- **boto3 默认 CRC32 校验和在 TLS 端点 BadDigest**（坑 1）：新版 botocore / AWS CLI 对
+  PutObject 默认追加 CRC32 并以 `aws-chunked` 流式 trailer 编码（`STREAMING-UNSIGNED-PAYLOAD-TRAILER`
+  等）；服务端此前不识别该类声明，把分帧体当净荷校验导致必报 BadDigest。现按 `STREAMING-*`
+  前缀统一识别为流式编码、解码后按 `x-amz-decoded-content-length` 校验净荷长度，
+  boto3 默认配置（无需 `request_checksum_calculation=when_required`）即可直连；
+  multipart UploadPart 同步修复。
+
+### 变更
+- **默认配置路径改为 `config.yaml`**（坑 3）：`-config` 缺省时依次查找 `./config.yaml` →
+  可执行文件同目录 → `/app/config.yaml`（Docker 惯例）——Windows 裸起 exe 无需显式传参；
+  Dockerfile CMD 显式参数不受影响。
+- `bugs/` 目录加入 `.gitignore`（多版本/多来源 bug 反馈存档，不进仓库）。
+- 全部文档与配置样例清除历史 alpha 版本号标注（历史明细仅保留于 CHANGELOG）。
+- `tests/test_v1310.py` 新增（图片缓存 miss/hit/失效、裸名 op、非法管道 400、计时头、
+  账号锁定 + 管理面解锁）并纳入 `tests/run_all.sh`；编排新增 3.4 段：本机回环豁免
+  （proxy 网络命名空间内 40 次错误密码后正确登录仍成功）、CLI 解锁/查锁、
+  `mysql.enable=false` 不监听 3309 冒烟；全套回归 **ALL TESTS PASSED**。
+
 ## [1.3.9.alpha] - 2026-10-27
 
 ### 变更

@@ -313,6 +313,26 @@ func (b *Backend) OpenSystemDB() (*sql.DB, error) {
 	return b.openFileRetry(b.fileFor(SystemAuthDB), 2)
 }
 
+// OpenAuthDBDirect CLI 直连打开 glacier_auth 系统库（解锁/查锁用）：
+// 不建默认库、不自检、不迁移目录布局、不抢目录锁——服务运行中可安全调用
+// （WAL 多进程并发；仅做几行小事务）。DSN 语义与 NewBackend 完全一致。
+func OpenAuthDBDirect(cfg *config.Config) (*sql.DB, error) {
+	q := url.Values{}
+	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", cfg.SQLite.BusyTimeoutMs))
+	q.Add("_pragma", "journal_mode(WAL)")
+	q.Add("_pragma", "foreign_keys(1)")
+	q.Add("_pragma", fmt.Sprintf("synchronous(%d)", cfg.SQLite.SynchronousLevel()))
+	q.Add("_pragma", fmt.Sprintf("cache_size(-%d)", cfg.SQLite.CacheSizeKB))
+	b := &Backend{
+		dir:       cfg.DBDir,
+		encrypt:   cfg.Security.Encrypt,
+		passphrase: cfg.Security.Passphrase,
+		dsnOpts:   q.Encode(),
+	}
+	_ = os.MkdirAll(filepath.Join(b.dir, SysDir), 0o755)
+	return b.openFileRetry(b.fileFor(SystemAuthDB), 2)
+}
+
 // OpenS3DB 打开对象存储系统库（glacier_s3.db，v1.1.0），供 s3 包使用。
 // 对象存储需并发读 + 流式取内容，物理连接池放宽到 4（写仍由 s3.Store 串行化）。
 func (b *Backend) OpenS3DB() (*sql.DB, error) {

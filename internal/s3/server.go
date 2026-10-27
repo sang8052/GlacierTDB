@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -68,17 +69,24 @@ type Server struct {
 	httpClient *http.Client
 	servers    []*http.Server
 	certRegs   []*certRegistry
+	imgcache   *imgCache // 图片预处理结果磁盘缓存（GET 加工链路；nil/未启用 = 关）
 	started    bool
 }
 
 // NewServer 创建 S3 服务。
 func NewServer(cfg *config.Config, store *Store, auths *auth.Store) *Server {
-	SetImageFont(cfg.S3.ImageFont) // v1.3.7：图片文字 ttf 字体（空 = 内置 ASCII）
+	SetImageFont(cfg.S3.ImageFont) // 图片文字 ttf 字体（空 = 内置 ASCII）
 	s := &Server{
 		cfg:   cfg,
 		store: store,
 		auths: auths,
 		httpClient: &http.Client{Timeout: 10 * time.Second},
+	}
+	if cfg.S3.ImageCache {
+		s.imgcache = newImgCache(filepath.Join(cfg.DBDir, "sys"), cfg.S3.ImageCacheMB)
+		if s.imgcache.enabled() {
+			logx.Infof("s3: image cache enabled at %s (cap %d MB)", filepath.Join(cfg.DBDir, "sys", "gimg_cache"), cfg.S3.ImageCacheMB)
+		}
 	}
 	s.lim = newLimiter(store.EffectiveLimit)
 	return s
@@ -134,6 +142,9 @@ func (s *Server) lifecycleLoop() {
 	defer t.Stop()
 	for range t.C {
 		s.store.RunLifecycle()
+		if s.imgcache.enabled() { // 图片缓存顺带做一轮容量回收
+			s.imgcache.enforce()
+		}
 	}
 }
 
@@ -151,9 +162,33 @@ type endpointHandler struct {
 	certs *certRegistry
 }
 
+// timingRW 响应计时包装：首个响应字节写出前补 X-Using-Time（请求整体耗时）
+// 与可选 X-Gimg-Ops-Time（图片管道纯处理耗时）观测头。
+type timingRW struct {
+	http.ResponseWriter
+	start   time.Time
+	opsTime time.Duration
+	headerDone bool
+}
+
+func (t *timingRW) stamp() {
+	if t.headerDone {
+		return
+	}
+	t.headerDone = true
+	t.Header().Set("X-Using-Time", time.Since(t.start).Round(time.Millisecond).String())
+	if t.opsTime > 0 {
+		t.Header().Set("X-Gimg-Ops-Time", t.opsTime.Round(time.Millisecond).String())
+	}
+}
+
+func (t *timingRW) WriteHeader(code int) { t.stamp(); t.ResponseWriter.WriteHeader(code) }
+func (t *timingRW) Write(b []byte) (int, error) { t.stamp(); return t.ResponseWriter.Write(b) }
+
 func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s := h.srv
 	reqID := genRequestUUID()
+	w = &timingRW{ResponseWriter: w, start: time.Now()}
 	w.Header().Set("x-amz-request-id", reqID)
 	w.Header().Set("Server", "GlacierTDB/"+config.GlacierVersion)
 
@@ -623,18 +658,33 @@ func (h *endpointHandler) handleObject(w http.ResponseWriter, r *http.Request, b
 	}
 }
 
-// putObject 上传对象（支持 base64 上传解码、aws-chunked 流式、负载哈希校验）。
+// putObject 上传对象（支持 base64 上传解码、aws-chunked 流式[含新版 CRC32 trailer 编码]、
+// 负载哈希校验）。
 func (h *endpointHandler) putObject(w http.ResponseWriter, r *http.Request, bucket, key, owner,
 	payloadHash string, img imgParams, hasImg bool, reqID string) {
+	if hasImg && img.OpsErr != nil { // 非法 x-gimg-ops：显式 400，不再静默透传
+		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: img.OpsErr.Error()})
+		return
+	}
 	body := io.Reader(r.Body)
 	contentEnc := r.Header.Get("Content-Encoding")
-	if payloadHash == payloadStreaming || strings.Contains(strings.ToLower(contentEnc), "aws-chunked") {
+	if isStreamingPayload(payloadHash) || strings.Contains(strings.ToLower(contentEnc), "aws-chunked") {
 		body = newAWSChunkedReader(r.Body)
 	}
 	// 负载哈希校验（BadDigest）：签名已覆盖声明值，此处验证实际字节
 	var hr io.Reader = body
-	if payloadHash != "" && payloadHash != payloadUnsigned && payloadHash != payloadStreaming {
+	if payloadHash != "" && payloadHash != payloadUnsigned && !isStreamingPayload(payloadHash) {
 		hr = &hashCheckReader{r: body, h: sha256.New(), expected: payloadHash}
+	}
+	// aws-chunked 帧长 ≠ 净荷长：按声明净荷长校验，未声明则跳过长度校验
+	sizeHint := r.ContentLength
+	if isStreamingPayload(payloadHash) || strings.Contains(strings.ToLower(contentEnc), "aws-chunked") {
+		sizeHint = -1
+		if v := r.Header.Get("x-amz-decoded-content-length"); v != "" {
+			if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+				sizeHint = n
+			}
+		}
 	}
 
 	attrs := ObjectAttrs{
@@ -725,7 +775,7 @@ func (h *endpointHandler) putObject(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-	m, replaced, err := h.srv.store.PutObject(bucket, key, hr, r.ContentLength, attrs)
+	m, replaced, err := h.srv.store.PutObject(bucket, key, hr, sizeHint, attrs)
 	if err != nil {
 		writeErr(w, r, reqID, toS3Err(err))
 		return
@@ -746,21 +796,74 @@ func (h *endpointHandler) finishPut(w http.ResponseWriter, r *http.Request, buck
 	w.WriteHeader(http.StatusOK)
 }
 
-// getObject 下载对象（限速 + 图片加工 + 记账）。
+// getObject 下载对象（限速 + 图片加工[磁盘缓存] + 记账）。
 func (h *endpointHandler) getObject(w http.ResponseWriter, r *http.Request, bucket, key, versionID, owner string,
 	img imgParams, hasImg bool, lim config.S3Limit, userTB *tokenBucket, reqID string) {
 	headOnly := r.Method == http.MethodHead
 
-	// 图片加工链路（裁剪 / 缩放 / 格式转换 / base64 输出）需整体加工
-	if hasImg && (img.ResizeW > 0 || img.ResizeH > 0 || !img.Crop.Empty() || img.Format != "" || img.Base64 || len(img.Ops) > 0) {
-		m, data, err := h.srv.store.GetObjectBytes(bucket, key, versionID)
+	// 图片加工链路（裁剪 / 缩放 / 格式转换 / ops 管道 / base64 输出）需整体加工；
+	// 非法 ops（解析失败）也进此分支：显式 400，不再静默透传原图
+	if hasImg && (img.OpsErr != nil || img.ResizeW > 0 || img.ResizeH > 0 || !img.Crop.Empty() || img.Format != "" || img.Base64 || len(img.Ops) > 0) {
+		if img.OpsErr != nil { // 非法 x-gimg-ops：显式 400，不再静默透传原图
+			writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: img.OpsErr.Error()})
+			return
+		}
+		// 先取元数据算缓存键（含 etag/version：对象变更后旧条目自然失效）
+		m, err := h.srv.store.HeadObject(bucket, key, versionID)
 		if err != nil {
 			writeErr(w, r, reqID, toS3Err(err))
 			return
 		}
-		out, ct, err := processImage(data, img)
+		needTransform := !img.Crop.Empty() || img.ResizeW > 0 || img.ResizeH > 0 || img.Format != "" || len(img.Ops) > 0
+		var ck string
+		if h.srv.imgcache.enabled() && needTransform {
+			ck = h.srv.imgcache.key(bucket, key, m.VersionID, m.ETag, img)
+			if out, ct, ok := h.srv.imgcache.get(ck); ok {
+				h.srv.store.AddUsage(usageOwner(h.srv, bucket, owner), bucket, "GET", 0, int64(len(out)))
+				if ct != "" {
+					w.Header().Set("Content-Type", ct)
+				} else {
+					w.Header().Set("Content-Type", orDefault(m.ContentType, "application/octet-stream"))
+				}
+				w.Header().Set("ETag", "\""+m.ETag+"\"")
+				w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+				w.Header().Set("X-Gimg-Cache", "hit")
+				if headOnly {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				_, cw := newLimitedWriter(w, lim.PerConnBps, userTB)
+				_, _ = cw.Write(out)
+				return
+			}
+		}
+		process := func() ([]byte, string, error) {
+			_, data, err := h.srv.store.GetObjectBytes(bucket, key, versionID)
+			if err != nil {
+				return nil, "", err
+			}
+			opsStart := time.Now()
+			out, ct, perr := processImage(data, img)
+			if tw, ok := w.(*timingRW); ok && needTransform {
+				tw.opsTime = time.Since(opsStart)
+			}
+			if perr != nil {
+				return nil, "", &s3Error{Code: "InvalidArgument", Status: 400, Msg: perr.Error()}
+			}
+			if ck != "" { // 处理结果落缓存（对象身份 + 参数为键；单飞下只写一次）
+				h.srv.imgcache.put(ck, out, ct)
+			}
+			return out, ct, nil
+		}
+		var out []byte
+		var ct string
+		if ck != "" { // 单飞：并发同键请求只处理一次
+			out, ct, err = h.srv.imgcache.do(ck, process)
+		} else {
+			out, ct, err = process()
+		}
 		if err != nil {
-			writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: err.Error()})
+			writeErr(w, r, reqID, toS3Err(err))
 			return
 		}
 		h.srv.store.AddUsage(usageOwner(h.srv, bucket, owner), bucket, "GET", 0, int64(len(out)))
@@ -771,6 +874,9 @@ func (h *endpointHandler) getObject(w http.ResponseWriter, r *http.Request, buck
 		}
 		w.Header().Set("ETag", "\""+m.ETag+"\"")
 		w.Header().Set("Content-Length", strconv.Itoa(len(out)))
+		if h.srv.imgcache.enabled() && needTransform {
+			w.Header().Set("X-Gimg-Cache", "miss")
+		}
 		if headOnly {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -936,13 +1042,13 @@ func (h *endpointHandler) uploadPart(w http.ResponseWriter, r *http.Request, buc
 		return
 	}
 	body := io.Reader(r.Body)
-	chunked := payloadHash == payloadStreaming ||
+	chunked := isStreamingPayload(payloadHash) ||
 		strings.Contains(strings.ToLower(r.Header.Get("Content-Encoding")), "aws-chunked")
 	if chunked {
 		body = newAWSChunkedReader(r.Body)
 	}
 	var hr io.Reader = body
-	if payloadHash != "" && payloadHash != payloadUnsigned && payloadHash != payloadStreaming {
+	if payloadHash != "" && payloadHash != payloadUnsigned && !isStreamingPayload(payloadHash) {
 		hr = &hashCheckReader{r: body, h: sha256.New(), expected: payloadHash}
 	}
 	sizeHint := r.ContentLength
@@ -1232,6 +1338,10 @@ func genRequestUUID() string {
 // imageProcessSave POST ?x-gimg-ops=...&x-gimg-save-as=b/k2 → 读源对象执行操作管道后另存（v1.3.7）。
 func (h *endpointHandler) imageProcessSave(w http.ResponseWriter, r *http.Request, bucket, key string,
 	img imgParams, owner, reqID string) {
+	if img.OpsErr != nil { // 非法管道：400（不再静默透传）
+		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: img.OpsErr.Error()})
+		return
+	}
 	if len(img.Ops) == 0 {
 		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400,
 			Msg: "x-gimg-save-as requires x-gimg-ops"})

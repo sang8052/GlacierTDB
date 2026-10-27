@@ -29,6 +29,17 @@ const (
 	serviceName       = "s3"
 )
 
+// isStreamingPayload 判断 x-amz-content-sha256 声明是否为 aws-chunked 流式编码。
+// 覆盖新版 botocore / AWS CLI 的 CRC32 默认校验和编码：
+//   STREAMING-UNSIGNED-PAYLOAD-TRAILER
+//   STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER
+//   STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD(-TRAILER)
+// 此类请求体是分帧格式（trailer 携带 crc32），必须解码后才是净荷，
+// 且不做整负载 sha256 比对（声明值是字面量而非哈希）。
+func isStreamingPayload(h string) bool {
+	return h != "" && strings.HasPrefix(h, "STREAMING-")
+}
+
 // credScope 一次签名请求的凭据范围（从 Authorization / 预签名查询串解析）。
 type credScope struct {
 	AK            string

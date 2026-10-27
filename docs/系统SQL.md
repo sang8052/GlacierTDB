@@ -3,7 +3,7 @@
 > GlacierTDB 在标准 SQL 透传之外，提供三类系统级 SQL 能力：
 > **管理面私有 SQL**（`USE GlacierTDB`）、**系统库兼容层**（`information_schema` / `mysql` / …）、**探活与兜底**（`SHOW` 家族 / `DESC` / `glacier_version`）。
 >
-> 登录账号：管理账号固定为 `glacier`；另有只读账号（默认 `glacier_ro`，v1.0.9）——同等认证，
+> 登录账号：管理账号固定为 `glacier`；另有只读账号（默认 `glacier_ro`）——同等认证，
 > 仅允许查询与查看（写语句 / 事务 / 管理面变更命令一律 `1290` 拒绝）。连接后默认库为配置的 `default_db`（默认 `backup`）。
 
 ---
@@ -34,7 +34,7 @@ SELECT name FROM server_config WHERE name LIKE 'sqlite.%';
 
 | 键 | 说明 |
 | --- | --- |
-| `glacier_version` | GlacierTDB 自身版本（如 `1.3.0.alpha`） |
+| `glacier_version` | GlacierTDB 自身版本（如 `1.3.10.beta`） |
 | `server` / `server_version` | 产品名 / 对外模拟的 MySQL 协议版本（`8.99.999`） |
 | `listen` / `db_dir` / `default_db` / `databases` | 监听、库目录、默认库、当前库列表 |
 | `auth.user` / `auth.readonly_user` | 管理账号（固定 `glacier`）/ 只读账号名 |
@@ -89,7 +89,7 @@ SET PASSWORD = '<新密码>';                          -- 推荐
 SET PASSWORD FOR glacier = '<新密码>';
 ALTER USER 'glacier' IDENTIFIED BY '<新密码>';
 
--- 只读账号密码（v1.0.9，与管理员同等热改/持久化）
+-- 只读账号密码（与管理员同等热改/持久化）
 SET PASSWORD FOR glacier_ro = '<新密码>';
 ALTER USER 'glacier_ro' IDENTIFIED BY '<新密码>';
 ```
@@ -109,15 +109,15 @@ SET DB_READ_THREADS backup = 0;       -- 0 = 删除覆盖，回到全局默认
 
 即时生效，可在压测间动态调节；**重启后回到 `config.yaml` 中 `concurrency` 的值**。当前值通过 `server_config` 查看（见 1.1）。
 
-### 1.6 用户权限管理（v1.0.10，仅超级用户）
+### 1.6 用户权限管理（仅超级用户）
 
 账号入库（`glacier_auth.db` 系统表），MySQL 风格语法：
 
 ```sql
 CREATE USER 'u1'@'%' IDENTIFIED BY 'pwd';          -- host 省略 = '%'；可加 SUPER/READONLY/USER
-CREATE USER 't1' IDENTIFIED BY 'pwd' USER DEFAULT_DB db_a;  -- 租户默认库（v1.3.6，登录即落该库）
-SET USER 't1' DEFAULT_DB db_b;                       -- 热改默认库（v1.3.6）
-SET USER 't1' QOS QPS=5 CONCURRENCY=2;              -- 账号级配额（v1.3.6；QPS/CONCURRENCY 单参亦可；CLEAR 清除）
+CREATE USER 't1' IDENTIFIED BY 'pwd' USER DEFAULT_DB db_a;  -- 租户默认库（登录即落该库）
+SET USER 't1' DEFAULT_DB db_b;                       -- 热改默认库
+SET USER 't1' QOS QPS=5 CONCURRENCY=2;              -- 账号级配额（QPS/CONCURRENCY 单参亦可；CLEAR 清除）
 CREATE USER 'u2'@'192.168.1.%' IDENTIFIED BY 'pwd' READONLY;
 ALTER USER 'u1' IDENTIFIED BY 'newpwd';            -- 改密（= SET PASSWORD FOR 'u1'）
 ALTER USER 'u1' READONLY;                          -- 账号类型热切换 SUPER/READONLY/USER
@@ -136,7 +136,7 @@ DROP USER 'u1';
 - **视图**：`SELECT * FROM users`（不含密码）/ `user_grants` / `user_hosts`；
 - 旧版配置（config auth 段 + `glacier.json`）首次启动自动迁移；`glacier` 保持默认超级用户。
 
-### 1.7 防爆破审计与解锁（v1.0.10，仅超级用户）
+### 1.7 防爆破审计与解锁（仅超级用户）
 
 ```sql
 SHOW LOGIN ATTEMPTS LIMIT 50;     -- 登录审计：Id/Time/IP/Remote/User/Success/Reason
@@ -148,7 +148,7 @@ UNLOCK ALL;                       -- 全部解锁
 
 失败计数、锁定模式（ip_only/account_only/mixed）、系统层防火墙封锁与 HTTP 告警见 [配置说明.md §2.9](配置说明.md)。
 
-### 1.8 查询 QoS（v1.0.10，仅超级用户）
+### 1.8 查询 QoS（仅超级用户）
 
 ```sql
 SET QOS GLOBAL QPS = 500;                 -- 全系统每秒查询数（令牌桶）
@@ -171,7 +171,7 @@ SELECT glacier_version;               -- GlacierTDB 自身版本（≠ @@version
 KILL <conn_id>;                       -- 见 1.3
 ```
 
-### 1.9a rollup 与登录算法（v1.1.1）
+### 1.9a rollup 与登录算法
 
 ```sql
 REBUILD ROLLUP <db>;                      -- 从原始 points 回填 m1/h1/d1 汇总表（超级用户，写锁长持）
@@ -179,7 +179,7 @@ CREATE USER 'u'@'%' IDENTIFIED WITH caching_sha2_password BY 'pwd';   -- MySQL 8
 ALTER USER 'u' IDENTIFIED WITH mysql_native_password [BY 'pwd'];      -- 切换登录算法
 ```
 
-### 1.9b 键值/队列管理（v1.2.0，kv.enable 开启后可用）
+### 1.9b 键值/队列管理（kv.enable 开启后可用）
 
 ```sql
 SHOW KV STATS;                          -- 占用/命中率（namespace/keys/memory_bytes/hits/misses/hit_rate/expired/evicted）
@@ -188,7 +188,7 @@ SET KV MAX_MEMORY 64;                   -- 热改内存上限 MB（0 = 不限，
 SET KV EVICTION allkeys-lru;            -- allkeys-lru | volatile-lru | noeviction
 ```
 
-### 1.9c 消息队列管理（v1.3.0，mq.enable 开启后可用）
+### 1.9c 消息队列管理（mq.enable 开启后可用）
 
 ```sql
 SHOW QUEUES;        -- 队列深度/unacked/消费者数/published/delivered/acked
@@ -197,7 +197,7 @@ SELECT * FROM mq_queues WHERE ready > 0;
 SELECT * FROM mq_exchanges;
 ```
 
-### 1.10 S3 对象存储管理（v1.1.0；模块开启 s3.enable 后可用）
+### 1.10 S3 对象存储管理（模块开启 s3.enable 后可用）
 
 详见 [S3对象存储.md](S3对象存储.md)。变更命令仅超级用户（只读 1290 / 普通用户 1142），
 SHOW 与表查询所有管理面用户可看。
@@ -332,9 +332,9 @@ DO 0;  /* ping */
 
 ---
 
-## 4. 异步查询与定时任务（v1.0.5–1.0.8）
+## 4. 异步查询与定时任务
 
-> 完整语法、生命周期、回调协议与示例见 **[docs/异步任务.md](异步任务.md)**（v1.0.8 新增专册）。
+> 完整语法、生命周期、回调协议与示例见 **[docs/异步任务.md](异步任务.md)**。
 
 ```sql
 SUBMIT QUERY 'SELECT …'
@@ -342,9 +342,9 @@ SUBMIT QUERY 'SELECT …'
   [SIGN '<secret>'] [TIMEOUT 3600] [RETAIN 300]
   [AT '17:00' | '2026-10-16 17:00:00']  -- 指定时刻执行
   [WINDOW '17:00-20:00']                -- 每日窗口（EXPIRED 不跨天）
-  [WINDOW '周五 17:00-20:00']           -- 周几限定窗口（周一..周日 / MON..SUN，v1.0.8）
+  [WINDOW '周五 17:00-20:00']           -- 周几限定窗口（周一..周日 / MON..SUN）
   [WHEN CPU < 70 AND MEM < 80 AND APP_CPU < 50 AND IO_MBPS < 10]
-  [PARTITION BY ROWS 50000 | BY BYTES 8388608]   -- 分片回调：每片独立 POST（v1.0.8 实装）
+  [PARTITION BY ROWS 50000 | BY BYTES 8388608]   -- 分片回调：每片独立 POST）
   [EVERY DAY [AT '17:00'] | EVERY HOUR | EVERY 30 MINUTES];  -- 周期定时任务
 
 SHOW QUERY JOBS;  SELECT * FROM query_jobs WHERE state='DONE';
@@ -353,7 +353,7 @@ CANCEL QUERY 'j_xxx';  DROP QUERY RESULT 'j_xxx';
 VACUUM DATABASE backup;   -- ⚠️ 执行期间该库全部写入阻塞；CLI: glaciertdb -vacuum
 ```
 
-四态回调（DONE/ERROR/EXPIRED/CANCELLED）；结果默认 60 秒自动删除；`query_jobs` v1.0.8 新增 `partition_rows` / `partition_bytes` 列。
+四态回调（DONE/ERROR/EXPIRED/CANCELLED）；结果默认 60 秒自动删除；`query_jobs` `partition_rows` / `partition_bytes` 列。
 
 ## 4.1 多核并行查询（EXPLAIN PARALLEL）
 
@@ -364,13 +364,13 @@ EXPLAIN PARALLEL SELECT COUNT(*) FROM big_table;   -- 查看拆分计划（分�
 ```
 
 - 适用：单表顶层可合并聚合（COUNT/SUM/MIN/MAX/AVG），无 GROUP BY/ORDER/LIMIT；分片键 rowid 或单列主键；
-- v1.0.8 修复：注释剥离曾连带剥掉 `/*+ PARALLEL(n) */` hint（hint 从未生效、静默串行回退），现已保留。
+- 历史修复：注释剥离曾连带剥掉 `/*+ PARALLEL(n) */` hint（hint 从未生效、静默串行回退），现已保留。
 
-## 5. MySQL 函数兼容（v1.0.3 M1 + v1.0.8 M2）
+## 5. MySQL 函数兼容（M1 + M2）
 
-文本改写（v1.0.3）：`NOW()/CURDATE()/CURTIME()/UNIX_TIMESTAMP()/FROM_UNIXTIME()/LAST_INSERT_ID()/TRUNCATE`、`LIMIT o,n`、`CONCAT`、`IF`、`RAND()`、`UUID()`、DDL 类型映射、`DEFAULT CURRENT_TIMESTAMP`。
+文本改写：`NOW()/CURDATE()/CURTIME()/UNIX_TIMESTAMP()/FROM_UNIXTIME()/LAST_INSERT_ID()/TRUNCATE`、`LIMIT o,n`、`CONCAT`、`IF`、`RAND()`、`UUID()`、DDL 类型映射、`DEFAULT CURRENT_TIMESTAMP`。
 
-Go 标量函数（v1.0.8，注册进每个后端连接，任意表达式位置可用）：
+Go 标量函数（注册进每个后端连接，任意表达式位置可用）：
 
 | 函数 | 说明 |
 | --- | --- |
@@ -382,13 +382,13 @@ Go 标量函数（v1.0.8，注册进每个后端连接，任意表达式位置�
 | `TIMESTAMPDIFF(unit,a,b)` | b−a；unit∈MICROSECOND/SECOND/MINUTE/HOUR/DAY/WEEK/MONTH/QUARTER/YEAR（日历感知） |
 | `DATE_FORMAT(d,fmt)` | `%Y %y %m %c %d %e %H %k %h %I %l %i %s %S %f %p %r %T %W %a %M %b %j %w %%` |
 
-语句改写（v1.0.8 M2）：`INSERT IGNORE INTO` → `INSERT OR IGNORE INTO`；`TIMESTAMPDIFF(MONTH, …)` 单位关键字自动字符串化。
+语句改写（M2）：`INSERT IGNORE INTO` → `INSERT OR IGNORE INTO`；`TIMESTAMPDIFF(MONTH, …)` 单位关键字自动字符串化。
 
-**转义还原（v1.0.9）**：MySQL 协议客户端把参数值按 MySQL 规则转义后拼进 SQL 文本（`"` → `\"`、`'` → `\'`、`\` → `\\`、换行 → `\n`），网关在语句进入 SQLite 前对单引号字面量统一做 MySQL→SQLite 还原，文本值（如 JSON 配置）不再被转义序列污染，`WHERE` 等值比较可正常命中；`\%` / `\_`（LIKE 通配符字面量）保留原样。查询、写语句与异步任务执行路径全部覆盖。
+**转义还原**：MySQL 协议客户端把参数值按 MySQL 规则转义后拼进 SQL 文本（`"` → `\"`、`'` → `\'`、`\` → `\\`、换行 → `\n`），网关在语句进入 SQLite 前对单引号字面量统一做 MySQL→SQLite 还原，文本值（如 JSON 配置）不再被转义序列污染，`WHERE` 等值比较可正常命中；`\%` / `\_`（LIKE 通配符字面量）保留原样。查询、写语句与异步任务执行路径全部覆盖。
 
-**JSON 查询（v1.0.10）**：`->` / `->>` 运算符自动改写为 SQLite JSON1 等价形式（`->` 保留 JSON 值形态、字符串加引号，支持链式 `a->'$.x'->>'$.y'`）；`JSON_LENGTH` / `JSON_CONTAINS` / `JSON_KEYS` / `JSON_SEARCH`（% / _ 通配）/ `JSON_MERGE_PATCH`（RFC 7386）为 Go 实现；`JSON_EXTRACT` / `JSON_SET` / `JSON_REPLACE` / `JSON_REMOVE` / `JSON_TYPE` / `json_each` 等 SQLite JSON1 原生直通；`json_extract` 表达式索引可用。
+**JSON 查询**：`->` / `->>` 运算符自动改写为 SQLite JSON1 等价形式（`->` 保留 JSON 值形态、字符串加引号，支持链式 `a->'$.x'->>'$.y'`）；`JSON_LENGTH` / `JSON_CONTAINS` / `JSON_KEYS` / `JSON_SEARCH`（% / _ 通配）/ `JSON_MERGE_PATCH`（RFC 7386）为 Go 实现；`JSON_EXTRACT` / `JSON_SET` / `JSON_REPLACE` / `JSON_REMOVE` / `JSON_TYPE` / `json_each` 等 SQLite JSON1 原生直通；`json_extract` 表达式索引可用。
 
-**Geo 查询（v1.0.10）**：`ST_*` 函数族（WKT / WKB / GeoJSON 三种输入自动识别）：
+**Geo 查询**：`ST_*` 函数族（WKT / WKB / GeoJSON 三种输入自动识别）：
 
 | 函数 | 说明 |
 | --- | --- |
@@ -402,7 +402,7 @@ Go 标量函数（v1.0.8，注册进每个后端连接，任意表达式位置�
 
 `POINT` / `GEOMETRY` / `LINESTRING` / `POLYGON` 等建表类型直通 SQLite（WKT 文本存储）。
 
-## 6. MySQL 8 兼容 M4 批（v1.3.3）
+## 6. MySQL 8 兼容 M4 批
 
 - **运算符**：`&&`→AND、`||`→OR（MySQL 默认语义）、`!`→NOT、`XOR`、`a DIV b`（整除）、`RLIKE`→REGEXP、`BINARY 'x'`→CAST AS BLOB、`0x1F` 十六进制、`N'x'`/`_utf8mb4'x'` 引导符剥除；
 - **函数（Go 注册，任意表达式位置可用）**：`LOCATE/CHAR_LENGTH/REPEAT/REVERSE/SPACE/STRCMP/ASCII/UNHEX/FORMAT`、`MOD/FLOOR/CEIL/POW/SQRT/LOG2/TRUNCATE/SIGN/DEGREES/PI`、`YEAR/MONTH/DAY/DAYOFWEEK/WEEKDAY/QUARTER/DAYNAME/MONTHNAME/DAYOFYEAR/LAST_DAY/TO_DAYS/FROM_DAYS/SEC_TO_TIME/TIME_TO_SEC`；
@@ -411,7 +411,7 @@ Go 标量函数（v1.0.8，注册进每个后端连接，任意表达式位置�
 - **维护语句**：`ANALYZE/CHECK/OPTIMIZE/REPAIR TABLE`（四列 OK 结果集）、`CHECKSUM TABLE`；
 - **用户变量**：`SET @a = 42` 会话登记，后续语句 `@a` 自动替换为字面量（`@@version` 等系统变量不受影响）。
 
-## 6.1 列类型映射（v1.3.3，系统库 glacier_meta）
+## 6.1 列类型映射（系统库 glacier_meta）
 
 - **落盘**：`DOUBLE/FLOAT/DECIMAL` 列以 SQLite TEXT 存储——INSERT/UPDATE 的裸数字字面量自动加引号，**17 位有效数字精确往返**（`SELECT typeof(money)` 为 `text`）；
 - **读出**：按建表登记的 MySQL 类型还原——DOUBLE/FLOAT 列返回 float64（协议类型码 5），DECIMAL 返回精确文本（NEWDECIMAL=246，客户端转 Decimal）；
@@ -419,7 +419,7 @@ Go 标量函数（v1.0.8，注册进每个后端连接，任意表达式位置�
 - **类型回放**：`SHOW COLUMNS` / `SHOW CREATE TABLE` / `information_schema.COLUMNS` 优先回放建表时的原始类型（如 `ENUM('a','b','c')`、`DECIMAL(8,2)`、`BIT(1)`）；
 - CREATE/ALTER（ADD/DROP/RENAME COLUMN、CHANGE）/DROP/RENAME TABLE/LIKE 全路径维护映射；存量旧表（无映射）行为不变。
 
-## 6.2 时序冷压缩命令（v1.3.3，普通库执行）
+## 6.2 时序冷压缩命令（普通库执行）
 
 ```sql
 COMPRESS COLD points BEFORE '2026-10-01' [STEP n DAY|HOUR];   -- 边界前完整块 gzip 固化进 points_cold
@@ -435,16 +435,16 @@ SHOW COLD [points];                                            -- 块数/行数/
 
 ```sql
 -- 日常
-SELECT glacier_version;                          -- 1.3.0.alpha
+SELECT glacier_version;                          -- 当前版本
 USE GlacierTDB;                                  -- 进管理面
 SHOW CLIENTS;                                    -- 看连接
 SHOW TRANSACTIONS;                               -- 看事务
 KILL 10086;                                      -- 踢人
 SET PASSWORD = 'new-pass';                       -- 改密（热生效）
-CREATE USER 'u1'@'%' IDENTIFIED BY 'pwd';        -- 建用户（v1.0.10）
+CREATE USER 'u1'@'%' IDENTIFIED BY 'pwd';        -- 建用户
 GRANT SELECT ON backup.* TO 'u1';                -- 授权
-SHOW LOGIN ATTEMPTS LIMIT 20;                    -- 登录审计（v1.0.10）
-SHOW QOS;                                        -- QoS 统计（v1.0.10）
+SHOW LOGIN ATTEMPTS LIMIT 20;                    -- 登录审计
+SHOW QOS;                                        -- QoS 统计
 SHOW QUERY VARS;                                 -- 异步 WHEN 监测变量当前值
 SET GLOBAL_THREADS = 64; SET PER_DB_READ_THREADS = 16;
 USE backup;                                      -- 回业务库

@@ -5,3 +5,9 @@ dist/
 *.db-shm
 *.log
 *.zip
+
+# bug 反馈存档（多版本/多来源，不进仓库）
+bugs/
+
+# 智能体工作指南（本地保留，不入仓库）
+AGENTS.md

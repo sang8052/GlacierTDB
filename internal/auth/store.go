@@ -309,9 +309,27 @@ func (s *Store) AccountLocked(username string) (bool, time.Time) {
 	return s.lockActive("acct:" + username)
 }
 
-// IPLocked 判断来源 IP 是否被锁。
+// IPLocked 判断来源 IP 是否被锁（本机回环地址永不锁定：运维本机客户端
+// 密码配错不应把自己锁死在管理面之外）。
 func (s *Store) IPLocked(ip string) (bool, time.Time) {
+	if isLoopbackIP(ip) {
+		return false, time.Time{}
+	}
 	return s.lockActive("ip:" + ip)
+}
+
+// isLoopbackIP 判断是否本机回环地址（127.x.x.x / ::1 / localhost）。
+func isLoopbackIP(ip string) bool {
+	if ip == "" {
+		return false
+	}
+	if strings.EqualFold(ip, "localhost") {
+		return true
+	}
+	if p := net.ParseIP(ip); p != nil {
+		return p.IsLoopback()
+	}
+	return false
 }
 
 func (s *Store) lockActive(key string) (bool, time.Time) {
@@ -350,8 +368,9 @@ func (s *Store) RecordLogin(ip, remote, username string, success bool, reason st
 		s.clearFails("acct:" + username)
 		return
 	}
-	// 失败计数（窗口滑动）
-	if s.cfg.Mode == "ip_only" || s.cfg.Mode == "mixed" {
+	// 失败计数（窗口滑动）；本机回环地址豁免 IP 维度计数与锁定
+	//（审计照记；账号维度计数不受影响，可用 UNLOCK ACCOUNT / CLI -unlock-user 解锁）
+	if (s.cfg.Mode == "ip_only" || s.cfg.Mode == "mixed") && !isLoopbackIP(ip) {
 		if s.bumpFail("ip:"+ip) >= s.cfg.MaxFailuresIP {
 			s.lockKey("ip:"+ip, "ip", ip, username)
 		}
@@ -388,6 +407,10 @@ func (s *Store) clearFails(key string) {
 
 // lockKey 落锁（指数升级）+ 防火墙封锁 + HTTP 告警。
 func (s *Store) lockKey(key, lockType, subject, ip string) {
+	if lockType == "ip" && isLoopbackIP(subject) {
+		logx.Debugf("auth: skip locking loopback %s", subject)
+		return
+	}
 	now := time.Now()
 	var level, failCount int
 	var lockedAt, untilOld string
@@ -982,9 +1005,9 @@ func (f *firewallCtl) detect() string {
 	return "off"
 }
 
-// BlockIP 封锁 IP（异步：下发规则 + TTL 后自动解封）。
+// BlockIP 封锁 IP（异步：下发规则 + TTL 后自动解封；本机回环永不封锁）。
 func (f *firewallCtl) BlockIP(ip string, ttl time.Duration) {
-	if f.driver == "" || f.driver == "off" || net.ParseIP(ip) == nil {
+	if f.driver == "" || f.driver == "off" || net.ParseIP(ip) == nil || isLoopbackIP(ip) {
 		return
 	}
 	go func() {

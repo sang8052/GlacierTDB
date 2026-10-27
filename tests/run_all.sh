@@ -177,6 +177,7 @@ echo "---- test_v135.py ----"; python /tests/test_v135.py || rc=1
 echo "---- test_v136.py ----"; python /tests/test_v136.py || rc=1
 echo "---- test_v137.py ----"; python /tests/test_v137.py || rc=1
 echo "---- test_v138.py ----"; python /tests/test_v138.py || rc=1
+echo "---- test_v1310.py ----"; python /tests/test_v1310.py || rc=1
 exit $rc
 EOF
 )
@@ -195,6 +196,93 @@ echo
 echo "—— 各 Python 测试的结论标记 ——"
 grep -E 'PYMYSQL:|SQLALCHEMY:|CONCURRENCY:' "$LOG_DIR/python_tests.out" || \
     echo "（未捕获到结论标记，详见 $LOG_DIR/python_tests.out）"
+
+# ----------------------------------------------------------------------------
+# 3.4 v1.3.10：本机回环防爆破豁免 / CLI 解锁 / mysql.enable 开关
+# ----------------------------------------------------------------------------
+step "步骤 3.4/4: v1.3.10 回环豁免 / CLI 解锁 / mysql.enable"
+
+# ① 本机回环（127.0.0.1）豁免：在 proxy 网络命名空间内连打 40 次错误密码，
+#    正确密码登录必须仍成功（IP 维度永不锁定本机地址）
+if docker run --rm --network "container:$PROXY" "$PY_IMG" bash -c '
+    pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple PyMySQL >/dev/null 2>&1
+    python - <<PYEOF
+import pymysql
+for i in range(40):
+    try:
+        pymysql.connect(host="127.0.0.1", port=3309, user="clilock1310",
+                        password="bad-%d" % i, connect_timeout=5)
+    except Exception:
+        pass
+try:
+    c = pymysql.connect(host="127.0.0.1", port=3309, user="glacier",
+                        password="iloveyou~", connect_timeout=5)
+    c.close()
+    print("LOOPBACK_OK")
+except Exception as e:
+    print("LOOPBACK_BLOCKED: %r" % (e,))
+PYEOF
+' 2>&1 | tee "$LOG_DIR/loopback.out" | grep -q LOOPBACK_OK; then
+    record "loopback brute-force exemption  : PASS"
+else
+    record "loopback brute-force exemption  : FAIL"
+fi
+
+# ② CLI 解锁（服务运行中旁路解锁）：-unlock-user 清除上面留下的账号锁
+UNLOCK_OUT=$(docker exec "$PROXY" /app/glaciertdb -config /app/config.yaml -db-dir /data -unlock-user clilock1310 2>&1 || true)
+echo "$UNLOCK_OUT" | tee "$LOG_DIR/cli_unlock.out"
+LOCKS_OUT=$(docker exec "$PROXY" /app/glaciertdb -config /app/config.yaml -db-dir /data -show-locks 2>&1 || true)
+echo "$LOCKS_OUT" | tee -a "$LOG_DIR/cli_unlock.out"
+if echo "$UNLOCK_OUT" | grep -q "已解锁" && ! echo "$LOCKS_OUT" | grep -q "acct:clilock1310"; then
+    record "CLI -unlock-user / -show-locks    : PASS"
+else
+    record "CLI -unlock-user / -show-locks    : FAIL"
+fi
+
+# ③ mysql.enable=false 冒烟：3309 不监听（kv/mq 同关 ⇒ 无任何复用服务），
+#    进程保持运行（非退出崩溃），tmp 独立数据目录与目录锁
+NMX="proxy-nomysql-$$"
+rm -rf /tmp/gnm-data && mkdir -p /tmp/gnm-data
+cat > /tmp/glacier-nomysql.yaml <<CFG
+listen: 0.0.0.0:3309
+db_dir: /data
+default_db: backup
+mysql:
+  enable: false
+kv:
+  enable: false
+mq:
+  enable: false
+security:
+  encrypt: true
+  passphrase: "GlacierTDB"
+CFG
+docker rm -f "$NMX" >/dev/null 2>&1 || true
+docker run -d --name "$NMX" \
+    -v /tmp/glacier-nomysql.yaml:/app/config.yaml \
+    -v /tmp/gnm-data:/data glaciertdb:latest >/dev/null 2>&1
+sleep 3
+NMX_ALIVE=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -Fx "$NMX" || true)
+NMX_LOG=$(docker logs "$NMX" 2>&1 || true)
+NMX_PORT=$(docker run --rm --network "container:$NMX" "$PY_IMG" python -c "
+import socket
+try:
+    s = socket.create_connection(('127.0.0.1', 3309), 3)
+    s.close()
+    print('PORT_OPEN')
+except ConnectionRefusedError:
+    print('PORT_CLOSED')
+except Exception as e:
+    print('PORT_ERR:%s' % e)
+" 2>&1 || true)
+echo "$NMX_LOG" | tail -5 | tee "$LOG_DIR/mysql_off.out"
+echo "port probe: $NMX_PORT" | tee -a "$LOG_DIR/mysql_off.out"
+if [ -n "$NMX_ALIVE" ] && echo "$NMX_LOG" | grep -q "3309 复用服务全部禁用" && [ "$NMX_PORT" = "PORT_CLOSED" ]; then
+    record "mysql.enable=false 不监听 3309  : PASS"
+else
+    record "mysql.enable=false 不监听 3309  : FAIL"
+fi
+docker rm -f "$NMX" >/dev/null 2>&1 || true
 
 # ----------------------------------------------------------------------------
 # 3.5 KV 持久化：重启 proxy 容器后数据无损恢复（v1.2.0）

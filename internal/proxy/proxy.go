@@ -55,10 +55,20 @@ func sniffConn(msrv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 
 	mqttOn := cfg.MQ.Enable && cfg.MQ.MQTT.Enable && mqs != nil
 
+	// mysql.enable=false：MySQL 面拒绝服务（RESP/AMQP/MQTT 不受影响），直接断开
+	toMySQL := func() {
+		if msrv == nil || !cfg.MySQL.Enable {
+			logx.Debugf("mysql: disabled, close %s", remote)
+			bc.Close()
+			return
+		}
+		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm, remote)
+	}
+
 	sniff := time.Duration(cfg.MuxSniffMs) * time.Millisecond
 	if sniff <= 0 || (!cfg.KV.Enable) {
 		// 纯 MySQL（嗅探关闭）
-		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm, remote)
+		toMySQL()
 		return
 	}
 	_ = raw.SetReadDeadline(time.Now().Add(sniff))
@@ -66,7 +76,7 @@ func sniffConn(msrv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 	_ = raw.SetReadDeadline(time.Time{})
 	if ferr != nil || len(first) == 0 {
 		// 窗口内无数据：客户端静默等握手 → MySQL
-		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm, remote)
+		toMySQL()
 		return
 	}
 	// HTTP（WebSocket 升级）→ MQTT over WS
@@ -89,7 +99,7 @@ func sniffConn(msrv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 			consumeModeLine(bc.br) // 声明行消费掉（连接级一次性）
 			switch strings.ToLower(m[1]) {
 			case "mysql":
-				serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm, remote)
+				toMySQL()
 			case "redis":
 				serveRedis(bc, cfg, store, kvs, remote)
 			case "rabbitmq":
@@ -100,7 +110,7 @@ func sniffConn(msrv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 			return
 		}
 		// 非声明行：原样交 MySQL
-		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm, remote)
+		toMySQL()
 	case '*', '+', '-', ':', '$':
 		serveRedis(bc, cfg, store, kvs, remote)
 	case 'A', 'a':
@@ -108,14 +118,14 @@ func sniffConn(msrv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 			serveRabbit(bc, cfg, store, mqs, remote)
 			return
 		}
-		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm, remote)
+		toMySQL()
 	default:
 		// MQTT CONNECT：byte1 高半字节 = 1（0x10..0x1F）
 		if mqttOn && first[0] >= 0x10 && first[0] <= 0x1F {
 			serveMQTT(bc, cfg, store, mqs, remote)
 			return
 		}
-		serveMySQL(msrv, bc, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm, remote)
+		toMySQL()
 	}
 }
 
@@ -259,7 +269,12 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 			cfg.AsyncQuery.MetricsIntervalSec, cfg.AsyncQuery.ResultTTLHours)
 	}
 
-	msrv := newMySQLServer(cfg)
+	var msrv *server.Server
+	if cfg.MySQL.Enable {
+		msrv = newMySQLServer(cfg)
+	} else {
+		logx.Infof("mysql: protocol service disabled (mysql.enable=false)")
+	}
 
 	// 时序冷压缩后台策略（v1.3.3）
 	handler.RunColdPolicy(backend, cfg)
@@ -269,12 +284,19 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 		go mqtt.ListenAndServe(cfg.MQ.MQTT.Listen, cfg.MQ.MQTT.WsPath, mqs, store, cfg)
 	}
 
+	// mysql.enable=false 且 kv/mq 也关闭：3309 无任何复用服务，不占用端口
+	if !cfg.MySQL.Enable && !cfg.KV.Enable && !cfg.MQ.Enable {
+		logx.Warnf("3309 复用服务全部禁用（mysql/kv/mq），跳过监听；进程保持运行（S3 等独立端口服务不受影响）")
+		select {} // 阻塞等待进程信号退出（main 的 signal handler 负责 os.Exit）
+	}
+
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return err
 	}
-	logx.Infof("listening on %s (multiplex mysql%s%s -> sqlite dir %s, default db=%s, user=%s)",
-		cfg.Listen, map[bool]string{true: "+redis", false: ""}[cfg.KV.Enable],
+	logx.Infof("listening on %s (multiplex %s%s%s -> sqlite dir %s, default db=%s, user=%s)",
+		cfg.Listen, map[bool]string{true: "mysql", false: ""}[cfg.MySQL.Enable],
+		map[bool]string{true: "+redis", false: ""}[cfg.KV.Enable],
 		map[bool]string{true: "+mqtt", false: ""}[cfg.MQ.Enable && cfg.MQ.MQTT.Enable],
 		cfg.DBDir, cfg.DefaultDB, cfg.Auth.User)
 

@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.3.9.alpha"
+const GlacierVersion = "1.3.10.beta"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -119,7 +119,14 @@ type S3Opts struct {
 	LifecycleIntervalSec int `yaml:"lifecycle_interval_sec"` // 生命周期（自动删除）扫描周期
 	AbortIncompleteDays  int `yaml:"abort_incomplete_days"`  // 未完成分片上传自动回收天数（v1.3.5；默认 7，0=关闭）
 	CallbackSecret  string   `yaml:"callback_secret"`        // 上传回调默认 HMAC 签名密钥
-	ImageFont       string   `yaml:"image_font"`             // 图片文字渲染 ttf 字体路径（v1.3.7；空 = 内置 ASCII）
+	ImageFont       string   `yaml:"image_font"`             // 图片文字渲染 ttf 字体路径（空 = 内置 ASCII）
+	ImageCache      bool     `yaml:"image_cache"`            // 图片预处理结果磁盘缓存（GET 加工链路；默认开）
+	ImageCacheMB    int      `yaml:"image_cache_mb"`         // 缓存目录容量上限 MB（默认 1024；-1 = 不限）
+}
+
+// MySQLOpts MySQL 协议服务开关（3309 复用端口上的 MySQL 面）。
+type MySQLOpts struct {
+	Enable bool `yaml:"enable"` // false = 3309 不再服务 MySQL（RESP/AMQP/MQTT 不受影响）
 }
 
 // KVOpts Redis 键值/队列（v1.2.0，mode:redis 同端口 RESP 服务）。
@@ -201,6 +208,7 @@ type Config struct {
 	Qos           QosOpts      `yaml:"qos"`
 	Lock          LockOpts     `yaml:"lock"`
 	S3            S3Opts       `yaml:"s3"`
+	MySQL         MySQLOpts    `yaml:"mysql"`
 	KV            KVOpts       `yaml:"kv"`
 	MQ            MQOpts       `yaml:"mq"`
 
@@ -263,7 +271,9 @@ func Default() *Config {
 			Region:   "*",
 			Endpoints: []S3Endpoint{{Listen: "0.0.0.0:9000"}},
 			BucketLimits: map[string]S3Limit{},
+			ImageCache: true,
 		},
+		MySQL: MySQLOpts{Enable: true},
 		KV: KVOpts{
 			Enable:   true,
 			Eviction: "allkeys-lru",
@@ -458,6 +468,9 @@ func (c *Config) Fill() {
 		}
 		if c.S3.LifecycleIntervalSec < 60 {
 			c.S3.LifecycleIntervalSec = 60
+		}
+		if c.S3.ImageCacheMB == 0 {
+			c.S3.ImageCacheMB = 1024
 		}
 	}
 	// KV 键值/队列（v1.2.0）

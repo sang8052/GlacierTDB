@@ -25,8 +25,26 @@ type imgParams struct {
 	Base64  bool   // GET: 转 base64 输出；PUT: body 为 base64（解码后二进制落盘）
 	DataURL bool   // base64 输出时带 data:image/...;base64, 前缀
 
-	Ops    []imgOp // OpenCV 风格操作管道（v1.3.7）：rectangle/text/circle/line/grayscale/blur/rotate/flip
-	SaveAs string  // POST 处理另存目标（bucket/key，v1.3.7；空 = 不另存）
+	Ops    []imgOp // OpenCV 风格操作管道：rectangle/text/circle/line/grayscale/blur/rotate/flip
+	OpsErr error   // 管道解析错误（非法 op 名/语法）：不再静默透传，服务端报 400
+	SaveAs string  // POST 处理另存目标（bucket/key；空 = 不另存）
+}
+
+// canonical 图片参数的规范化串（缓存 key 组成部分：同参数 ⇒ 同 key）。
+func (p imgParams) canonical() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "crop=%d,%d,%d,%d;", p.Crop.Min.X, p.Crop.Min.Y, p.Crop.Dx(), p.Crop.Dy())
+	fmt.Fprintf(&b, "resize=%d,%d;", p.ResizeW, p.ResizeH)
+	fmt.Fprintf(&b, "format=%s;q=%d;", p.Format, p.Quality)
+	fmt.Fprintf(&b, "b64=%t/%t;", p.Base64, p.DataURL)
+	b.WriteString("ops=")
+	for _, op := range p.Ops {
+		b.WriteString(op.name)
+		b.WriteString("(")
+		b.WriteString(strings.Join(op.args, ","))
+		b.WriteString(")")
+	}
+	return b.String()
 }
 
 // parseImgParams 从查询参数解析（x-gimg-*）。
@@ -83,7 +101,8 @@ func parseImgParams(q map[string][]string) (imgParams, bool) {
 		seen = true
 		ops, perr := parseOps(v)
 		if perr != nil {
-			return p, true // 语法错按无参数透传，具体报错由 processImage 给出
+			p.OpsErr = perr // 非法管道不再静默透传：服务端按 400 拒绝
+			return p, true
 		}
 		p.Ops = ops
 	}
@@ -214,7 +233,7 @@ func subImage(src image.Image, r image.Rectangle) image.Image {
 }
 
 // resizeBilinear 双线性缩放（w/h 为 0 时按另一维等比；均 >0 时拉伸）。
-// 纯手写实现，避免引入外部依赖。
+// RGBA 源走 Pix 直读 + 行带并行快速路径（v1.3.10 提速），其余实现走通用 At() 路径。
 func resizeBilinear(src image.Image, w, h int) image.Image {
 	b := src.Bounds()
 	sw, sh := b.Dx(), b.Dy()
@@ -239,6 +258,48 @@ func resizeBilinear(src image.Image, w, h int) image.Image {
 	dst := image.NewRGBA(image.Rect(0, 0, w, h))
 	xr := float64(sw) / float64(w)
 	yr := float64(sh) / float64(h)
+	if s, ok := src.(*image.RGBA); ok {
+		parallelBands(h, func(lo, hi int) {
+			for y := lo; y < hi; y++ {
+				sy := (float64(y)+0.5)*yr - 0.5
+				if sy < 0 {
+					sy = 0
+				}
+				y0 := int(sy)
+				y1 := y0 + 1
+				if y1 >= sh {
+					y1 = sh - 1
+				}
+				fy := sy - float64(y0)
+				row0 := s.PixOffset(b.Min.X, b.Min.Y+y0)
+				row1 := s.PixOffset(b.Min.X, b.Min.Y+y1)
+				do := dst.PixOffset(0, y)
+				for x := 0; x < w; x++ {
+					sx := (float64(x)+0.5)*xr - 0.5
+					if sx < 0 {
+						sx = 0
+					}
+					x0 := int(sx)
+					x1 := x0 + 1
+					if x1 >= sw {
+						x1 = sw - 1
+					}
+					fx := sx - float64(x0)
+					c00 := row0 + x0*4
+					c10 := row0 + x1*4
+					c01 := row1 + x0*4
+					c11 := row1 + x1*4
+					for i := 0; i < 4; i++ {
+						top := float64(s.Pix[c00+i]) * (1 - fx) + float64(s.Pix[c10+i])*fx
+						bot := float64(s.Pix[c01+i]) * (1 - fx) + float64(s.Pix[c11+i])*fx
+						dst.Pix[do+i] = uint8(clamp255(top*(1-fy) + bot*fy))
+					}
+					do += 4
+				}
+			}
+		})
+		return dst
+	}
 	for y := 0; y < h; y++ {
 		sy := (float64(y)+0.5)*yr - 0.5
 		if sy < 0 {

@@ -33,7 +33,10 @@ func main() {
 		forceUnlock = flag.Bool("force-unlock", false, "db 目录锁被异常占用时强制解锁启动（拒绝抢活进程的锁）")
 		vacuumMode  = flag.Bool("vacuum", false, "CLI 真空模式：VACUUM 库目录（服务必须停止；与目录锁互斥）")
 		vacuumDB    = flag.String("vacuum-db", "", "仅 VACUUM 指定库（默认目录内全部库）")
-		configPath = flag.String("config", "/app/config.yaml", "path to config.yaml")
+		unlockUser  = flag.String("unlock-user", "", "CLI 解锁账号（清除自动锁/手动锁/失败计数；服务运行中可用）")
+		unlockIP    = flag.String("unlock-ip", "", "CLI 解锁 IP（清除自动锁/失败计数/防火墙封锁）")
+		showLocks   = flag.Bool("show-locks", false, "CLI 查看当前防爆破锁定列表（账号 + IP）")
+		configPath = flag.String("config", "config.yaml", "path to config.yaml（默认依次查找 ./config.yaml、exe 同目录、/app/config.yaml）")
 		dbDir      = flag.String("db-dir", "", "override sqlite db directory (one db = one .db file)")
 		dbPath     = flag.String("db", "", "override sqlite db file path (legacy; dir=dirname, default db=basename)")
 		listen     = flag.String("listen", "", "override listen address")
@@ -45,7 +48,10 @@ func main() {
 		return
 	}
 
-	cfg, err := config.Load(*configPath)
+	// 默认配置路径解析链：显式 -config 优先原样使用；未显式传参时按
+	// ./config.yaml → exe 同目录/config.yaml → /app/config.yaml（Docker 惯例）回退
+	cfgFile := resolveConfigPath(*configPath)
+	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		logx.Errorf("load config: %v", err)
 		os.Exit(1)
@@ -63,6 +69,14 @@ func main() {
 		cfg.Listen = *listen
 	}
 	logx.SetLevel(logx.ParseLevel(cfg.Log.Level))
+
+	// CLI 解锁 / 查锁模式：旁路 dirlock（服务运行中可用），直连 glacier_auth 系统库
+	// 做小事务（WAL 多进程并发安全），完成后退出、不启动任何监听。
+	if *unlockUser != "" || *unlockIP != "" || *showLocks {
+		cliAuthAdmin(cfg, *unlockUser, *unlockIP, *showLocks)
+		return
+	}
+
 	if cfg.Log.SQLLogFile != "" {
 		if err := logx.InitSQLLog(cfg.Log.SQLLogFile); err != nil {
 			logx.Errorf("init sql log %s: %v", cfg.Log.SQLLogFile, err)
@@ -219,4 +233,79 @@ func backendVacuum(cfg *config.Config, db string) (time.Duration, int64, int64, 
 	}
 	defer b.CloseAll()
 	return b.VacuumDB(db)
+}
+
+// resolveConfigPath 默认配置路径解析链。显式传参（flag.Visit 可辨）原样使用；
+// 默认值时若 ./config.yaml 不存在，依次回退 exe 同目录、/app/config.yaml。
+func resolveConfigPath(given string) string {
+	explicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "config" {
+			explicit = true
+		}
+	})
+	if explicit {
+		return given
+	}
+	if _, err := os.Stat(given); err == nil {
+		return given
+	}
+	if exe, err := os.Executable(); err == nil {
+		cand := filepath.Join(filepath.Dir(exe), "config.yaml")
+		if _, err := os.Stat(cand); err == nil {
+			logx.Infof("config: %s 不存在，使用可执行文件同目录 %s", given, cand)
+			return cand
+		}
+	}
+	if _, err := os.Stat("/app/config.yaml"); err == nil {
+		logx.Infof("config: %s 不存在，回退 /app/config.yaml", given)
+		return "/app/config.yaml"
+	}
+	return given
+}
+
+// cliAuthAdmin CLI 解锁 / 查锁：直连 glacier_auth 系统库（不建默认库、不自检、
+// 不抢目录锁），与运行中的服务进程通过 WAL 并发安全地做几行小事务。
+func cliAuthAdmin(cfg *config.Config, unlockUser, unlockIP string, showLocks bool) {
+	db, err := sqlite.OpenAuthDBDirect(cfg)
+	if err != nil {
+		logx.Errorf("open auth db: %v", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+	store, err := auth.Open(db, auth.Bootstrap{
+		AdminUser:    cfg.Auth.User,
+		AdminPassword: cfg.Auth.Password,
+	}, cfg.Lock)
+	if err != nil {
+		logx.Errorf("init auth store: %v", err)
+		os.Exit(1)
+	}
+	if unlockUser != "" {
+		if err := store.UnlockAccount(unlockUser); err != nil {
+			logx.Errorf("unlock account %s 失败: %v", unlockUser, err)
+			os.Exit(1)
+		}
+		fmt.Printf("账号 %s 已解锁（自动锁/手动锁/失败计数已清除）\n", unlockUser)
+	}
+	if unlockIP != "" {
+		if err := store.UnlockIP(unlockIP); err != nil {
+			logx.Errorf("unlock ip %s 失败: %v", unlockIP, err)
+			os.Exit(1)
+		}
+		fmt.Printf("IP %s 已解锁（自动锁/失败计数/防火墙封锁已清除）\n", unlockIP)
+	}
+	locks := store.Locks()
+	if len(locks) == 0 {
+		fmt.Println("当前无防爆破锁定")
+	} else {
+		fmt.Printf("当前锁定 %d 项：\n", len(locks))
+		for _, r := range locks {
+			fmt.Printf("  %-8s %-24s 锁定于 %s  到期 %s（第 %d 级，失败 %d 次）\n",
+				r.LockType, r.LockKey, r.LockedAt, r.UntilTS, r.Level, r.FailCount)
+		}
+	}
+	if !showLocks {
+		return
+	}
 }
