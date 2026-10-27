@@ -168,7 +168,7 @@ AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked`），boto3 
 - **事务与发布订阅（v1.3.5）**：`MULTI/EXEC/DISCARD`（EXEC 返回逐条结果数组）；`SUBSCRIBE/PSUBSCRIBE/PUBLISH`（message/pmessage 推送、同连接 channel+pattern 双收、按账号命名空间隔离）；
 - **SCAN 真游标（v1.3.5）**：`SCAN cursor [MATCH][COUNT][TYPE]` 每批 COUNT 个、游标推进，`--scan`/`scan_iter` 多批遍历与 `KEYS` 等价；
 - **阻塞弹出（v1.3.2）**：`BLPOP/BRPOP key [key…] timeout`——按序取首个非空队列，Push 立即唤醒、超时返回空数组（`0` = 无限等待）；
-- **HELLO/SCAN（v1.3.3）**：`HELLO` 最小应答（server map + `proto:2`，**redis-py ≥ 8 默认 RESP3 握手直连可用**）；`SCAN cursor [MATCH][COUNT][TYPE]` 单批全量 + 游标恒 0（`redis-cli --scan` / `scan_iter` 可用）；**RESP3 空值兼容（v1.3.4）**——`HELLO 3` 连接的空值应答发 RESP3 null 帧 `_`（redis-py ≥8 的 GET miss/MGET/BLPOP 超时不再挂死），RESP2 连接维持 `$-1`/`*-1`；
+- **HELLO/SCAN（v1.3.3）**：`HELLO` 最小应答（server map + `proto:2`，**redis-py ≥ 8 默认 RESP3 握手直连可用**）；`SCAN` 真游标（v1.3.5：每批 COUNT 个、游标推进）；**RESP3 空值兼容（v1.3.4）**——`HELLO 3` 连接的空值应答发 RESP3 null 帧 `_`（redis-py ≥8 的 GET miss/MGET/BLPOP 超时不再挂死），RESP2 连接维持 `$-1`/`*-1`；
 - **TTL**：惰性过期 + 定期扫描；**变更实时写 SQLite（`glacier_kv.db`）重启无损**；
 - **命名空间 = 登录账号**（跨用户不可见）；**内存治理**：`kv.max_memory_mb` + `allkeys-lru/volatile-lru/noeviction`；`SHOW KV STATS` / `kv_stats` 占用与命中率。
 
@@ -379,14 +379,14 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 **协议层**
 
 - 不支持预处理语句（`COM_STMT_*`），客户端走文本协议；不支持 TLS / XA / `LOAD DATA` / `LOCK TABLES` / 复制协议（公网暴露请前置认证代理）；
-- S3 multipart 为基础分片上传（无 UploadPartCopy / 未完成上传自动生命周期，未完成会话需 Abort 或 `DROP BUCKET FORCE` 回收）；单对象上限 `max_object_mb`；
+- S3 multipart 完整支持 **UploadPartCopy 拷贝分片**（`x-amz-copy-source [+range]`，v1.3.5）与**未完成会话自动回收**（`s3.abort_incomplete_days`，默认 7 天，0=关闭）；单对象上限 `max_object_mb`（**`-1` = 不限制**，v1.3.5）；
 - Redis 为 RESP2（`HELLO` 应答 `proto:2` 自动降级不升级 RESP3；BLPOP/BRPOP 单连接串行阻塞，`timeout=0` 无限等待；事务为队列执行语义无 WATCH；SCAN 为快照游标——遍历期间写入可能漏见/重见）；
 - AMQP 为基本队列（无镜像/仲裁队列、无事务性队列；confirm 为逐条 ack、无 `immediate` 位；pika 1.4.4 客户端 close() 有自身 bug，见消息队列手册）。
 
 **语义层**
 
 - 系统库兼容层为常用表只读应答，非全量 MySQL 系统库；库间无跨库 JOIN；
-- `DROP DATABASE` 直接删文件不可恢复；无 `DECIMAL` 精确类型（金额建议 TEXT）；`ALTER TABLE` 仅限 SQLite 能力集；
+- `DROP DATABASE` 直接删文件不可恢复；`DECIMAL`/浮点经**列类型映射**（v1.3.3，系统库 `glacier_meta`）以 TEXT 精确落盘、查出按 MySQL 类型回放（存量旧表无映射时维持原样）；`ALTER TABLE` 支持 ADD/DROP INDEX·MODIFY·CHANGE·RENAME TABLE 等（v1.3.3），仍受 SQLite 能力集约束；
 - rollup 仅覆盖标准 `points` schema 与可合并聚合，含 `val` 谓词等形态自动回退全量扫（语义优先）。
 
 **部署层**
