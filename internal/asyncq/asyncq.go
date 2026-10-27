@@ -84,7 +84,15 @@ type Job struct {
 	QosWaitMs   int64      `json:"qos_wait_ms,omitempty"`   // 本次执行的 QoS 排队毫秒（v1.0.10）
 	RecurGroup  string     `json:"recur_group,omitempty"`  // 周期链 ID；CANCEL 取消整链
 	CancelCh    chan struct{} `json:"-"`
+	Kind        string     `json:"kind,omitempty"`   // 任务类型（空 = SQL；"s3" = S3 管理任务，v1.3.11）
+	Payload     string     `json:"payload,omitempty"` // Kind 对应的私有载荷（JSON；SQL 不用）
+	Owner       string     `json:"owner,omitempty"`   // 提交者账号（v1.3.11：任务属主隔离）
+	SubmitterDB string     `json:"submitter_db,omitempty"` // 提交时所在库（执行会话落此库，不再恒用服务端默认库）
 }
+
+// Runner 非_SQL 任务执行器：返回列头与行（与 SQL 查询同构，走同一套
+// 结果落盘 / FETCH / 回调 / 周期链管线）。注册方自持权限语义（提交入口已把关）。
+type Runner func(j *Job) ([]string, [][]any, error)
 
 // Engine 异步查询引擎。
 type Engine struct {
@@ -100,6 +108,24 @@ type Engine struct {
 	cgrp    map[string]bool // 已取消的周期链
 	pauseMu sync.RWMutex
 	paused  map[string]bool // 已暂停的周期链/任务（PAUSE QUERY，v1.0.10）
+	runMu   sync.RWMutex
+	runners map[string]Runner // 非_SQL 任务执行器（按 Kind 分发；v1.3.11）
+}
+
+// RegisterRunner 注册非_SQL 任务执行器（如 "s3"）；重复注册覆盖。
+func (e *Engine) RegisterRunner(kind string, fn Runner) {
+	e.runMu.Lock()
+	if e.runners == nil {
+		e.runners = make(map[string]Runner)
+	}
+	e.runners[kind] = fn
+	e.runMu.Unlock()
+}
+
+func (e *Engine) runnerFor(kind string) Runner {
+	e.runMu.RLock()
+	defer e.runMu.RUnlock()
+	return e.runners[kind]
 }
 
 // NewEngine 创建引擎并启动调度循环。
@@ -251,7 +277,7 @@ func (e *Engine) runWhenDue(j *Job) {
 	}
 }
 
-// execute 执行查询并流式落盘 + 回调。
+// execute 执行任务（SQL 查询 / 注册的 Kind 执行器）并流式落盘 + 回调。
 func (e *Engine) execute(j *Job) {
 	e.mu.Lock()
 	if j.State != StatePending {
@@ -262,19 +288,36 @@ func (e *Engine) execute(j *Job) {
 	j.StartTS = time.Now()
 	e.mu.Unlock()
 
-	s, err := e.backend.OpenSession("async", "job:"+j.ID, e.cfg.DefaultDB)
-	if err != nil {
-		e.finish(j, StateError, "open session: "+err.Error())
-		return
+	var cols []string
+	var rows [][]any
+	var err error
+	if j.Kind != "" { // 非_SQL 任务（v1.3.11：S3 检索/删除等）
+		fn := e.runnerFor(j.Kind)
+		if fn == nil {
+			e.finish(j, StateError, "no runner registered for kind "+j.Kind)
+			return
+		}
+		cols, rows, err = fn(j)
+	} else {
+		db := j.SubmitterDB
+		if db == "" {
+			db = e.cfg.DefaultDB
+		}
+		s, serr := e.backend.OpenSession("async", "job:"+j.ID, db)
+		if serr != nil {
+			e.finish(j, StateError, "open session: "+serr.Error())
+			return
+		}
+		defer s.Close()
+		cols, rows, err = s.Query(meta.UnescapeLiterals(j.SQL))
+		if err == nil {
+			j.QosWaitMs = s.QoSWaitMs() // QoS 排队时长（query_jobs.qos_wait_ms）
+		}
 	}
-	defer s.Close()
-
-	cols, rows, err := s.Query(meta.UnescapeLiterals(j.SQL))
 	if err != nil {
 		e.finish(j, StateError, err.Error())
 		return
 	}
-	j.QosWaitMs = s.QoSWaitMs() // QoS 排队时长（query_jobs.qos_wait_ms）
 
 	// 流式写 JSONL
 	f, err := os.Create(e.resultPath(j.ID))
@@ -532,6 +575,33 @@ func (e *Engine) Get(id string) (Job, bool) {
 		return Job{}, false
 	}
 	return *j, true
+}
+
+// ListFor 按查看者过滤作业（super 看全部；普通用户只见自己的，v1.3.11 属主隔离）。
+func (e *Engine) ListFor(user string, super bool) []Job {
+	all := e.List()
+	if super {
+		return all
+	}
+	var out []Job
+	for _, j := range all {
+		if j.Owner == "" || j.Owner == user {
+			out = append(out, j)
+		}
+	}
+	return out
+}
+
+// Authorize 校验操作者对作业的权限（FETCH/CANCEL/DROP/PAUSE/RESUME 前置，v1.3.11）。
+func (e *Engine) Authorize(id, user string, super bool) error {
+	j, ok := e.Get(id)
+	if !ok {
+		return fmt.Errorf("unknown job '%s'", id)
+	}
+	if super || j.Owner == "" || j.Owner == user {
+		return nil
+	}
+	return fmt.Errorf("job '%s' belongs to another user", id)
 }
 
 // Vars 返回 WHEN 监测变量当前快照（SHOW QUERY VARS，v1.0.9）。

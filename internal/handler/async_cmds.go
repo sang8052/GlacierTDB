@@ -13,6 +13,7 @@ import (
 	"github.com/go-mysql-org/go-mysql/mysql"
 
 	"glaciertdb/internal/asyncq"
+	"glaciertdb/internal/auth"
 	"glaciertdb/internal/meta"
 )
 
@@ -379,6 +380,10 @@ func parseWeekday(s string) (int, bool) {
 
 // handleAsyncQ 异步查询命令分发；handled=false 表示非本类命令。
 func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
+	// SUBMIT S3 TEXT/FILE SEARCH / DELETE（管理面 S3 异步任务，v1.3.11）
+	if res, ok, err := h.handleSubmitS3(s); ok || err != nil {
+		return res, ok, err
+	}
 	// SUBMIT QUERY
 	if m := reSubmit.FindStringSubmatch(s); m != nil {
 		if h.async == nil {
@@ -388,6 +393,22 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			return nil, true, roErr()
 		}
 		sqlText := strings.ReplaceAll(m[1], "''", "'")
+		// v1.3.11 安全修复：异步引擎自开会话执行，绕过了主链路的权限层——
+		// ① ATTACH/DETACH 一律拒绝（防越库挂载系统库文件）；② USER 账号仅允许
+		// SELECT 形态且须过表级授权（此前 DELETE/INSERT 也能经异步执行）；
+		// ③ 执行会话落在提交者当前库（不再恒用服务端默认库）。
+		if meta.IsAttachStmt(sqlText) {
+			return nil, true, mysql.NewError(1142, "command denied to user '"+h.user+"' (ATTACH/DETACH are not allowed in async jobs)")
+		}
+		if h.userType == auth.TypeUser {
+			if priv, known := stmtPriv(sqlText); !known || priv != "SELECT" {
+				return nil, true, mysql.NewError(1142,
+					"command denied to user '"+h.user+"' (async jobs of USER accounts are limited to SELECT queries)")
+			}
+			if err := h.checkPrivilege(sqlText); err != nil {
+				return nil, true, err
+			}
+		}
 		cb, cbOpt, sign, timeout, at, win, weekWd, when, part, partBytes, script, scriptOut, retainSec, everySec, everyAt, everyWd, everyWeeks, everyMonths, everyMonthDay, everyYears, everyYearDay, perr := parseSubmitOpts(m[2])
 		if perr != nil {
 			return nil, true, mysql.NewError(1064, perr.Error())
@@ -429,6 +450,8 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			job.CallbackProto = "http"
 		}
 		job.CallbackOpt = cbOpt
+		job.Owner = h.user
+		job.SubmitterDB = h.session.CurrentDB()
 		id := h.async.Submit(job)
 		res, err := meta.SimpleRS([]string{"job_id", "state"},
 			[][]any{{id, string(asyncq.StatePending)}})
@@ -452,7 +475,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		return res, true, err
 	}
 
-	// SHOW QUERY JOBS / query_jobs 表
+	// SHOW QUERY JOBS / query_jobs 表（v1.3.11：普通用户只见自己的任务）
 	if reShowJobs.MatchString(s) || reJobsTable.MatchString(s) {
 		if h.async == nil {
 			return nil, true, mysql.NewError(1235, "async query is disabled")
@@ -461,7 +484,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		if m := reJobsTable.FindStringSubmatch(s); m != nil {
 			colsExpr, where = m[1], m[2]
 		}
-		rows := jobsRows(h.async.List())
+		rows := jobsRows(h.async.ListFor(h.user, h.userType == auth.TypeSuper))
 		rows = filterAsyncRows(rows, where)
 		if strings.TrimSpace(colsExpr) == "*" {
 			res, err := meta.SimpleRS(asyncJobCols, rows)
@@ -508,6 +531,9 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		if h.readonly {
 			return nil, true, roErr()
 		}
+		if err := h.async.Authorize(m[1], h.user, h.userType == auth.TypeSuper); err != nil {
+			return nil, true, mysql.NewError(1142, err.Error())
+		}
 		if err := h.async.Cancel(m[1]); err != nil {
 			return nil, true, mysql.NewError(1105, err.Error())
 		}
@@ -520,6 +546,9 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		}
 		if h.readonly {
 			return nil, true, roErr()
+		}
+		if err := h.async.Authorize(m[1], h.user, h.userType == auth.TypeSuper); err != nil {
+			return nil, true, mysql.NewError(1142, err.Error())
 		}
 		if err := h.async.Drop(m[1]); err != nil {
 			return nil, true, mysql.NewError(1105, err.Error())
@@ -534,6 +563,9 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		if h.readonly {
 			return nil, true, roErr()
 		}
+		if err := h.async.Authorize(m[1], h.user, h.userType == auth.TypeSuper); err != nil {
+			return nil, true, mysql.NewError(1142, err.Error())
+		}
 		if err := h.async.Pause(m[1]); err != nil {
 			return nil, true, mysql.NewError(1105, err.Error())
 		}
@@ -545,6 +577,9 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		}
 		if h.readonly {
 			return nil, true, roErr()
+		}
+		if err := h.async.Authorize(m[1], h.user, h.userType == auth.TypeSuper); err != nil {
+			return nil, true, mysql.NewError(1142, err.Error())
 		}
 		if err := h.async.Resume(m[1]); err != nil {
 			return nil, true, mysql.NewError(1105, err.Error())
@@ -719,6 +754,10 @@ func filterRowsByCols(cols []string, rows [][]any, where string) [][]any {
 func fetchResult(h *Handler, id string, limit, offset int) (*mysql.Result, bool, error) {
 	if h.async == nil {
 		return nil, true, mysql.NewError(1235, "async query is disabled")
+	}
+	// v1.3.11：结果按属主隔离（super 可取任意）
+	if err := h.async.Authorize(id, h.user, h.userType == auth.TypeSuper); err != nil {
+		return nil, true, mysql.NewError(1142, err.Error())
 	}
 	cols, rows, err := h.async.Fetch(id, limit, offset)
 	if err != nil {

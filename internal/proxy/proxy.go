@@ -265,6 +265,11 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 	var aq *asyncq.Engine
 	if cfg.AsyncQuery.Enable {
 		aq = asyncq.NewEngine(backend, cfg)
+		if s3store != nil { // S3 管理面异步任务执行器（SUBMIT S3 ...，v1.3.11）
+			aq.RegisterRunner("s3", func(j *asyncq.Job) ([]string, [][]any, error) {
+				return s3store.RunSearchTask(j.Payload)
+			})
+		}
 		logx.Infof("async query engine: jobs_dir=%s metrics_interval=%ds ttl=%dh", cfg.DBDir+"/jobs",
 			cfg.AsyncQuery.MetricsIntervalSec, cfg.AsyncQuery.ResultTTLHours)
 	}

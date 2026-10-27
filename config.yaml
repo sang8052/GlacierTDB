@@ -130,10 +130,10 @@ s3:
       # cert_file: /data/certs/wildcard.pem   # 端点泛域名证书（SNI 兜底）
       # key_file: /data/certs/wildcard.key
       server_names: []              # virtual-host 后缀（客户端访问主机名，如 s3.example.com）
-  max_object_mb: 512        # 单对象上限（-1 = 不限制，v1.3.5）
+  max_object_mb: 16384      # 单对象上限（默认 16GB；-1 = 不限制，v1.3.5）
   abort_incomplete_days: 7  # 未完成分片上传自动回收天数（v1.3.5；0 = 关闭）
   inline_max_kb: 64         # 内联存储阈值（超过走分块表）
-  chunk_kb: 256             # 分块大小
+  chunk_kb: 8192            # 分块大小（默认 8MB，v1.3.11）
   default_owner: glacier    # 建桶 / 签发密钥未指定属主时的默认用户
   limits:                   # 下载限速（0 = 不限）
     per_conn_bps: 0         # 单连接 bytes/s

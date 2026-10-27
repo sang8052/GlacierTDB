@@ -52,40 +52,58 @@ var (
 func coldTableName(tbl string) string { return tbl + "_cold" }
 
 // handleColdStmt COMPRESS/THAW/SHOW COLD 命令入口（普通库执行）。
+// v1.3.11：表可为任意声明时序表（WITH (TIMESERIES...)），边界/步长按声明精度换算；
+// COMPRESS/THAW 为破坏性写（热表删除/回插），只读账号拒绝（安全修复）。
 func (h *Handler) handleColdStmt(q string) (*mysql.Result, bool, error) {
 	switch {
 	case reCompressCold.MatchString(q):
+		if h.readonly {
+			return nil, true, roErr()
+		}
 		m := reCompressCold.FindStringSubmatch(q)
 		tbl := strings.Trim(m[1], "`")
-		boundary, ok := parseColdTime(m[2])
+		unit := "ms"
+		if t := h.tsTableForNamed(tbl); t != nil {
+			unit = t.Unit
+		}
+		boundaryMS, ok := parseColdTime(m[2])
 		if !ok {
 			return nil, true, mysql.NewError(1064, "invalid BEFORE time: "+m[2])
 		}
-		step := int64(86400000)
+		boundary := msToUnitValue(boundaryMS, unit)
+		stepMS := int64(86400000)
 		if m[3] != "" {
 			n, _ := strconv.ParseInt(m[3], 10, 64)
 			if n <= 0 || n > 366 {
 				return nil, true, mysql.NewError(1064, "invalid STEP")
 			}
-			step = n * 86400000
+			stepMS = n * 86400000
 			if strings.EqualFold(m[4], "HOUR") {
-				step = n * 3600000
+				stepMS = n * 3600000
 			}
 		}
+		step := msToUnitValue(stepMS, unit)
 		st, err := h.coldCompress(tbl, boundary, step)
 		if err != nil {
 			return nil, true, err
 		}
 		res, err := meta.SimpleRS([]string{"table", "chunks", "series", "rows", "raw_bytes", "gz_bytes", "ratio", "boundary_ms"},
 			[][]any{{tbl, int64(st.Chunks), int64(st.Series), st.Rows, st.RawBytes, st.GzBytes,
-				fmt.Sprintf("%.2f", st.Ratio()), boundary}})
+				fmt.Sprintf("%.2f", st.Ratio()), unitValueToMs(boundary, unit)}})
 		return res, true, err
 
 	case reThawCold.MatchString(q):
+		if h.readonly {
+			return nil, true, roErr()
+		}
 		m := reThawCold.FindStringSubmatch(q)
 		tbl := strings.Trim(m[1], "`")
+		unit := "ms"
+		if t := h.tsTableForNamed(tbl); t != nil {
+			unit = t.Unit
+		}
 		mode := strings.ToUpper(strings.TrimSpace(m[2]))
-		chunkMs := int64(-1)
+		chunk := int64(-1)
 		before := int64(-1)
 		switch {
 		case mode == "" || mode == "ALL":
@@ -98,17 +116,17 @@ func (h *Handler) handleColdStmt(q string) (*mysql.Result, bool, error) {
 			if !ok {
 				return nil, true, mysql.NewError(1064, "invalid BEFORE time: "+bm[1])
 			}
-			before = t
+			before = msToUnitValue(t, unit)
 		case strings.HasPrefix(mode, "CHUNK"):
 			cm := regexp.MustCompile(`(?is)^CHUNK\s+(\d+)$`).FindStringSubmatch(mode)
 			if cm == nil {
 				return nil, true, mysql.NewError(1064, "invalid CHUNK")
 			}
-			chunkMs, _ = strconv.ParseInt(cm[1], 10, 64)
+			chunk, _ = strconv.ParseInt(cm[1], 10, 64)
 		default:
 			return nil, true, mysql.NewError(1064, "invalid THAW clause")
 		}
-		chunks, rows, err := h.coldThaw(tbl, before, chunkMs)
+		chunks, rows, err := h.coldThaw(tbl, before, chunk)
 		if err != nil {
 			return nil, true, err
 		}
@@ -124,7 +142,11 @@ func (h *Handler) handleColdStmt(q string) (*mysql.Result, bool, error) {
 		}
 		var rows [][]any
 		for _, t := range h.coldTables(tbl) {
-			trows, err := h.coldStats(t)
+			unit := "ms"
+			if d := h.tsTableForNamed(t); d != nil {
+				unit = d.Unit
+			}
+			trows, err := h.coldStats(t, unit)
 			if err != nil {
 				continue
 			}
@@ -317,12 +339,17 @@ func compressColdOnSession(sess *sqlite.Session, tbl string, boundary, step int6
 
 // coldThaw 解冻（写锁 + 单事务；BEFORE/CHUNK/ALL）。返回（块数, 行数）。
 func (h *Handler) coldThaw(tbl string, before, chunk int64) (int64, int64, error) {
-	return thawColdOnSession(h.session, tbl, before, chunk, -1)
+	unit := "ms"
+	if t := h.tsTableForNamed(tbl); t != nil {
+		unit = t.Unit
+	}
+	return thawColdOnSession(h.session, tbl, unit, before, chunk, -1)
 }
 
 // thawColdOnSession 解冻核心。过滤优先级：CHUNK > overlap（max_ts >= 值，自动
-// 解冻用）> BEFORE（max_ts < 值）；全 -1 = ALL。
-func thawColdOnSession(sess *sqlite.Session, tbl string, before, chunk, overlap int64) (int64, int64, error) {
+// 解冻用）> BEFORE（max_ts < 值）；全 -1 = ALL。unit 为该表 ts 存储精度
+//（仅用于 rollup 触发器重建的桶宽换算，块过滤值本身已是存储精度）。
+func thawColdOnSession(sess *sqlite.Session, tbl, unit string, before, chunk, overlap int64) (int64, int64, error) {
 	cold := coldTableName(tbl)
 	if sess.InTx || sess.HoldsWriteLock() {
 		return 0, 0, mysql.NewError(1192, "THAW COLD cannot run inside an explicit transaction")
@@ -330,8 +357,8 @@ func thawColdOnSession(sess *sqlite.Session, tbl string, before, chunk, overlap 
 	sess.AcquireWrite()
 	defer sess.ReleaseWrite()
 	// rollup 触发器临时摘除（避免解冻 INSERT 重复计数）
-	dropRollupTriggers(sess)
-	defer ensureRollupTriggers(sess)
+	dropRollupTriggers(sess, tbl)
+	defer ensureRollupTriggersFor(sess, tbl, unit)
 
 	if _, _, err := sess.Exec("BEGIN IMMEDIATE"); err != nil {
 		return 0, 0, MapSQLiteErr(err)
@@ -437,17 +464,24 @@ func coldValueLiteral(v any) string {
 	}
 }
 
-// dropRollupTriggers / ensureRollupTriggers rollup 触发器临时摘除与重建（仅 points）。
-func dropRollupTriggers(sess *sqlite.Session) {
+// dropRollupTriggers / ensureRollupTriggersFor rollup 触发器临时摘除与重建（任意声明时序表；
+// 仅当该表已建 rollup 汇总表时才重建，避免给未启用 rollup 的表凭空建触发器）。
+func dropRollupTriggers(sess *sqlite.Session, tbl string) {
 	for _, g := range rollupGrains {
-		_, _, _ = sess.Exec(fmt.Sprintf(`DROP TRIGGER IF EXISTS points_rollup_ai_%s`, g.suffix))
+		_, _, _ = sess.Exec(fmt.Sprintf(`DROP TRIGGER IF EXISTS %s`,
+			quoteIdent(tbl+"_rollup_ai_"+g.suffix)))
 	}
 }
 
-func ensureRollupTriggers(sess *sqlite.Session) {
+func ensureRollupTriggersFor(sess *sqlite.Session, tbl, unit string) {
+	if _, rows, err := sess.Query(fmt.Sprintf(
+		`SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=%s LIMIT 1`, quoteStr(tbl+"_m1"))); err != nil || len(rows) == 0 {
+		return // 该表未启用 rollup：不建触发器
+	}
 	for _, g := range rollupGrains {
-		t := "points_" + g.suffix
-		trg := fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS points_rollup_ai_%s AFTER INSERT ON points BEGIN
+		p := msToUnitValue(g.periodMs, unit)
+		t := tbl + "_" + g.suffix
+		trg := fmt.Sprintf(`CREATE TRIGGER IF NOT EXISTS %s AFTER INSERT ON %s BEGIN
   INSERT INTO %s(series_id,bucket_ts,cnt,cntv,sum_val,min_val,max_val)
   VALUES (NEW.series_id, NEW.ts/%d*%d, 1, CASE WHEN NEW.val IS NULL THEN 0 ELSE 1 END, NEW.val, NEW.val, NEW.val)
   ON CONFLICT(series_id,bucket_ts) DO UPDATE SET
@@ -456,7 +490,7 @@ func ensureRollupTriggers(sess *sqlite.Session) {
     sum_val = CASE WHEN excluded.sum_val IS NULL THEN sum_val WHEN sum_val IS NULL THEN excluded.sum_val ELSE sum_val + excluded.sum_val END,
     min_val = CASE WHEN excluded.min_val IS NULL THEN min_val WHEN min_val IS NULL THEN excluded.min_val WHEN excluded.min_val < min_val THEN excluded.min_val ELSE min_val END,
     max_val = CASE WHEN excluded.max_val IS NULL THEN max_val WHEN max_val IS NULL THEN excluded.max_val WHEN excluded.max_val > max_val THEN excluded.max_val ELSE max_val END;
-END`, g.suffix, t, g.periodMs, g.periodMs)
+END`, quoteIdent(tbl+"_rollup_ai_"+g.suffix), quoteIdent(tbl), quoteIdent(t), p, p)
 		_, _, _ = sess.Exec(trg)
 	}
 }
@@ -466,8 +500,8 @@ func quoteStr(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-// coldStats 归档统计行集。
-func (h *Handler) coldStats(tbl string) ([][]any, error) {
+// coldStats 归档统计行集（unit 用于块起点展示换算）。
+func (h *Handler) coldStats(tbl, unit string) ([][]any, error) {
 	cold := coldTableName(tbl)
 	_, rows, err := h.session.Query(fmt.Sprintf(
 		`SELECT chunk, COUNT(*), SUM(rows), SUM(LENGTH(zdata)), MIN(min_ts), MAX(max_ts) FROM %s GROUP BY chunk ORDER BY chunk`,
@@ -480,8 +514,8 @@ func (h *Handler) coldStats(tbl string) ([][]any, error) {
 		ch := cellInt64(r[0])
 		out = append(out, []any{
 			tbl,
-			time.UnixMilli(ch).UTC().Format("2006-01-02 15:04:05"),
-			ch,
+			time.UnixMilli(unitValueToMs(ch, unit)).UTC().Format("2006-01-02 15:04:05"),
+			unitValueToMs(ch, unit),
 			cellInt64(r[1]),
 			cellInt64(r[2]),
 			cellInt64(r[3]),
@@ -496,18 +530,27 @@ func (h *Handler) coldStats(tbl string) ([][]any, error) {
 // 自动解冻（读写透明性）
 // ---------------------------------------------------------------------------
 
-// maybeThawCold 语句触及冻结区间时先行解冻。
+// maybeThawCold 语句触及冻结区间时先行解冻（v1.3.11：遍历当前库全部时序表——
+// 声明表 + 隐式 points；语句提及且存在归档才处理）。
 // 无 ts 谓词 → 保守全解冻；有下界 → 解冻 max_ts >= lo 的块。
 // 客户端显式事务/已持写锁时跳过（避免不可重入锁死锁，查询只见热数据）。
 func (h *Handler) maybeThawCold(sq string) {
 	if h.session.InTx || h.session.HoldsWriteLock() {
 		return
 	}
-	if !reColdOK.MatchString(sq) {
+	for _, t := range h.activeTsTables() {
+		h.maybeThawColdTable(sq, t)
+	}
+}
+
+// maybeThawColdTable 单表的冻结区间触达检查与解冻。
+func (h *Handler) maybeThawColdTable(sq string, t tsTable) {
+	reMention := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(strings.Trim(t.Table, "`")) + `\b`)
+	if !reMention.MatchString(sq) {
 		return
 	}
-	db := h.session.CurrentDB()
-	cold := coldTableName("points")
+	reLower := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(t.Column) + `\s*(?:>=|>|=|between)\s*('(?:[^']|'')*'|[0-9]+)`)
+	cold := coldTableName(t.Table)
 	_, rows, err := h.session.Query(fmt.Sprintf(
 		`SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=%s LIMIT 1`, quoteStr(cold)))
 	if err != nil || len(rows) == 0 {
@@ -522,10 +565,11 @@ func (h *Handler) maybeThawCold(sq string) {
 	if cnt == 0 || maxCold == 0 {
 		return
 	}
-	// 查询 ts 下界
+	// 查询 ts 下界（rewriteTsPredicates 已把字面量换算到存储精度；
+	// evalRollupTime 对数值原样返回、日期串/NOW() 给 ms → 统一归一到存储精度）
 	lo := int64(-1)
-	for _, m := range reTsLower.FindAllStringSubmatch(sq, -1) {
-		if v, ok := evalColdPredicateTime(m[1]); ok {
+	for _, m := range reLower.FindAllStringSubmatch(sq, -1) {
+		if v, ok := evalColdPredicateTimeForUnit(m[1], t.Unit); ok {
 			if lo < 0 || v < lo {
 				lo = v
 			}
@@ -537,39 +581,55 @@ func (h *Handler) maybeThawCold(sq string) {
 	if lo >= 0 && lo > maxCold {
 		return // 查询区间在冻结区之后：无需解冻
 	}
-	if _, _, err := thawColdOnSession(h.session, "points", -1, -1, lo); err != nil {
-		logx.Warnf("cold auto-thaw [db=%s]: %v (query continues on hot data)", db, err)
+	if _, _, err := thawColdOnSession(h.session, t.Table, t.Unit, -1, -1, lo); err != nil {
+		logx.Warnf("cold auto-thaw [db=%s tbl=%s]: %v (query continues on hot data)", h.session.CurrentDB(), t.Table, err)
 	} else {
-		logx.Debugf("cold auto-thaw [db=%s] for query touching frozen range", db)
+		logx.Debugf("cold auto-thaw [db=%s tbl=%s] for query touching frozen range", h.session.CurrentDB(), t.Table)
 	}
 }
 
-// evalColdPredicateTime 谓词时间值（复用 rollup 的求值规则）。
-func evalColdPredicateTime(s string) (int64, bool) {
-	return evalRollupTime(strings.TrimSpace(s))
+// evalColdPredicateTimeForUnit 谓词时间值 → 该表存储精度
+//（数值字面量原样、日期串/NOW() 由 ms 换算）。
+func evalColdPredicateTimeForUnit(s, unit string) (int64, bool) {
+	v, ok := evalRollupTime(strings.TrimSpace(s))
+	if !ok {
+		return 0, false
+	}
+	if n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
+		return n, true // 数值：已在存储精度（rewriter 已换算）
+	}
+	return msToUnitValue(v, unit), true
 }
 
-// retryThawOnConstraint 写 points 撞冻结区间（PK 冲突）→ 全解冻后重试一次。
+// retryThawOnConstraint 写时序表撞冻结区间（PK 冲突）→ 解冻后重试一次。
 // 返回 true 表示已解冻（调用方应重试原语句）。
 func (h *Handler) retryThawOnConstraint(err error, sq string) bool {
-	if err == nil || !reColdOK.MatchString(sq) {
+	if err == nil {
 		return false
 	}
 	var se *sqlite3.Error
 	if !errors.As(err, &se) || se.Code() != sqlite3.CONSTRAINT {
 		return false
 	}
-	cold := coldTableName("points")
-	_, rows, qerr := h.session.Query(fmt.Sprintf(
-		`SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=%s LIMIT 1`, quoteStr(cold)))
-	if qerr != nil || len(rows) == 0 {
-		return false
+	thawed := false
+	for _, t := range h.activeTsTables() {
+		reMention := regexp.MustCompile(`(?i)\b` + regexp.QuoteMeta(strings.Trim(t.Table, "`")) + `\b`)
+		if !reMention.MatchString(sq) {
+			continue
+		}
+		cold := coldTableName(t.Table)
+		_, rows, qerr := h.session.Query(fmt.Sprintf(
+			`SELECT 1 FROM main.sqlite_master WHERE type='table' AND name=%s LIMIT 1`, quoteStr(cold)))
+		if qerr != nil || len(rows) == 0 {
+			continue
+		}
+		if _, _, terr := thawColdOnSession(h.session, t.Table, t.Unit, -1, -1, -1); terr != nil {
+			logx.Warnf("cold constraint-thaw: %v", terr)
+			continue
+		}
+		thawed = true
 	}
-	if _, _, terr := thawColdOnSession(h.session, "points", -1, -1, -1); terr != nil {
-		logx.Warnf("cold constraint-thaw: %v", terr)
-		return false
-	}
-	return true
+	return thawed
 }
 
 // ---------------------------------------------------------------------------
@@ -721,7 +781,8 @@ func cellInt64(v any) int64 {
 // 后台冷压缩策略（timeseries.cold_after_days）
 // ---------------------------------------------------------------------------
 
-// RunColdPolicy 周期扫描：所有库的 points 表超过 cold_after_days 的数据自动固化。
+// RunColdPolicy 周期扫描：各库的时序表（声明表 + 隐式 points）超过
+// cold_after_days 的数据自动固化（v1.3.11：不再固定 points 表名）。
 func RunColdPolicy(backend *sqlite.Backend, cfg *config.Config) {
 	if cfg.Timeseries.ColdAfterDays <= 0 {
 		return
@@ -732,6 +793,24 @@ func RunColdPolicy(backend *sqlite.Backend, cfg *config.Config) {
 			runColdPolicyOnce(backend, cfg)
 		}
 	}()
+}
+
+// coldPolicyTables 某库参与后台冷压缩的表：sidecar 声明表 + 隐式 points（去重）。
+func coldPolicyTables(sess *sqlite.Session) []tsTable {
+	out := loadTsTablesSess(sess)
+	if _, rows, err := sess.Query(`PRAGMA main.table_info("points")`); err == nil && len(rows) > 0 {
+		dup := false
+		for _, t := range out {
+			if strings.EqualFold(t.Table, "points") {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			out = append(out, tsTable{Table: "points", Column: "ts", Unit: "ms"})
+		}
+	}
+	return out
 }
 
 func runColdPolicyOnce(backend *sqlite.Backend, cfg *config.Config) {
@@ -747,18 +826,18 @@ func runColdPolicyOnce(backend *sqlite.Backend, cfg *config.Config) {
 		}
 		func() {
 			defer sess.Close()
-			_, ti, err := sess.Query(`PRAGMA main.table_info("points")`)
-			if err != nil || len(ti) == 0 {
-				return
-			}
-			boundary := time.Now().UnixMilli() - int64(cfg.Timeseries.ColdAfterDays)*86400000
-			st, err := compressColdOnSession(sess, "points", boundary, 86400000)
-			if err != nil {
-				logx.Debugf("cold policy %s: %v", db, err)
-				return
-			}
-			if st.Chunks > 0 {
-				logx.Infof("cold policy %s: chunks=%d rows=%d ratio=%.2f", db, st.Chunks, st.Rows, st.Ratio())
+			boundaryMS := time.Now().UnixMilli() - int64(cfg.Timeseries.ColdAfterDays)*86400000
+			for _, t := range coldPolicyTables(sess) {
+				boundary := msToUnitValue(boundaryMS, t.Unit)
+				step := msToUnitValue(86400000, t.Unit)
+				st, err := compressColdOnSession(sess, t.Table, boundary, step)
+				if err != nil {
+					logx.Debugf("cold policy %s.%s: %v", db, t.Table, err)
+					continue
+				}
+				if st.Chunks > 0 {
+					logx.Infof("cold policy %s.%s: chunks=%d rows=%d ratio=%.2f", db, t.Table, st.Chunks, st.Rows, st.Ratio())
+				}
 			}
 		}()
 	}

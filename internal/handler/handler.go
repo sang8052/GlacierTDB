@@ -58,6 +58,7 @@ type Handler struct {
 	mu         sync.Mutex // 保护 lastQuery/adminMode/txStartedAt/usrVars 的跨连接读
 
 	authCacheInv func(user string) // caching_sha2_password 缓存失效钩子（改密后调用）
+	tsCache      []tsTable         // 当前库时序大表声明缓存（v1.3.11；DDL 后失效）
 }
 
 var reSetAutocommit = regexp.MustCompile(`(?i)^SET\s+(?:@@?[A-Za-z_]*\.)?AUTOCOMMIT\s*=\s*([01])`)
@@ -118,8 +119,10 @@ func (h *Handler) BindConn(mc *server.Conn) {
 	}
 	mc.SetStatus(mysql.SERVER_STATUS_AUTOCOMMIT)
 	// 多租户（v1.3.6）：账号配置了 DEFAULT_DB 则登录即落该库（GlacierTDB 管理库除外）
+	// v1.3.11：默认库须在授权内（未授权时不切，留在服务端默认库——数据面仍受
+	// checkPrivilege 拦截，仅避免整库 schema 经 SHOW TABLES/DESC 泄露）
 	if u := mc.GetUser(); u != "" && h.session != nil && h.userType == auth.TypeUser && h.auths != nil {
-		if info, ok, _ := h.auths.Lookup(u); ok && info.DefaultDB != "" {
+		if info, ok, _ := h.auths.Lookup(u); ok && info.DefaultDB != "" && h.canUseDBGraceful(info.DefaultDB) {
 			_ = h.session.Use(info.DefaultDB)
 		}
 	}
@@ -190,9 +193,14 @@ func MapSQLiteErr(err error) error {
 // ---------------------------------------------------------------------------
 
 // UseDB 处理 COM_INIT_DB / USE：真实切换后端 SQLite 文件；GlacierTDB 为管理库。
+// v1.3.11：普通 USER 账号禁入管理面（与 USE GlacierTDB 文本路径同一门禁）。
 func (h *Handler) UseDB(dbName string) error {
 	dbName = strings.Trim(strings.TrimSpace(dbName), "`\"'")
 	if strings.EqualFold(dbName, AdminDB) {
+		if h.userType == auth.TypeUser {
+			return mysql.NewError(1044,
+				"Access denied for user '"+h.user+"' to database 'GlacierTDB' (admin plane requires admin or readonly account)")
+		}
 		h.mu.Lock()
 		h.adminMode = true
 		h.mu.Unlock()
@@ -201,18 +209,35 @@ func (h *Handler) UseDB(dbName string) error {
 	h.mu.Lock()
 	h.adminMode = false
 	h.mu.Unlock()
+	// v1.3.11：COM_INIT_DB 走与 SQL USE 相同的授权校验
+	if !h.canUseDBGraceful(dbName) {
+		return mysql.NewError(1044, "Access denied for user '"+h.user+"' to database '"+dbName+"'")
+	}
 	if err := h.session.Use(dbName); err != nil {
 		if strings.Contains(err.Error(), "transaction open") {
 			return mysql.NewError(1192, err.Error())
 		}
 		return mysql.NewError(mysql.ER_BAD_DB_ERROR, err.Error())
 	}
+	h.invalidateTsCache() // 时序声明缓存按库隔离（v1.3.11）
 	return nil
+}
+
+// canUseDBGraceful USER 账号切库授权校验（v1.3.11 安全修复：COM_INIT_DB / 握手
+// 默认库此前不走 CanUseDB，未授权库可连入并读其表结构）。
+func (h *Handler) canUseDBGraceful(db string) bool {
+	if h.userType != auth.TypeUser || h.auths == nil {
+		return true
+	}
+	return h.auths.HasDBGrant(h.user, db)
 }
 
 var reReadWord = regexp.MustCompile("(?is)^(?:/\\*\\+.*?\\*/\\s*)*(SELECT|WITH|EXPLAIN|VALUES|TABLE)\\b")
 
-func isReadStmt(q string) bool { return reReadWord.MatchString(q) }
+func isReadStmt(q string) bool {
+	// v1.3.11：WITH 前缀语句按主动词分类（WITH ... DELETE/INSERT/UPDATE 是写）
+	return reReadWord.MatchString(StripWithPrefix(q))
+}
 
 // HandleQuery 处理 COM_QUERY（统一记录 SQL 审计日志后转发）。
 func (h *Handler) HandleQuery(query string) (*mysql.Result, error) {
@@ -308,7 +333,13 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 	}
 
 	// USE GlacierTDB → 进入管理面；USE 普通库 → 退出管理面（在探活层之前拦截）
+	// v1.3.11 租户隔离：普通 USER 账号禁入管理面——此前 SHOW S3 KEYS/OBJECTS/
+	// USAGE 等读命令无门禁，任意租户可枚举其他属主的桶/对象/密钥元数据。
 	if am, ok := IsAdminUse(s); ok {
+		if h.userType == auth.TypeUser {
+			return nil, mysql.NewError(1044,
+				"Access denied for user '"+h.user+"' to database 'GlacierTDB' (admin plane requires admin or readonly account)")
+		}
 		h.mu.Lock()
 		h.adminMode = am
 		h.mu.Unlock()
@@ -318,6 +349,17 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 		h.mu.Lock()
 		h.adminMode = false
 		h.mu.Unlock()
+	}
+
+	// 时序大表建表谓词（CREATE TABLE ... WITH (TIMESERIES, TS_UNIT=...)，v1.3.11）
+	// 与 SHOW TS TABLES（声明查询）——必须先于探活层：探活对未知 SHOW 变体有空集兜底
+	if res, ok, err := h.handleCreateTableWith(s); ok || err != nil {
+		h.slow(start, s)
+		return res, err
+	}
+	if res, ok, err := h.handleShowTsTables(s); ok || err != nil {
+		h.slow(start, s)
+		return res, err
 	}
 
 	// VACUUM DATABASE <db>（写锁警示见 handleVacuumDB）
@@ -408,6 +450,16 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 			return nil
 		}
 	}
+	// 建库/删库门禁（v1.3.11 安全修复：此前任何账号——含只读——都能删任意租户的库）
+	ctx.CanAdminDB = func() error {
+		if h.readonly {
+			return roErr()
+		}
+		if h.userType != auth.TypeSuper {
+			return mysql.NewError(1142, "command denied to user '"+h.user+"' (CREATE/DROP DATABASE requires super user)")
+		}
+		return nil
+	}
 
 	// 1) 探活/元语句
 	res, handled, err := meta.HandleProbe(ctx, s)
@@ -472,6 +524,9 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 	}
 
 	// 2c-4) 时序冷区自动解冻（读写触及冻结区间先解冻，v1.3.3）
+	//        v1.3.11：先做 ts 谓词单位换算（声明表 s/ms/us 自动归一到存储精度），
+	//        再进入解冻 / rollup 判定，两套机制读到的都是存储精度数值。
+	s = h.rewriteTsPredicates(s)
 	h.maybeThawCold(s)
 
 	// 2d) 时序 rollup 自动路由（v1.1.1）：长范围聚合优先走 m1/h1/d1 汇总表（精确等价）
@@ -604,9 +659,12 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 	// 类型映射（v1.3.3）：浮点/DECIMAL 列字面量加引号 + 比较语义修正
 	sq = h.quoteTextColumnLiterals(sq)
 	sq = h.rewriteFloatPredicates(sq)
-	// rollup 汇总表/触发器懒建（v1.1.1）：首次写 points 前就位（同遍落保证从第一行开始）
-	if reRollInsert.MatchString(sq) {
-		h.ensureRollupTables()
+	// rollup 汇总表/触发器懒建（v1.1.1；v1.3.11 任意声明时序表）：首次写前就位
+	//（同遍落保证从第一行开始）
+	if m := reRollInsert.FindStringSubmatch(sq); m != nil {
+		if t := h.tsTableForNamed(m[1]); t != nil {
+			h.ensureRollupTablesFor(t.Table, t.Unit)
+		}
 	}
 	if !h.session.InTx {
 		if h.autocommit {
@@ -637,6 +695,7 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 	}
 	// DDL 映射登记（CREATE/ALTER/DROP，v1.3.3）
 	h.afterWriteSuccess(s)
+	h.invalidateTsCacheOnDDL(s)
 	return &mysql.Result{AffectedRows: uint64(affected), InsertId: uint64(lastID)}, nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -77,6 +78,7 @@ type UsageRow struct {
 type Store struct {
 	db        *sql.DB
 	dir       string
+	dbFile    string // glacier_s3.db 路径（空间统计 / VACUUM 用）
 	masterKey []byte
 	writeMu   sync.Mutex // 对象/桶写入串行化（SQLite 单写者）
 
@@ -88,7 +90,22 @@ type Store struct {
 	limits       config.S3Limit
 	bucketLimits map[string]config.S3Limit
 	limitMu      sync.RWMutex
+
+	usageMu  sync.Mutex
+	usageBuf map[string]*usageDelta // 读写操作计数内存缓冲（v1.3.11）
+	usageOps int
 }
+
+// usageDelta 单 (owner,bucket) 的操作计数增量。
+type usageDelta struct {
+	get, put, list, del int64
+	bytesIn, bytesOut   int64
+}
+
+const (
+	usageFlushOps   = 256              // 缓冲满 256 次操作批量落库
+	usageFlushEvery = 5 * time.Second  // 定时落库周期（崩溃至多丢 5 秒计数）
+)
 
 // Open 打开（并初始化）对象存储系统库。
 func Open(backend *sqlite.Backend, cfg *config.Config) (*Store, error) {
@@ -99,6 +116,7 @@ func Open(backend *sqlite.Backend, cfg *config.Config) (*Store, error) {
 	s := &Store{
 		db:           db,
 		dir:          cfg.DBDir,
+		dbFile:       filepath.Join(cfg.DBDir, "sys", "glacier_s3.db"),
 		inlineMax:    int64(cfg.S3.InlineMaxKB) << 10,
 		chunkSize:    int64(cfg.S3.ChunkKB) << 10,
 		maxObject:    int64(cfg.S3.MaxObjectMB) << 20,
@@ -115,6 +133,20 @@ func Open(backend *sqlite.Backend, cfg *config.Config) (*Store, error) {
 	if err := s.initSchema(); err != nil {
 		return nil, err
 	}
+	// 存量桶补 manifest 列（v1.3.11：ALTER 只在建桶时执行，升级部署的旧桶表
+	// 缺列会导致对象写入直接 500——启动时全量幂等补跑一次）
+	for _, b := range s.ListBuckets("") {
+		if err := s.ensureBucketTables(b.TableName); err != nil {
+			logx.Warnf("s3: migrate bucket table %s: %v", b.TableName, err)
+		}
+	}
+	go func() { // 记账缓冲定时落库（v1.3.11）
+		t := time.NewTicker(usageFlushEvery)
+		defer t.Stop()
+		for range t.C {
+			s.flushUsage()
+		}
+	}()
 	return s, nil
 }
 
@@ -143,6 +175,9 @@ func (s *Store) loadMasterKey() error {
 
 // initSchema 建系统表（幂等）。
 func (s *Store) initSchema() error {
+	// auto_vacuum=INCREMENTAL（v1.3.11）：增量空间回收的前提。新库建表前生效即启用；
+	// 存量库的头标志位在下次 VACUUM（S3 VACUUM FULL）后生效。
+	_, _ = s.db.Exec(`PRAGMA auto_vacuum=INCREMENTAL`)
 	_, err := s.db.Exec(`
 CREATE TABLE IF NOT EXISTS s3_buckets (
   name            TEXT PRIMARY KEY,
@@ -216,11 +251,14 @@ CREATE TABLE IF NOT EXISTS s3_parts (
   size        INTEGER NOT NULL DEFAULT 0,
   etag        TEXT NOT NULL DEFAULT '',
   created_ts  TEXT NOT NULL DEFAULT '',
+  chunks      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (upload_id, part_number)
 );`)
 	if err != nil {
 		return fmt.Errorf("init s3 schema: %w", err)
 	}
+	// 存量库补列（幂等：重复列报错忽略）
+	_, _ = s.db.Exec(`ALTER TABLE s3_parts ADD COLUMN chunks INTEGER NOT NULL DEFAULT 0`)
 	return nil
 }
 
@@ -270,6 +308,7 @@ CREATE TABLE IF NOT EXISTS %s (
   metadata           TEXT NOT NULL DEFAULT '{}',
   content            BLOB,
   storage            TEXT NOT NULL DEFAULT 'inline',
+  manifest           TEXT NOT NULL DEFAULT '',
   legal_hold         INTEGER NOT NULL DEFAULT 0,
   retention_mode     TEXT NOT NULL DEFAULT '',
   retain_until       TEXT NOT NULL DEFAULT '',
@@ -288,7 +327,13 @@ CREATE TABLE IF NOT EXISTS %s (
 		"idx_"+strings.TrimPrefix(t, "obj_"),
 		"obj_"+strings.TrimPrefix(t, "obj_"),
 		"chk_"+strings.TrimPrefix(t, "obj_")))
-	return err
+	if err != nil {
+		return err
+	}
+	// 存量桶表补 manifest 列（幂等：重复列报错忽略；常量默认值 ALTER 为瞬时操作）
+	_, _ = s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN manifest TEXT NOT NULL DEFAULT ''`,
+		"obj_"+strings.TrimPrefix(t, "obj_")))
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -617,9 +662,10 @@ func (s *Store) RunLifecycle() int {
 		if err != nil {
 			continue
 		}
+		cond, cargs := prefixCond(r.Prefix)
 		rows, err := s.db.Query(fmt.Sprintf(
-			`SELECT key, MIN(created_ts) FROM %s WHERE substr(key,1,?)=? AND created_ts < ? GROUP BY key`,
-			b.TableName), len(r.Prefix), r.Prefix, cutoff)
+			`SELECT key, MIN(created_ts) FROM %s WHERE 1=1%s AND created_ts < ? GROUP BY key`,
+			b.TableName, cond), append(cargs, any(cutoff))...)
 		if err != nil {
 			continue
 		}
@@ -669,10 +715,76 @@ func (s *Store) deleteAllVersionsLocked(b Bucket, key string) error {
 // ---------------------------------------------------------------------------
 
 // AddUsage 记账一次操作（class: GET/PUT/LIST/DELETE）。
+// v1.3.11 性能：改为内存缓冲 + 批量落库——此前每次 GET/LIST 都拿全局写锁写一行
+// UPSERT，全部 S3 读流量相互串行且与写竞争；现在读路径零锁零 SQL，
+// 每 256 次操作或 5 秒合并落库（写路径的 addUsageLocked 仍即时落）。
 func (s *Store) AddUsage(owner, bucket, class string, bytesIn, bytesOut int64) {
+	s.usageMu.Lock()
+	if s.usageBuf == nil {
+		s.usageBuf = make(map[string]*usageDelta)
+	}
+	k := owner + "\x00" + bucket
+	d := s.usageBuf[k]
+	if d == nil {
+		d = &usageDelta{}
+		s.usageBuf[k] = d
+	}
+	switch strings.ToUpper(class) {
+	case "GET":
+		d.get++
+	case "PUT":
+		d.put++
+	case "LIST":
+		d.list++
+	case "DELETE":
+		d.del++
+	}
+	d.bytesIn += bytesIn
+	d.bytesOut += bytesOut
+	s.usageOps++
+	flush := s.usageOps >= usageFlushOps
+	s.usageMu.Unlock()
+	if flush {
+		s.flushUsage()
+	}
+}
+
+// flushUsage 缓冲记账批量落库（换出缓冲 → writeMu 下逐行 UPSERT）。
+func (s *Store) flushUsage() {
+	s.usageMu.Lock()
+	if len(s.usageBuf) == 0 {
+		s.usageMu.Unlock()
+		return
+	}
+	buf := s.usageBuf
+	s.usageBuf = make(map[string]*usageDelta)
+	s.usageOps = 0
+	s.usageMu.Unlock()
+
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	s.addUsageLocked(owner, bucket, class, bytesIn, bytesOut)
+	for k, d := range buf {
+		owner, bucket, _ := strings.Cut(k, "\x00")
+		_, _ = s.db.Exec(`INSERT INTO s3_usage(owner,bucket,get_count,put_count,list_count,delete_count,
+			bytes_in,bytes_out,updated_ts) VALUES(?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(owner,bucket) DO UPDATE SET
+			get_count=get_count+excluded.get_count, put_count=put_count+excluded.put_count,
+			list_count=list_count+excluded.list_count, delete_count=delete_count+excluded.delete_count,
+			bytes_in=bytes_in+excluded.bytes_in, bytes_out=bytes_out+excluded.bytes_out,
+			updated_ts=excluded.updated_ts`,
+			owner, bucket, d.get, d.put, d.list, d.del, d.bytesIn, d.bytesOut, nowTS())
+	}
+}
+
+// usageSnapshot 缓冲增量快照（Usage 合并视图用）。
+func (s *Store) usageSnapshot() map[string]usageDelta {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	out := make(map[string]usageDelta, len(s.usageBuf))
+	for k, v := range s.usageBuf {
+		out[k] = *v
+	}
+	return out
 }
 
 func (s *Store) addUsageLocked(owner, bucket, class string, bytesIn, bytesOut int64) {
@@ -710,11 +822,12 @@ func (s *Store) adjustAggLocked(b Bucket, key string, dBytes, dCount int64) {
 }
 
 // keyAggLocked 某 key 当前的存储字节与对象计数贡献（调用方持 writeMu）。
+// v1.3.11：两条聚合合并为一条（每次对象写少一半锁内查询）。
 func (s *Store) keyAggLocked(b Bucket, key string) (int64, int64) {
-	var bytes int64
-	var nLatest int64
-	_ = s.db.QueryRow(fmt.Sprintf(`SELECT COALESCE(SUM(size),0) FROM %s WHERE key=?`, b.TableName), key).Scan(&bytes)
-	_ = s.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE key=? AND is_latest=1 AND delete_marker=0`, b.TableName), key).Scan(&nLatest)
+	var bytes, nLatest int64
+	_ = s.db.QueryRow(fmt.Sprintf(
+		`SELECT COALESCE(SUM(size),0), COALESCE(SUM(CASE WHEN is_latest=1 AND delete_marker=0 THEN 1 ELSE 0 END),0)
+		FROM %s WHERE key=?`, b.TableName), key).Scan(&bytes, &nLatest)
 	return bytes, nLatest
 }
 
@@ -740,6 +853,38 @@ func (s *Store) Usage(owner string) []UsageRow {
 			&u.BytesIn, &u.BytesOut, &u.StorageBytes, &u.ObjectCount, &u.UpdatedTS); err == nil {
 			out = append(out, u)
 		}
+	}
+	// 合并尚未落库的内存缓冲（v1.3.11：读视图一致）
+	if buf := s.usageSnapshot(); len(buf) > 0 {
+		idx := make(map[string]int, len(out))
+		for i := range out {
+			idx[out[i].Owner+"\x00"+out[i].Bucket] = i
+		}
+		for k, d := range buf {
+			o, b, _ := strings.Cut(k, "\x00")
+			if owner != "" && o != owner {
+				continue
+			}
+			if i, ok := idx[k]; ok {
+				u := &out[i]
+				u.GetCount += d.get
+				u.PutCount += d.put
+				u.ListCount += d.list
+				u.DeleteCount += d.del
+				u.BytesIn += d.bytesIn
+				u.BytesOut += d.bytesOut
+			} else {
+				out = append(out, UsageRow{Owner: o, Bucket: b,
+					GetCount: d.get, PutCount: d.put, ListCount: d.list, DeleteCount: d.del,
+					BytesIn: d.bytesIn, BytesOut: d.bytesOut, UpdatedTS: nowTS()})
+			}
+		}
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].Owner != out[j].Owner {
+				return out[i].Owner < out[j].Owner
+			}
+			return out[i].Bucket < out[j].Bucket
+		})
 	}
 	return out
 }
@@ -812,4 +957,98 @@ func (s *Store) DomainFor(host string) (DomainRow, bool) {
 func MarshalPolicy(v any) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+// ---------------------------------------------------------------------------
+// 空间回收（v1.3.11）：SQLite 删除只挂 freelist 不缩文件，这里提供
+// 增量回收（免长锁）与全量重建（排他）两级手段 + 后台阈值自动回收。
+// ---------------------------------------------------------------------------
+
+// SpaceStats 系统库空间统计。
+type SpaceStats struct {
+	PageCount     int64
+	FreelistCount int64
+	PageSize      int64
+	FreeBytes     int64
+	FileBytes     int64
+	AutoVacuum    int64 // 0=none 1=full 2=incremental
+}
+
+// SpaceStats 读取当前空间统计（纯 PRAGMA 读，不锁库）。
+func (s *Store) SpaceStats() SpaceStats {
+	var st SpaceStats
+	_ = s.db.QueryRow(`PRAGMA page_count`).Scan(&st.PageCount)
+	_ = s.db.QueryRow(`PRAGMA freelist_count`).Scan(&st.FreelistCount)
+	_ = s.db.QueryRow(`PRAGMA page_size`).Scan(&st.PageSize)
+	_ = s.db.QueryRow(`PRAGMA auto_vacuum`).Scan(&st.AutoVacuum)
+	st.FreeBytes = st.FreelistCount * st.PageSize
+	if fi, err := os.Stat(s.dbFile); err == nil {
+		st.FileBytes = fi.Size()
+	}
+	return st
+}
+
+// VacuumIncremental 增量回收：每次 PRAGMA incremental_vacuum(N) 是一个独立的
+// 短写事务（默认每步 256 页 ≈ 1MB），WAL 下读完全不受影响、写仅在单步期间排队。
+// 循环执行直到空闲页清空或达到单轮上限（默认 1GB）。返回释放字节数。
+// 前提：auto_vacuum=INCREMENTAL（新建库默认启用；存量库先跑一次 S3 VACUUM FULL）。
+func (s *Store) VacuumIncremental(maxBytes int64) int64 {
+	if maxBytes <= 0 {
+		maxBytes = 1 << 30 // 单轮默认回收至多 1GB
+	}
+	const stepPages = 256
+	freed := int64(0)
+	for freed < maxBytes {
+		var before int64
+		_ = s.db.QueryRow(`PRAGMA freelist_count`).Scan(&before)
+		if before == 0 {
+			break
+		}
+		if _, err := s.db.Exec(fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, stepPages)); err != nil {
+			logx.Warnf("s3: incremental_vacuum failed: %v", err)
+			break
+		}
+		var after int64
+		_ = s.db.QueryRow(`PRAGMA freelist_count`).Scan(&after)
+		if after >= before { // 未启用增量模式（auto_vacuum=0）等场景：不再空转
+			break
+		}
+		var ps int64
+		_ = s.db.QueryRow(`PRAGMA page_size`).Scan(&ps)
+		freed += (before - after) * ps
+	}
+	if freed > 0 {
+		logx.Infof("s3: incremental vacuum reclaimed %d bytes", freed)
+	}
+	return freed
+}
+
+// VacuumFull 全量重建（排他）：VACUUM 重写整个库文件、期间锁库（时长与库大小
+// 成正比），仅在维护窗口执行；顺带把存量库切换到 auto_vacuum=INCREMENTAL，
+// 之后日常空间释放都可走免长锁的增量回收。
+func (s *Store) VacuumFull() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, err := s.db.Exec(`PRAGMA auto_vacuum=INCREMENTAL`); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`VACUUM`); err != nil {
+		return err
+	}
+	logx.Infof("s3: full VACUUM done (glacier_s3.db rebuilt, auto_vacuum=INCREMENTAL)")
+	return nil
+}
+
+// AutoReclaim 后台阈值自动回收（生命周期扫描周期内调用一次）：
+// 空闲空间超过 [128MB 且占文件 10%] 才动手，避免频繁抖动；
+// 走增量路径（短事务分步），读流量与常规写基本无感。
+func (s *Store) AutoReclaim() {
+	st := s.SpaceStats()
+	if st.AutoVacuum != 2 { // 未启用增量模式（存量库）：交给管理员 S3 VACUUM FULL 一次性切换
+		return
+	}
+	if st.FreeBytes < 128<<20 || st.FreeBytes*10 < st.FileBytes {
+		return
+	}
+	s.VacuumIncremental(1 << 30)
 }

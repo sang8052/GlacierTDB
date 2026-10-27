@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.3.10.beta"
+const GlacierVersion = "1.3.11.alpha"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -443,14 +443,14 @@ func (c *Config) Fill() {
 			c.S3.Region = "*" // 默认任意 region（客户端可传可不传）
 		}
 		if c.S3.MaxObjectMB == 0 {
-			c.S3.MaxObjectMB = 512
-		} // 显式负值（如 -1）放行 = 不限制（v1.3.5）
+			c.S3.MaxObjectMB = 16384
+		} // 默认 16GB；显式负值（如 -1）放行 = 不限制（v1.3.5）
 		if c.S3.InlineMaxKB <= 0 {
 			c.S3.InlineMaxKB = 64
 		}
 		if c.S3.ChunkKB <= 0 {
-			c.S3.ChunkKB = 256
-		}
+			c.S3.ChunkKB = 8192
+		} // 单分片 8MB（v1.3.11；旧默认 256KB）
 		if c.S3.DefaultOwner == "" {
 			c.S3.DefaultOwner = "glacier"
 		}

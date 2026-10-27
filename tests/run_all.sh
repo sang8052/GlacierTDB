@@ -178,6 +178,8 @@ echo "---- test_v136.py ----"; python /tests/test_v136.py || rc=1
 echo "---- test_v137.py ----"; python /tests/test_v137.py || rc=1
 echo "---- test_v138.py ----"; python /tests/test_v138.py || rc=1
 echo "---- test_v1310.py ----"; python /tests/test_v1310.py || rc=1
+
+echo "---- test_v1311.py ----"; python /tests/test_v1311.py || rc=1
 exit $rc
 EOF
 )

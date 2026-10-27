@@ -29,10 +29,38 @@ type ObjectMeta struct {
 	ContentDisposition string
 	Metadata          map[string]string
 	Storage           string
+	Manifest          string // 分块布局清单（JSON；空 = 旧版稠密 seq 布局，v1.3.11）
 	LegalHold         bool
 	RetentionMode     string // '' | GOVERNANCE | COMPLIANCE
 	RetainUntil       string
 	CreatedTS         string
+}
+
+// chunkManifest 分块布局清单（v1.3.11）：Range 读据此做 offset → (seq, 块内偏移)
+// 的直接定位，无需线性扫描。Parts 每项 = [startSeq, nChunks, sizeBytes, chunkSize]——
+// 分片上传合并零拷贝后各 part 对应一段；单 PUT 稠密布局为一段。
+type chunkManifest struct {
+	CS   int64     `json:"cs"`
+	Parts [][4]int64 `json:"parts"`
+}
+
+// parseChunkManifest 解析清单（空串 / 非法 → nil，走旧版稠密布局）。
+func parseChunkManifest(s string) []chunkSpan {
+	if s == "" {
+		return nil
+	}
+	var m chunkManifest
+	if json.Unmarshal([]byte(s), &m) != nil || len(m.Parts) == 0 {
+		return nil
+	}
+	out := make([]chunkSpan, 0, len(m.Parts))
+	for _, p := range m.Parts {
+		if p[1] <= 0 || p[3] <= 0 {
+			return nil
+		}
+		out = append(out, chunkSpan{startSeq: p[0], chunks: p[1], size: p[2], cs: p[3]})
+	}
+	return out
 }
 
 // ObjectAttrs PUT 时的写入属性。
@@ -126,11 +154,12 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 	if b.Versioning {
 		versionID = genVersionID()
 	} else {
-		// 清理旧版本（含分块）
-		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=?`, chunkTableFor(b.TableName)), key); err != nil {
+		// 清理旧版本（含分块；只清正式行 version_id=''——不碰进行中分片上传的
+		// 暂存行 (key, uploadId)，v1.3.11）
+		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, chunkTableFor(b.TableName)), key); err != nil {
 			return out, false, err
 		}
-		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=?`, b.TableName), key); err != nil {
+		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, b.TableName), key); err != nil {
 			return out, false, err
 		}
 		replaced = oldCount > 0
@@ -166,13 +195,17 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 			return out, false, err
 		}
 	}
+	manifest := ""
+	if storage == "chunk" {
+		manifest = MarshalPolicy(chunkManifest{CS: s.chunkSize, Parts: [][4]int64{{0, (size + s.chunkSize - 1) / s.chunkSize, size, s.chunkSize}}})
+	}
 	_, err = tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,is_latest,delete_marker,size,etag,
-		content_type,content_encoding,cache_control,content_disposition,metadata,content,storage,
+		content_type,content_encoding,cache_control,content_disposition,metadata,content,storage,manifest,
 		legal_hold,retention_mode,retain_until,created_ts)
-		VALUES(?,?,1,0,?,?,?,?,?,?,?,?,?,0,'','',?)`, b.TableName),
+		VALUES(?,?,1,0,?,?,?,?,?,?,?,?,?,?,0,'','',?)`, b.TableName),
 		key, versionID, size, etag,
 		attrs.ContentType, attrs.ContentEncoding, attrs.CacheControl, attrs.ContentDisposition,
-		metaJSON, content, storage, nowTS())
+		metaJSON, content, storage, manifest, nowTS())
 	if err != nil {
 		return out, false, err
 	}
@@ -222,7 +255,7 @@ func scanObject(rows *sql.Rows) (ObjectMeta, error) {
 	var metaJSON, storage string
 	err := rows.Scan(&m.Key, &m.VersionID, &isLatest, &delMark, &m.Size, &m.ETag,
 		&m.ContentType, &m.ContentEncoding, &m.CacheControl, &m.ContentDisposition,
-		&metaJSON, &storage, &legalHold, &m.RetentionMode, &m.RetainUntil, &m.CreatedTS)
+		&metaJSON, &storage, &m.Manifest, &legalHold, &m.RetentionMode, &m.RetainUntil, &m.CreatedTS)
 	if err != nil {
 		return m, err
 	}
@@ -238,7 +271,7 @@ func scanObject(rows *sql.Rows) (ObjectMeta, error) {
 }
 
 const objectCols = `key,version_id,is_latest,delete_marker,size,etag,content_type,content_encoding,
-	cache_control,content_disposition,metadata,storage,legal_hold,retention_mode,retain_until,created_ts`
+	cache_control,content_disposition,metadata,storage,manifest,legal_hold,retention_mode,retain_until,created_ts`
 
 // HeadObject 查对象元数据（versionID 空 = 最新版本；不存在返回 NoSuchKey）。
 func (s *Store) HeadObject(bucket, key, versionID string) (ObjectMeta, error) {
@@ -269,57 +302,172 @@ func (s *Store) HeadObject(bucket, key, versionID string) (ObjectMeta, error) {
 	return m, nil
 }
 
-// contentReader 对象内容读取器（内联字节 / 分块惰性拉取）。
+// chunkSpan manifest 中一段连续分块（一个 part 或单 PUT 稠密整体）。
+type chunkSpan struct {
+	startSeq int64
+	chunks   int64
+	size     int64
+	cs       int64
+}
+
+// contentReader 对象内容读取器（内联字节 / 分块惰性拉取；支持 manifest 直定位与
+// Range 裁剪：skip = 起点前跳过字节，remain = 剩余输出字节，-1 = 不限）。
 type contentReader struct {
 	store *Store
 	tbl   string
 	key   string
 	ver   string
-	seq   int64
+	spans []chunkSpan // manifest 布局；nil = 旧版稠密 seq 布局
+	spanIdx   int
+	idxInSpan int64
+	legacySeq int64
 	buf   []byte
 	off   int
 	done  bool
 	inline bool
+	skip  int64
+	remain int64
+}
+
+// fetchNext 拉取下一分块到 buf（manifest 布局按 seq 直取；旧布局按 seq 升序）。
+func (c *contentReader) fetchNext() error {
+	if c.spans != nil {
+		for {
+			if c.spanIdx >= len(c.spans) {
+				return io.EOF
+			}
+			sp := c.spans[c.spanIdx]
+			if c.idxInSpan >= sp.chunks {
+				c.spanIdx++
+				c.idxInSpan = 0
+				continue
+			}
+			var data []byte
+			err := c.store.db.QueryRow(fmt.Sprintf(
+				`SELECT data FROM %s WHERE key=? AND version_id=? AND seq=?`, c.tbl),
+				c.key, c.ver, sp.startSeq+c.idxInSpan).Scan(&data)
+			if err == sql.ErrNoRows {
+				return io.EOF
+			}
+			if err != nil {
+				return err
+			}
+			c.buf = data
+			c.off = 0
+			c.idxInSpan++
+			return nil
+		}
+	}
+	var seq int64
+	var data []byte
+	err := c.store.db.QueryRow(fmt.Sprintf(
+		`SELECT seq,data FROM %s WHERE key=? AND version_id=? AND seq>? ORDER BY seq LIMIT 1`,
+		c.tbl), c.key, c.ver, c.legacySeq).Scan(&seq, &data)
+	if err == sql.ErrNoRows {
+		return io.EOF
+	}
+	if err != nil {
+		return err
+	}
+	c.legacySeq = seq
+	c.buf = data
+	c.off = 0
+	return nil
+}
+
+// seekTo Range 定位：把读取位置推进到对象第 start 字节（manifest 布局直接算出
+// 所在段与块；旧稠密布局退化为逐块跳过）。调用前提：尚未读出任何字节。
+func (c *contentReader) seekTo(start int64) {
+	if start <= 0 {
+		return
+	}
+	if c.spans != nil {
+		for i := range c.spans {
+			sp := c.spans[i]
+			if start >= sp.size {
+				start -= sp.size
+				continue
+			}
+			c.spanIdx = i
+			c.idxInSpan = start / sp.cs
+			c.skip = start % sp.cs
+			return
+		}
+		c.spanIdx = len(c.spans) // 越界：直接置完
+		return
+	}
+	c.skip = start // 旧布局：fetchNext 流程内逐块消化 skip
 }
 
 func (c *contentReader) Read(p []byte) (int, error) {
 	if c.inline {
-		n := copy(p, c.buf[c.off:])
-		c.off += n
-		if c.off >= len(c.buf) && n == 0 {
+		if c.off >= len(c.buf) {
 			return 0, io.EOF
+		}
+		n := copy(p, c.buf[c.off:])
+		if c.remain >= 0 && int64(n) > c.remain {
+			n = int(c.remain)
+		}
+		c.off += n
+		if c.remain >= 0 {
+			c.remain -= int64(n)
 		}
 		return n, nil
 	}
-	for len(c.buf)-c.off == 0 && !c.done {
-		var seq int64
-		var data []byte
-		err := c.store.db.QueryRow(fmt.Sprintf(
-			`SELECT seq,data FROM %s WHERE key=? AND version_id=? AND seq>? ORDER BY seq LIMIT 1`,
-			c.tbl), c.key, c.ver, c.seq).Scan(&seq, &data)
-		if err == sql.ErrNoRows {
-			c.done = true
-			break
+	for {
+		if c.remain == 0 {
+			return 0, io.EOF
 		}
-		if err != nil {
-			return 0, err
+		if len(c.buf)-c.off == 0 {
+			if c.done {
+				return 0, io.EOF
+			}
+			if err := c.fetchNext(); err != nil {
+				c.done = true
+				if err == io.EOF {
+					return 0, io.EOF
+				}
+				return 0, err
+			}
 		}
-		c.seq = seq
-		c.buf = data
-		c.off = 0
+		if c.skip > 0 {
+			n := int64(len(c.buf) - c.off)
+			if n > c.skip {
+				n = c.skip
+			}
+			c.off += int(n)
+			c.skip -= n
+			continue
+		}
+		n := copy(p, c.buf[c.off:])
+		if c.remain >= 0 && int64(n) > c.remain {
+			n = int(c.remain)
+		}
+		c.off += n
+		if c.remain >= 0 {
+			c.remain -= int64(n)
+		}
+		return n, nil
 	}
-	if len(c.buf)-c.off == 0 {
-		return 0, io.EOF
-	}
-	n := copy(p, c.buf[c.off:])
-	c.off += n
-	return n, nil
 }
 
 func (c *contentReader) Close() error { return nil }
 
 // GetObject 取对象内容（返回元数据 + 流式读取器）。
 func (s *Store) GetObject(bucket, key, versionID string) (ObjectMeta, io.ReadCloser, error) {
+	return s.getObjectRange(bucket, key, versionID, -1, -1)
+}
+
+// GetObjectRange 取对象 [start, start+length) 字节区间（v1.3.11 Range 读优化：
+// manifest 直定位到分块，不整读）。start<0 / length<0 = 全量。
+func (s *Store) GetObjectRange(bucket, key, versionID string, start, length int64) (ObjectMeta, io.ReadCloser, error) {
+	if start < 0 {
+		start = 0
+	}
+	return s.getObjectRange(bucket, key, versionID, start, length)
+}
+
+func (s *Store) getObjectRange(bucket, key, versionID string, start, length int64) (ObjectMeta, io.ReadCloser, error) {
 	b, err := s.Bucket(bucket)
 	if err != nil {
 		return ObjectMeta{}, nil, err
@@ -347,6 +495,13 @@ func (s *Store) GetObject(bucket, key, versionID string) (ObjectMeta, io.ReadClo
 		}
 		return ObjectMeta{}, nil, &s3Error{Code: "NoSuchKey", Status: 404, Msg: "The specified key does not exist"}
 	}
+	if start > m.Size {
+		return m, nil, &s3Error{Code: "InvalidRange", Status: 416,
+			Msg: fmt.Sprintf("Range start %d is beyond object size %d", start, m.Size)}
+	}
+	if length < 0 || start+length > m.Size {
+		length = m.Size - start
+	}
 	// 内容
 	if m.Storage == "inline" {
 		var content []byte
@@ -354,10 +509,15 @@ func (s *Store) GetObject(bucket, key, versionID string) (ObjectMeta, io.ReadClo
 			key, m.VersionID).Scan(&content); err != nil {
 			return ObjectMeta{}, nil, err
 		}
-		cr := &contentReader{inline: true, buf: content}
-		return m, cr, nil
+		if start > 0 || start+length < int64(len(content)) {
+			content = content[start : start+length]
+		}
+		// remain=-1：inline 缓冲即最终字节（已按需切片），不限长输出
+		return m, &contentReader{inline: true, buf: content, remain: -1}, nil
 	}
-	cr := &contentReader{store: s, tbl: chunkTableFor(b.TableName), key: key, ver: m.VersionID, seq: -1}
+	cr := &contentReader{store: s, tbl: chunkTableFor(b.TableName), key: key, ver: m.VersionID,
+		spans: parseChunkManifest(m.Manifest), legacySeq: -1, remain: length}
+	cr.seekTo(start)
 	return m, cr, nil
 }
 
@@ -458,10 +618,11 @@ func (s *Store) DeleteObject(bucket, key, versionID string, bypassGovernance boo
 		if err := cur.lockViolation(bypassGovernance); err != nil {
 			return del, err
 		}
-		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=?`, chunkTableFor(b.TableName)), key); err != nil {
+		// 只删正式行（version_id=''），不碰进行中分片上传的暂存行（v1.3.11）
+		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, chunkTableFor(b.TableName)), key); err != nil {
 			return del, err
 		}
-		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=?`, b.TableName), key); err != nil {
+		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, b.TableName), key); err != nil {
 			return del, err
 		}
 	}
@@ -490,6 +651,32 @@ func (s *Store) headLatestLocked(b Bucket, key string) (ObjectMeta, error) {
 		return ObjectMeta{}, &s3Error{Code: "NoSuchKey", Status: 404, Msg: "The specified key does not exist"}
 	}
 	return m, nil
+}
+
+
+// prefixUpperBound 前缀的字典序上界：'abc'→'abd'；高位全 0xff 时返回 ""（无上界）。
+func prefixUpperBound(p string) string {
+	b := []byte(p)
+	for i := len(b) - 1; i >= 0; i-- {
+		if b[i] < 0xff {
+			b[i]++
+			return string(b[:i+1])
+		}
+	}
+	return ""
+}
+
+// prefixCond 前缀过滤条件（v1.3.11 性能优化：substr(key,1,?)=? 不可走索引，
+// 改为 key 区间扫描——LIST/检索在 PK(key,version_id) 上从全桶扫描+排序降为
+// 前缀区间直读）。
+func prefixCond(p string) (string, []any) {
+	if p == "" {
+		return "", nil
+	}
+	if ub := prefixUpperBound(p); ub != "" {
+		return " AND key >= ? AND key < ?", []any{p, ub}
+	}
+	return " AND key >= ?", []any{p}
 }
 
 // ListEntry LIST 返回行。
@@ -528,9 +715,9 @@ func (s *Store) ListObjects(bucket, prefix, delimiter, marker, startAfter string
 	}
 	q := fmt.Sprintf(`SELECT %s FROM %s WHERE is_latest=1 AND delete_marker=0`, objectCols, b.TableName)
 	args := []any{}
-	if prefix != "" {
-		q += ` AND substr(key,1,?)=?`
-		args = append(args, len(prefix), prefix)
+	if c, a := prefixCond(prefix); c != "" {
+		q += c
+		args = append(args, a...)
 	}
 	if after != "" {
 		q += ` AND key>?`
@@ -595,9 +782,9 @@ func (s *Store) ListVersions(bucket, prefix, keyMarker, versionMarker string, ma
 	}
 	q := fmt.Sprintf(`SELECT %s FROM %s WHERE 1=1`, objectCols, b.TableName)
 	args := []any{}
-	if prefix != "" {
-		q += ` AND substr(key,1,?)=?`
-		args = append(args, len(prefix), prefix)
+	if c, a := prefixCond(prefix); c != "" {
+		q += c
+		args = append(args, a...)
 	}
 	if keyMarker != "" {
 		q += ` AND (key>? OR (key=? AND version_id>?))`
@@ -645,9 +832,9 @@ func (s *Store) ListObjectsRaw(bucket, prefix string, limit int) ([]ObjectMeta, 
 	}
 	q := fmt.Sprintf(`SELECT %s FROM %s WHERE is_latest=1 AND delete_marker=0`, objectCols, b.TableName)
 	args := []any{}
-	if prefix != "" {
-		q += ` AND substr(key,1,?)=?`
-		args = append(args, len(prefix), prefix)
+	if c, a := prefixCond(prefix); c != "" {
+		q += c
+		args = append(args, a...)
 	}
 	q += ` ORDER BY key LIMIT ?`
 	args = append(args, limit)
@@ -744,4 +931,118 @@ func (s *Store) CopyObject(srcBucket, srcKey, srcVersion, dstBucket, dstKey stri
 	}
 	out, _, err := s.PutObject(dstBucket, dstKey, bytes.NewReader(data), int64(len(data)), attrs)
 	return out, err
+}
+
+// ---------------------------------------------------------------------------
+// 对象检索（管理面 SUBMIT S3 TEXT/FILE SEARCH / DELETE，v1.3.11）
+// ---------------------------------------------------------------------------
+
+// SearchFilter 对象检索过滤（均可选；时间串格式 'YYYY-MM-DD[ HH:MM:SS]'）。
+type SearchFilter struct {
+	Prefix    string
+	Like      string // SQL LIKE 通配（%/_），对 key 匹配
+	SizeMin   int64  // <=0 = 未设
+	SizeMax   int64  // <=0 = 未设
+	ModBefore string // 修改时间（= 最新版本写入时间）上界
+	ModAfter  string // 修改时间下界
+	CreBefore string // 创建时间（= 全版本最早写入时间）上界
+	CreAfter  string // 创建时间下界
+	Limit     int    // 0 = 默认 1000
+}
+
+// SearchCandidate 检索结果行（最新版本口径 + 首版本创建时间）。
+type SearchCandidate struct {
+	Key         string
+	Size        int64
+	ContentType string
+	ETag        string
+	ModifiedTS  string
+	CreatedTS   string
+}
+
+// SearchObjects 按过滤条件检索桶内最新对象（prefix/LIKE/size/modified 下推 SQL，
+// created 涉及全版本聚合在 Go 侧过滤；天然受桶级单表索引加速）。
+func (s *Store) SearchObjects(bucket string, f SearchFilter) ([]SearchCandidate, error) {
+	b, err := s.Bucket(bucket)
+	if err != nil {
+		return nil, err
+	}
+	limit := f.Limit
+	if limit <= 0 || limit > 10000 {
+		limit = 1000
+	}
+	q := fmt.Sprintf(`SELECT key,size,content_type,etag,created_ts,
+		(SELECT MIN(created_ts) FROM %s v2 WHERE v2.key=%s.key) AS first_ts
+		FROM %s WHERE is_latest=1 AND delete_marker=0`, b.TableName, b.TableName, b.TableName)
+	var args []any
+	if c, a := prefixCond(f.Prefix); c != "" {
+		q += c
+		args = append(args, a...)
+	}
+	if f.Like != "" {
+		q += ` AND key LIKE ?` // 用户通配符（%/_）原样生效；参数化绑定防注入
+		args = append(args, f.Like)
+	}
+	if f.SizeMin > 0 {
+		q += ` AND size>=?`
+		args = append(args, f.SizeMin)
+	}
+	if f.SizeMax > 0 {
+		q += ` AND size<=?`
+		args = append(args, f.SizeMax)
+	}
+	if f.ModAfter != "" {
+		q += ` AND created_ts>=?`
+		args = append(args, normTS(f.ModAfter))
+	}
+	if f.ModBefore != "" {
+		q += ` AND created_ts<?`
+		args = append(args, normTS(f.ModBefore))
+	}
+	q += ` ORDER BY key`
+	// created 过滤在 Go 侧：放大抓取窗口后裁剪
+	scanCap := limit
+	if f.CreAfter != "" || f.CreBefore != "" {
+		scanCap = limit * 8
+		if scanCap > 20000 {
+			scanCap = 20000
+		}
+	}
+	q += ` LIMIT ?`
+	args = append(args, scanCap)
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SearchCandidate
+	for rows.Next() {
+		var c SearchCandidate
+		if err := rows.Scan(&c.Key, &c.Size, &c.ContentType, &c.ETag, &c.ModifiedTS, &c.CreatedTS); err != nil {
+			return nil, err
+		}
+		if c.CreatedTS == "" {
+			c.CreatedTS = c.ModifiedTS
+		}
+		if f.CreAfter != "" && c.CreatedTS < normTS(f.CreAfter) {
+			continue
+		}
+		if f.CreBefore != "" && c.CreatedTS >= normTS(f.CreBefore) {
+			continue
+		}
+		out = append(out, c)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// normTS 规范化时间过滤值：纯日期补 ' 00:00:00'，便于与 created_ts 字典序比较。
+func normTS(ts string) string {
+	ts = strings.TrimSpace(ts)
+	if len(ts) == 10 {
+		return ts + " 00:00:00"
+	}
+	return ts
 }

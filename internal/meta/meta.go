@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"glaciertdb/internal/config"
+	"sync"
 )
 
 // Querier 是 meta 对后端会话的最小依赖（含多库管理）。
@@ -36,6 +37,8 @@ type Ctx struct {
 	// information_schema.SCHEMATA；USE 切库前校验。
 	DBVisible func(db string) bool
 	CanUseDB  func(db string) error
+	// 建库/删库门禁（v1.3.11 安全修复；nil = 放行——仅本地调用方）
+	CanAdminDB func() error
 }
 
 // ---------------------------------------------------------------------------
@@ -355,13 +358,25 @@ func HandleProbe(ctx *Ctx, q string) (res *Result, handled bool, err error) {
 	}
 
 	// CREATE / DROP DATABASE（一库一文件）
+	// v1.3.11 安全修复：此前任何账号（含只读）都能建/删任意租户的库——
+	// 现在统一走 CanAdminDB 门禁（super 且非只读）。
 	if m := reCreateDB.FindStringSubmatch(q); m != nil {
+		if ctx.CanAdminDB != nil {
+			if err := ctx.CanAdminDB(); err != nil {
+				return nil, true, err
+			}
+		}
 		if err := ctx.Sess.CreateDatabase(m[2]); err != nil {
 			return nil, true, NewMySQLError(1007, "Can't create database '"+m[2]+"': "+err.Error())
 		}
 		return OKResult(), true, nil
 	}
 	if m := reDropDB.FindStringSubmatch(q); m != nil {
+		if ctx.CanAdminDB != nil {
+			if err := ctx.CanAdminDB(); err != nil {
+				return nil, true, err
+			}
+		}
 		if err := ctx.Sess.DropDatabase(m[2]); err != nil {
 			return nil, true, NewMySQLError(1008, "Can't drop database '"+m[2]+"': "+err.Error())
 		}
@@ -1064,23 +1079,36 @@ func quoteStr(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
+// likeRegexpCache LIKE 模式 → 编译正则缓存（v1.3.11 性能：此前每次调用现场
+// 编译正则，information_schema / SHOW 过滤逐行编译，O(rows) 次编译开销）。
+var likeRegexpCache sync.Map // string → *regexp.Regexp
+
 // likeMatch 实现 MySQL LIKE（% _）语义。
 func likeMatch(pattern, s string) bool {
-	var sb strings.Builder
-	sb.WriteString("(?s)\\A")
-	for _, c := range pattern {
-		switch c {
-		case '%':
-			sb.WriteString(".*")
-		case '_':
-			sb.WriteString(".")
-		default:
-			sb.WriteString(regexp.QuoteMeta(string(c)))
+	var re *regexp.Regexp
+	if v, ok := likeRegexpCache.Load(pattern); ok {
+		re = v.(*regexp.Regexp)
+	} else {
+		var sb strings.Builder
+		sb.WriteString("(?s)\\A")
+		for _, c := range pattern {
+			switch c {
+			case '%':
+				sb.WriteString(".*")
+			case '_':
+				sb.WriteString(".")
+			default:
+				sb.WriteString(regexp.QuoteMeta(string(c)))
+			}
 		}
+		sb.WriteString("\\z")
+		re, _ = regexp.Compile(sb.String())
+		likeRegexpCache.Store(pattern, re)
 	}
-	sb.WriteString("\\z")
-	ok, _ := regexp.MatchString(sb.String(), s)
-	return ok
+	if re == nil {
+		return false
+	}
+	return re.MatchString(s)
 }
 
 // reBlockComment 匹配全部块注释；StripComments 剥除时保留 /*+ ... */ 优化器 hint

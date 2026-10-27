@@ -153,7 +153,8 @@ func decodeBase64Body(data []byte) ([]byte, error) {
 
 // processImage 图片加工：解码 → 裁剪 → 缩放 → 编码（格式转换）→（可选）base64。
 // 非图片输入且无 base64 参数时报错；已是目标格式且无加工时原样返回。
-func processImage(data []byte, p imgParams) ([]byte, string, error) {
+// res：同桶图像解析器（blend 融合操作用；nil = 当前上下文不支持融合）。
+func processImage(data []byte, p imgParams, res imgResolver) ([]byte, string, error) {
 	needTransform := !p.Crop.Empty() || p.ResizeW > 0 || p.ResizeH > 0 || p.Format != "" || len(p.Ops) > 0
 	if !needTransform {
 		if p.Base64 {
@@ -176,7 +177,7 @@ func processImage(data []byte, p imgParams) ([]byte, string, error) {
 	}
 	// OpenCV 风格操作管道（v1.3.7）：绘制/滤镜/几何（绘制坐标基于裁剪后画布）
 	if len(p.Ops) > 0 {
-		src, err = applyOps(src, p.Ops)
+		src, err = applyOps(src, p.Ops, res)
 		if err != nil {
 			return nil, "", err
 		}

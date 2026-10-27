@@ -10,6 +10,9 @@
 //	blur(ksize)                            cv2.blur 均值滤波
 //	rotate(90|180|270)                     cv2.rotate
 //	flip(0|1|-1)                           cv2.flip（0 垂直 / 1 水平 / -1 双向）
+//	blend('key'[,x,y[,alpha[,cx,cy,cw,ch]]])  裁剪融合（v1.3.11）：取同桶对象 key
+//	                                       的图像，可选裁剪 (cx,cy,cw,ch) 后以权重
+//	                                       alpha 贴入当前位置（≈cv2.addWeighted）
 //
 // 执行顺序：crop → ops → resize → format（绘制坐标基于裁剪后画布）。
 // 文本渲染：默认内置 bitmap 字体（ASCII）；配置 s3.image_font 指向 ttf 时
@@ -114,7 +117,11 @@ func atoiArg(args []string, i int, def int) int {
 // 操作实现（opFuncs 注册表）
 // ---------------------------------------------------------------------------
 
-var opFuncs = map[string]func(img image.Image, args []string) (image.Image, error){}
+// imgResolver 同桶图像解析器：blend 操作按对象 key 取第二张图（v1.3.11）。
+// 只暴露 key（无 bucket 维度）——融合源恒限定在当前请求的来源桶内。
+type imgResolver func(key string) (image.Image, error)
+
+var opFuncs = map[string]func(img image.Image, args []string, res imgResolver) (image.Image, error){}
 
 func init() {
 	opFuncs["rectangle"] = opRectangle
@@ -125,6 +132,7 @@ func init() {
 	opFuncs["blur"] = opBlur
 	opFuncs["rotate"] = opRotate
 	opFuncs["flip"] = opFlip
+	opFuncs["blend"] = opBlend
 }
 
 // toRGBA 通用画布转换（绘制操作前置）。
@@ -192,7 +200,7 @@ func colorArg(args []string, i int) (color.RGBA, error) {
 	return c, nil
 }
 
-func opRectangle(src image.Image, args []string) (image.Image, error) {
+func opRectangle(src image.Image, args []string, _ imgResolver) (image.Image, error) {
 	if len(args) < 4 {
 		return nil, fmt.Errorf("rectangle needs x,y,w,h[,R,G,B[,thickness]]")
 	}
@@ -238,7 +246,7 @@ func opRectangle(src image.Image, args []string) (image.Image, error) {
 	return img, nil
 }
 
-func opCircle(src image.Image, args []string) (image.Image, error) {
+func opCircle(src image.Image, args []string, _ imgResolver) (image.Image, error) {
 	if len(args) < 3 {
 		return nil, fmt.Errorf("circle needs cx,cy,r[,R,G,B[,thickness]]")
 	}
@@ -286,7 +294,7 @@ func opCircle(src image.Image, args []string) (image.Image, error) {
 	return img, nil
 }
 
-func opLine(src image.Image, args []string) (image.Image, error) {
+func opLine(src image.Image, args []string, _ imgResolver) (image.Image, error) {
 	if len(args) < 4 {
 		return nil, fmt.Errorf("line needs x1,y1,x2,y2[,R,G,B[,thickness]]")
 	}
@@ -404,7 +412,7 @@ func loadImageFont(path string, size float64) (font.Face, error) {
 
 var ttfBase *opentype.Font
 
-func opText(src image.Image, args []string) (image.Image, error) {
+func opText(src image.Image, args []string, _ imgResolver) (image.Image, error) {
 	if len(args) < 4 {
 		return nil, fmt.Errorf("text needs 'str',x,y[,R,G,B[,scale]]")
 	}
@@ -442,7 +450,7 @@ func opText(src image.Image, args []string) (image.Image, error) {
 // 滤镜与几何
 // ---------------------------------------------------------------------------
 
-func opGrayscale(src image.Image, _ []string) (image.Image, error) {
+func opGrayscale(src image.Image, _ []string, _ imgResolver) (image.Image, error) {
 	b := src.Bounds()
 	img := toRGBA(src)
 	out := image.NewRGBA(b)
@@ -475,7 +483,7 @@ func opGrayscale(src image.Image, _ []string) (image.Image, error) {
 // opBlur 均值滤波（cv2.blur）：可分离两遍滑动窗口（水平 → 垂直），每像素 O(1)
 // 而非 O(k²)；边界窗口仅计有效像素（与原逐点实现语义一致）。中间结果用
 // 16.16 定点避免两遍整除的舍入漂移（与精确二维均值误差 ≤ 1 LSB）。
-func opBlur(src image.Image, args []string) (image.Image, error) {
+func opBlur(src image.Image, args []string, _ imgResolver) (image.Image, error) {
 	k := atoiArg(args, 0, 3)
 	if k < 1 || k > 51 || k%2 == 0 {
 		return nil, fmt.Errorf("blur ksize must be odd 1..51")
@@ -562,7 +570,7 @@ func opBlur(src image.Image, args []string) (image.Image, error) {
 	return out, nil
 }
 
-func opRotate(src image.Image, args []string) (image.Image, error) {
+func opRotate(src image.Image, args []string, _ imgResolver) (image.Image, error) {
 	deg := atoiArg(args, 0, 90)
 	switch ((deg % 360) + 360) % 360 {
 	case 90, 180, 270:
@@ -658,7 +666,7 @@ func opRotate(src image.Image, args []string) (image.Image, error) {
 	}
 }
 
-func opFlip(src image.Image, args []string) (image.Image, error) {
+func opFlip(src image.Image, args []string, _ imgResolver) (image.Image, error) {
 	code := atoiArg(args, 0, 1)
 	switch code {
 	case 0, 1, -1:
@@ -713,18 +721,93 @@ func opFlip(src image.Image, args []string) (image.Image, error) {
 }
 
 // ---------------------------------------------------------------------------
+// 裁剪融合（v1.3.11）
+// ---------------------------------------------------------------------------
+
+// opBlend 裁剪融合：blend('key'[,x,y[,alpha[,cx,cy,cw,ch]]])。
+//   key    同桶对象 key（单引号包裹，可含逗号 / 斜杠）
+//   x,y    贴入到当前画布的左上角坐标（默认 0,0）
+//   alpha  融合权重 0..1（默认 1 = 完全覆盖；0.5 ≈ cv2.addWeighted(a,0.5,b,0.5,0)）
+//   cx,cy,cw,ch  可选：先对 key 的图像裁剪该矩形再融合（裁剪融合）
+// 源图经 imgResolver 加载——resolver 仅按 key 取当前来源桶内对象，
+// 不提供跨桶能力（同桶融合，v1.3.11 权限边界）。
+func opBlend(src image.Image, args []string, res imgResolver) (image.Image, error) {
+	if res == nil {
+		return nil, fmt.Errorf("blend requires a same-bucket source image (unavailable in this context)")
+	}
+	if len(args) < 1 || strings.Trim(args[0], "'") == "" {
+		return nil, fmt.Errorf("blend needs 'key'[,x,y[,alpha[,cx,cy,cw,ch]]]")
+	}
+	key := strings.Trim(args[0], "'")
+	overlay, err := res(key)
+	if err != nil {
+		return nil, fmt.Errorf("blend source %q: %w", key, err)
+	}
+	x, y := atoiArg(args, 1, 0), atoiArg(args, 2, 0)
+	alpha := 1.0
+	if len(args) >= 4 {
+		if v, perr := strconv.ParseFloat(strings.TrimSpace(args[3]), 64); perr == nil && v >= 0 && v <= 1 {
+			alpha = v
+		} else {
+			return nil, fmt.Errorf("blend alpha must be within 0..1")
+		}
+	}
+	if len(args) >= 8 {
+		cx, cy := atoiArg(args, 4, 0), atoiArg(args, 5, 0)
+		cw, ch := atoiArg(args, 6, 0), atoiArg(args, 7, 0)
+		if cw <= 0 || ch <= 0 {
+			return nil, fmt.Errorf("blend crop w/h must be > 0")
+		}
+		r := image.Rect(cx, cy, cx+cw, cy+ch).Intersect(overlay.Bounds())
+		if r.Empty() {
+			return nil, fmt.Errorf("blend crop region outside source image bounds %v", overlay.Bounds())
+		}
+		overlay = subImage(overlay, r)
+	}
+	base := toRGBA(src)
+	ov := toRGBA(overlay)
+	ob := ov.Bounds()
+	bb := base.Bounds()
+	// 逐行并行：out = base*(1-w) + overlay*w，w = alpha × 源像素不透明度
+	parallelBands(ob.Dy(), func(lo, hi int) {
+		for sy := lo; sy < hi; sy++ {
+			dy := y + sy
+			if dy < bb.Min.Y || dy >= bb.Max.Y {
+				continue
+			}
+			so := ov.PixOffset(ob.Min.X, ob.Min.Y+sy)
+			for sx := 0; sx < ob.Dx(); sx++ {
+				dx := x + sx
+				if dx < bb.Min.X || dx >= bb.Max.X {
+					so += 4
+					continue
+				}
+				w := alpha * float64(ov.Pix[so+3]) / 255.0
+				do := base.PixOffset(dx, dy)
+				for i := 0; i < 3; i++ {
+					base.Pix[do+i] = uint8(clamp255(float64(base.Pix[do+i])*(1-w) + float64(ov.Pix[so+i])*w))
+				}
+				base.Pix[do+3] = uint8(clamp255(float64(base.Pix[do+3])*(1-w) + 255*w))
+				so += 4
+			}
+		}
+	})
+	return base, nil
+}
+
+// ---------------------------------------------------------------------------
 // 管道执行（image.go processImage 调用）
 // ---------------------------------------------------------------------------
 
-// applyOps 依序执行操作管道。
-func applyOps(src image.Image, ops []imgOp) (image.Image, error) {
+// applyOps 依序执行操作管道（res = 同桶图像解析器，blend 用）。
+func applyOps(src image.Image, ops []imgOp, res imgResolver) (image.Image, error) {
 	var err error
 	for _, op := range ops {
 		fn := opFuncs[op.name]
 		if fn == nil {
 			return nil, fmt.Errorf("unknown image op %q", op.name)
 		}
-		if src, err = fn(src, op.args); err != nil {
+		if src, err = fn(src, op.args, res); err != nil {
 			return nil, err
 		}
 	}

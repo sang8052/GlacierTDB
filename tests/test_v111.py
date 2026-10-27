@@ -261,7 +261,13 @@ def main() -> int:
     try:
         c3 = connect(user="sha2u", password="sha2pass2", db="backup")
         c3c = c3.cursor()
-        c3c.execute("USE GlacierTDB")
+        # v1.3.11 起 USER 账号禁入管理面（USE GlacierTDB → 1044）；
+        # REBUILD ROLLUP 在业务库直发同样被 super 门禁拒绝
+        try:
+            c3c.execute("USE GlacierTDB")
+            check(False, "普通用户 USE GlacierTDB 应拒绝")
+        except pymysql.MySQLError as e:
+            check(e.args[0] == 1044, "普通用户禁入管理面（%s）" % e.args[0])
         c3c.execute("REBUILD ROLLUP rollupdb")
         check(False, "普通用户 REBUILD ROLLUP 应拒绝")
         c3.close()

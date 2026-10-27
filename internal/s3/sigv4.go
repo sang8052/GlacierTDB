@@ -310,15 +310,20 @@ func verifySigV4(r *http.Request, region string,
 		if cs.Expires <= 0 {
 			cs.Expires = 604800 // S3 默认 7 天
 		}
+		if cs.Expires > 604800 { // v1.3.11：对齐 AWS 上限（7 天），防止万年签名
+			return cs, "", fmt.Errorf("X-Amz-Expires must be <= 604800")
+		}
 		if len(cs.SignedHeaders) == 0 {
 			return cs, "", fmt.Errorf("missing X-Amz-SignedHeaders")
 		}
-		// 有效期
-		if t, err := time.Parse("20060102T150405Z", cs.ReqDateTime); err == nil {
-			if now := time.Now().UTC(); now.After(t.Add(time.Duration(cs.Expires)*time.Second)) ||
-				now.Before(t.Add(-signTimeSkew)) {
-				return cs, "", fmt.Errorf("presigned URL expired")
-			}
+		// 有效期（v1.3.11：日期不可解析时 fail-closed，不再静默跳过时效校验）
+		t, err := time.Parse("20060102T150405Z", cs.ReqDateTime)
+		if err != nil {
+			return cs, "", fmt.Errorf("malformed X-Amz-Date")
+		}
+		if now := time.Now().UTC(); now.After(t.Add(time.Duration(cs.Expires)*time.Second)) ||
+			now.Before(t.Add(-signTimeSkew)) {
+			return cs, "", fmt.Errorf("presigned URL expired")
 		}
 	} else {
 		auth := r.Header.Get("Authorization")
@@ -340,10 +345,13 @@ func verifySigV4(r *http.Request, region string,
 		if cs.ReqDateTime == "" {
 			return cs, "", fmt.Errorf("missing X-Amz-Date")
 		}
-		if t, err := time.Parse("20060102T150405Z", cs.ReqDateTime); err == nil {
-			if dt := time.Now().UTC().Sub(t); dt > signTimeSkew || dt < -signTimeSkew {
-				return cs, "", fmt.Errorf("request time too skewed")
-			}
+		// v1.3.11：日期不可解析时 fail-closed
+		t, terr := time.Parse("20060102T150405Z", cs.ReqDateTime)
+		if terr != nil {
+			return cs, "", fmt.Errorf("malformed X-Amz-Date")
+		}
+		if dt := time.Now().UTC().Sub(t); dt > signTimeSkew || dt < -signTimeSkew {
+			return cs, "", fmt.Errorf("request time too skewed")
 		}
 	}
 

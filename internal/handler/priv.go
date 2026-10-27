@@ -60,9 +60,77 @@ func (h *Handler) checkPrivilege(q string) error {
 	return nil
 }
 
+// withMainVerbs WITH 前缀语句的主动词集合（CTE 之后的核心语句）。
+var withMainVerbs = map[string]bool{
+	"SELECT": true, "INSERT": true, "UPDATE": true, "DELETE": true,
+	"REPLACE": true, "VALUES": true, "TABLE": true,
+}
+
+// StripWithPrefix 归一化 WITH 前缀语句（v1.3.11 安全修复：此前 WITH ... DELETE/INSERT
+// 被读路径正则 ^SELECT|WITH 误判为读，SELECT 权限即可写、只读账号可写）。
+// 返回主动词开头的形式，仅用于语句分类；非 WITH 语句原样返回。
+// "WITH x AS (…) DELETE FROM t" → "DELETE FROM t"。
+func StripWithPrefix(q string) string {
+	t := strings.TrimSpace(q)
+	if len(t) < 6 || !strings.EqualFold(t[:4], "WITH") {
+		return t
+	}
+	c4 := t[4]
+	if c4 != ' ' && c4 != '\t' && c4 != '\n' && c4 != '\r' && c4 != '(' {
+		return t
+	}
+	depth, i, n := 0, 0, len(t)
+	var quote byte
+	for i < n {
+		c := t[i]
+		if quote != 0 {
+			if c == '\\' && (quote == '\'' || quote == '"') {
+				i += 2
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			i++
+			continue
+		}
+		switch c {
+		case '\'', '"', '`':
+			quote = c
+			i++
+			continue
+		case '(':
+			depth++
+			i++
+			continue
+		case ')':
+			depth--
+			i++
+			continue
+		}
+		if depth == 0 && isIdentByteCls(c) {
+			j := i
+			for j < n && isIdentByteCls(t[j]) {
+				j++
+			}
+			if withMainVerbs[strings.ToUpper(t[i:j])] {
+				return t[i:]
+			}
+			i = j
+			continue
+		}
+		i++
+	}
+	return t
+}
+
+func isIdentByteCls(c byte) bool {
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80
+}
+
 // stmtPriv 判定语句所需权限（priv, 是否已识别）。
 func stmtPriv(q string) (string, bool) {
-	q = strings.TrimSpace(q)
+	q = StripWithPrefix(strings.TrimSpace(q))
 	switch {
 	case reKindSelect.MatchString(q):
 		return "SELECT", true

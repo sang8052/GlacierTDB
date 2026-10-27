@@ -63,9 +63,10 @@ func IsAdminUse(q string) (adminMode bool, ok bool) {
 
 var reVacuumDB = regexp.MustCompile("(?i)^VACUUM\\s+DATABASE\\s+`?([A-Za-z0-9_-]+)`?\\s*$")
 
-var reRebuildRollup = regexp.MustCompile("(?i)^REBUILD\\s+ROLLUP\\s+`?([A-Za-z0-9_-]+)`?\\s*$")
+var reRebuildRollup = regexp.MustCompile("(?i)^REBUILD\\s+ROLLUP\\s+`?([A-Za-z0-9_-]+)`?(?:\\.`?([A-Za-z0-9_\\x{4e00}-\\x{9fa5}]+)`?)?\\s*$")
 
-// handleRebuildRollup REBUILD ROLLUP <db>：从原始 points 回填 m1/h1/d1 汇总表（v1.1.1）。
+// handleRebuildRollup REBUILD ROLLUP <db>[.<tbl>]：从原始表回填 m1/h1/d1 汇总表
+//（v1.1.1；v1.3.11 支持任意声明时序表，缺省 points）。
 // 回填期间该库写入持写锁；触发器保证后续写入同遍落。
 func (h *Handler) handleRebuildRollup(q string) (*mysql.Result, bool, error) {
 	m := reRebuildRollup.FindStringSubmatch(q)
@@ -81,19 +82,26 @@ func (h *Handler) handleRebuildRollup(q string) (*mysql.Result, bool, error) {
 	if h.session.InTx {
 		return nil, true, mysql.NewError(1192, "can't execute REBUILD ROLLUP with active transaction")
 	}
-	db := m[1]
+	db, tbl := m[1], m[2]
+	if tbl == "" {
+		tbl = "points"
+	}
 	old := h.session.CurrentDB()
 	if err := h.session.Use(db); err != nil {
 		return nil, true, mysql.NewError(mysql.ER_BAD_DB_ERROR, err.Error())
 	}
 	defer func() { _ = h.session.Use(old) }()
+	unit := "ms"
+	if t := h.tsTableForNamed(tbl); t != nil {
+		unit = t.Unit
+	}
 	h.session.AcquireWrite()
 	defer h.session.ReleaseWrite()
-	cols, rows, err := h.rebuildRollup()
+	cols, rows, err := h.rebuildRollupFor(tbl, unit)
 	if err != nil {
 		return nil, true, mysql.NewError(1105, err.Error())
 	}
-	logx.Infof("rollup rebuilt for db %s by conn %d", db, h.connID)
+	logx.Infof("rollup rebuilt for db %s table %s by conn %d", db, tbl, h.connID)
 	res, err2 := meta.SimpleRS(cols, rows)
 	return res, true, err2
 }
@@ -260,8 +268,10 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		return meta.OKResultPub(), true, nil
 
 	case reAdminSetConc.MatchString(q):
-		if h.readonly {
-			return nil, true, roErr()
+		// v1.3.11 安全修复：全局/单库并发属服务器级配置，此前仅拦只读——
+		// 任意 USER 账号可 SET GLOBAL_THREADS=1 拖垮全部租户
+		if err := h.adminMutateGate(); err != nil {
+			return nil, true, err
 		}
 		// 并发配置热改（仅内存生效，重启失效回到配置文件值）
 		m := reAdminSetConc.FindStringSubmatch(q)

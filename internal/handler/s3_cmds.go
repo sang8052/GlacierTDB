@@ -34,6 +34,8 @@ import (
 //	SHOW S3 USAGE [FOR <user>]   EXPORT S3 USAGE [FOR <user>] [TO '<file>']
 //	SHOW S3 OBJECTS <bucket> [LIKE '<prefix>'] [LIMIT <n>]
 //	SHOW S3 UPLOADS [<bucket>]（分片上传会话，v1.3.1）
+//	SHOW S3 SPACE（系统库页/空闲页统计，v1.3.11）
+//	S3 VACUUM [FULL]（空间回收：默认增量免长锁；FULL 排他重建并切换增量模式，v1.3.11）
 //	S3 RETAIN <bucket>/<key> UNTIL '<date>' (COMPLIANCE|GOVERNANCE) [VERSION '<v>']
 //	S3 LEGAL_HOLD <bucket>/<key> (ON|OFF) [VERSION '<v>']
 func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
@@ -87,6 +89,8 @@ func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
 			return h.s3ShowObjects(toks)
 		case up(1) == "S3" && up(2) == "UPLOADS":
 			return h.s3ShowUploads(toks)
+		case up(1) == "S3" && up(2) == "SPACE":
+			return h.s3ShowSpace()
 		}
 	case "ALTER":
 		if up(1) == "BUCKET" {
@@ -135,6 +139,9 @@ func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
 		if up(1) == "LEGAL_HOLD" {
 			return h.s3LegalHold(toks)
 		}
+		if up(1) == "VACUUM" {
+			return h.s3Vacuum(toks)
+		}
 	}
 	return nil, false, nil
 }
@@ -147,7 +154,7 @@ func isS3Command(up func(int) string) bool {
 	case "SHOW":
 		return up(1) == "BUCKETS" || (up(1) == "S3" && (up(2) == "KEYS" || up(2) == "USAGE" ||
 			up(2) == "LIFECYCLE" || up(2) == "DOMAINS" || up(2) == "POLICIES" || up(2) == "OBJECTS" ||
-			up(2) == "UPLOADS"))
+			up(2) == "UPLOADS" || up(2) == "SPACE"))
 	case "ALTER":
 		return up(1) == "BUCKET"
 	case "SET", "CLEAR":
@@ -159,7 +166,7 @@ func isS3Command(up func(int) string) bool {
 	case "EXPORT":
 		return up(1) == "S3" && up(2) == "USAGE"
 	case "S3":
-		return up(1) == "RETAIN" || up(1) == "LEGAL_HOLD"
+		return up(1) == "RETAIN" || up(1) == "LEGAL_HOLD" || up(1) == "VACUUM"
 	}
 	return false
 }
@@ -748,6 +755,59 @@ func (h *Handler) s3ShowUploads(toks []string) (*mysql.Result, bool, error) {
 	// SHOW S3 UPLOADS [<bucket>]（分片上传会话）
 	res, err := meta.SimpleRS([]string{"upload_id", "bucket", "key", "parts", "bytes", "created"},
 		h.s3UploadRows(argVal(toks, 3)))
+	return res, true, err
+}
+
+// s3ShowSpace SHOW S3 SPACE：系统库空间统计（纯 PRAGMA 读，不锁库）。
+func (h *Handler) s3ShowSpace() (*mysql.Result, bool, error) {
+	st := h.s3store.SpaceStats()
+	auto := "none"
+	switch st.AutoVacuum {
+	case 1:
+		auto = "full"
+	case 2:
+		auto = "incremental"
+	}
+	note := "incremental_vacuum 可用（S3 VACUUM 走增量免长锁）"
+	if st.AutoVacuum != 2 {
+		note = "增量模式未启用：执行一次 S3 VACUUM FULL 切换（排他，维护窗口执行）"
+	}
+	res, err := meta.SimpleRS([]string{"page_size", "page_count", "freelist_pages", "free_bytes",
+		"file_bytes", "auto_vacuum", "note"},
+		[][]any{{st.PageSize, st.PageCount, st.FreelistCount, st.FreeBytes, st.FileBytes, auto, note}})
+	return res, true, err
+}
+
+// s3Vacuum S3 VACUUM [FULL]：空间回收（SQLite 删除只挂 freelist 不缩文件）。
+// 默认增量：每步 256 页的短写事务，WAL 下读不受影响；FULL 排他重建整个库文件
+// （时长与库大小成正比），并把存量库切换到增量模式。
+func (h *Handler) s3Vacuum(toks []string) (*mysql.Result, bool, error) {
+	if err := h.adminMutateGate(); err != nil {
+		return nil, true, err
+	}
+	full := false
+	for i := 2; i < len(toks); i++ {
+		if strings.EqualFold(toks[i], "FULL") {
+			full = true
+		}
+	}
+	before := h.s3store.SpaceStats()
+	if full {
+		if err := h.s3store.VacuumFull(); err != nil {
+			return nil, true, mysql.NewError(1105, err.Error())
+		}
+		after := h.s3store.SpaceStats()
+		logx.Infof("s3: full VACUUM by conn %d (file %d -> %d bytes)", h.connID, before.FileBytes, after.FileBytes)
+		res, err := meta.SimpleRS([]string{"mode", "file_bytes_before", "file_bytes_after"},
+			[][]any{{"full", before.FileBytes, after.FileBytes}})
+		return res, true, err
+	}
+	freed := h.s3store.VacuumIncremental(0)
+	after := h.s3store.SpaceStats()
+	logx.Infof("s3: incremental vacuum by conn %d (freed %d bytes, freelist %d -> %d pages)",
+		h.connID, freed, before.FreelistCount, after.FreelistCount)
+	res, err := meta.SimpleRS([]string{"mode", "freed_bytes", "freelist_pages_before", "freelist_pages_after"},
+		[][]any{{"incremental", freed, before.FreelistCount, after.FreelistCount}})
 	return res, true, err
 }
 

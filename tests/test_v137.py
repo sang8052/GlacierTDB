@@ -126,7 +126,7 @@ def main():
 
     # POST save-as：已存对象处理另存
     st, _, _ = req("POST", "/v137/base.png",
-                   query="x-gimg-ops=rectangle(5,5,40,40,255,0,255,2)&x-gimg-save-as=v137/saved.png")
+                   query="x-gimg-ops=rectangle(5,5,40,40,255,0,255,2)&x-gimg-save-as=saved.png")
     check(st == 200, "POST save-as 200")
     img = get_img("/v137/saved.png", "")
     check(img.getpixel((25, 5)) == (255, 0, 255), "另存图含品红框（%r）" % (img.getpixel((25, 5)),))

@@ -9,7 +9,9 @@ import (
 	"encoding/xml"
 	"fmt"
 	"hash"
+	"image"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"path/filepath"
@@ -145,6 +147,7 @@ func (s *Server) lifecycleLoop() {
 		if s.imgcache.enabled() { // 图片缓存顺带做一轮容量回收
 			s.imgcache.enforce()
 		}
+		s.store.AutoReclaim() // 删除留下的空闲页增量回收（阈值触发，短事务分步免长锁；v1.3.11）
 	}
 }
 
@@ -236,6 +239,18 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 拷贝源桶 ACL（v1.3.11 修复跨租户读漏洞）：x-amz-copy-source 引入了第二个
+	// 攻击者可控的桶引用，此前从未校验——任何租户可凭自己桶里的 PUT+copy-source
+	// 整读其他属主的对象（CopyObject 与 UploadPartCopy 同一入口堵死）。
+	if key != "" && r.Method == http.MethodPut {
+		if src := r.Header.Get("X-Amz-Copy-Source"); src != "" {
+			if e := h.checkCopySourceACL(owner, keyPolicy, src, r, ip); e != nil {
+				writeErr(w, r, reqID, e)
+				return
+			}
+		}
+	}
+
 	// 限速 / 并发（用户级聚合：多连接合并不超过用户总带宽）
 	lim := s.store.EffectiveLimit(bucket)
 	release, userTB, lerr := s.lim.acquire(owner, bucket)
@@ -319,6 +334,28 @@ func (s *Server) canAccess(user, owner string) bool {
 		return true
 	}
 	return false
+}
+
+// checkCopySourceACL 校验 x-amz-copy-source 源桶（v1.3.11）：
+// 与请求桶同等的属主隔离 + 源桶策略条件。src 形如 [/]bucket/key[?versionId=..]。
+func (h *endpointHandler) checkCopySourceACL(owner, keyPolicy, src string, r *http.Request, ip string) *s3Error {
+	src = strings.TrimPrefix(src, "/")
+	srcBucket, _ := splitPathStyle(src)
+	if srcBucket == "" {
+		return &s3Error{Code: "InvalidArgument", Status: 400, Msg: "invalid x-amz-copy-source"}
+	}
+	sb, err := h.srv.store.Bucket(srcBucket)
+	if err != nil {
+		return toS3Err(err)
+	}
+	if !h.srv.canAccess(owner, sb.Owner) {
+		return &s3Error{Code: "AccessDenied", Status: 403,
+			Msg: "Access Denied: copy source bucket " + srcBucket + " belongs to another owner"}
+	}
+	if err := checkPolicies(keyPolicy, h.srv.store.BucketPolicy(srcBucket), r, ip); err != nil {
+		return toS3Err(err)
+	}
+	return nil
 }
 
 // checkPolicies 密钥级 + 桶级策略条件校验（AND）。
@@ -658,6 +695,22 @@ func (h *endpointHandler) handleObject(w http.ResponseWriter, r *http.Request, b
 	}
 }
 
+// imgResolverFor 构造同桶图像解析器（blend 融合源加载；v1.3.11）。
+// 只按 key 取当前来源桶内对象——融合不提供跨桶能力（权限边界）。
+func (h *endpointHandler) imgResolverFor(bucket string) imgResolver {
+	return func(key string) (image.Image, error) {
+		_, data, err := h.srv.store.GetObjectBytes(bucket, key, "")
+		if err != nil {
+			return nil, err
+		}
+		img, _, err := image.Decode(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("decode image: %w", err)
+		}
+		return img, nil
+	}
+}
+
 // putObject 上传对象（支持 base64 上传解码、aws-chunked 流式[含新版 CRC32 trailer 编码]、
 // 负载哈希校验）。
 func (h *endpointHandler) putObject(w http.ResponseWriter, r *http.Request, bucket, key, owner,
@@ -726,7 +779,7 @@ func (h *endpointHandler) putObject(w http.ResponseWriter, r *http.Request, buck
 		if len(img.Ops) > 0 || !img.Crop.Empty() || img.ResizeW > 0 || img.ResizeH > 0 || img.Format != "" {
 			procParams := img
 			procParams.Base64 = false
-			processed, ct, perr := processImage(decoded, procParams)
+			processed, ct, perr := processImage(decoded, procParams, h.imgResolverFor(bucket))
 			if perr != nil {
 				writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: perr.Error()})
 				return
@@ -758,7 +811,7 @@ func (h *endpointHandler) putObject(w http.ResponseWriter, r *http.Request, buck
 			writeErr(w, r, reqID, toS3Err(rerr))
 			return
 		}
-		processed, ct, perr := processImage(raw, img)
+		processed, ct, perr := processImage(raw, img, h.imgResolverFor(bucket))
 		if perr != nil {
 			writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: perr.Error()})
 			return
@@ -843,7 +896,7 @@ func (h *endpointHandler) getObject(w http.ResponseWriter, r *http.Request, buck
 				return nil, "", err
 			}
 			opsStart := time.Now()
-			out, ct, perr := processImage(data, img)
+			out, ct, perr := processImage(data, img, h.imgResolverFor(bucket))
 			if tw, ok := w.(*timingRW); ok && needTransform {
 				tw.opsTime = time.Since(opsStart)
 			}
@@ -886,7 +939,38 @@ func (h *endpointHandler) getObject(w http.ResponseWriter, r *http.Request, buck
 		return
 	}
 
-	m, rc, err := h.srv.store.GetObject(bucket, key, versionID)
+	// Range 读（v1.3.11）：bytes=a-b / a- / -n；分块对象按 manifest 直定位分块，
+	// 不整读对象。先做语法解析（伪 size=MaxInt64），取到 meta 后再做语义校验。
+	rangeHdr := ""
+	if rg := r.Header.Get("Range"); rg != "" && !headOnly {
+		if _, _, ok := parseByteRange(rg, math.MaxInt64); !ok {
+			writeErr(w, r, reqID, &s3Error{Code: "InvalidRange", Status: 416,
+				Msg: "The requested range is not satisfiable (malformed Range header)"})
+			return
+		}
+		rangeHdr = rg
+	}
+
+	var m ObjectMeta
+	var rc io.ReadCloser
+	var err error
+	if rangeHdr != "" {
+		m0, herr := h.srv.store.HeadObject(bucket, key, versionID)
+		if herr != nil {
+			writeErr(w, r, reqID, toS3Err(herr))
+			return
+		}
+		a, n, ok := parseByteRange(rangeHdr, m0.Size)
+		if !ok {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", m0.Size))
+			writeErr(w, r, reqID, &s3Error{Code: "InvalidRange", Status: 416,
+				Msg: fmt.Sprintf("The requested range is not satisfiable (size %d)", m0.Size)})
+			return
+		}
+		m, rc, err = h.srv.store.GetObjectRange(bucket, key, versionID, a, n)
+	} else {
+		m, rc, err = h.srv.store.GetObject(bucket, key, versionID)
+	}
 	if err != nil {
 		if se, ok := err.(*s3Error); ok && se.Code == "NoSuchKey" && versionID == "" {
 			// 删除标记 GET：404 + x-amz-delete-marker
@@ -936,11 +1020,67 @@ func (h *endpointHandler) getObject(w http.ResponseWriter, r *http.Request, buck
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+
+	w.Header().Set("Accept-Ranges", "bytes")
+	if rangeHdr != "" { // 206：GetObjectRange 已按区间定位
+		a, n, _ := parseByteRange(rangeHdr, m.Size)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", a, a+n-1, m.Size))
+		w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		_, cw := newLimitedWriter(w, lim.PerConnBps, userTB)
+		_, _ = io.Copy(cw, rc)
+		h.srv.store.AddUsage(usageOwner(h.srv, bucket, owner), bucket, "GET", 0, cw.count)
+		return
+	}
 	w.Header().Set("Content-Length", strconv.FormatInt(m.Size, 10))
 	w.WriteHeader(http.StatusOK)
 	_, cw := newLimitedWriter(w, lim.PerConnBps, userTB)
 	_, _ = io.Copy(cw, rc)
 	h.srv.store.AddUsage(usageOwner(h.srv, bucket, owner), bucket, "GET", 0, cw.count)
+}
+
+// parseByteRange 解析 Range 头（单区间）；返回 (start, length)。
+// ok=false 表示不可满足（越界）或格式非法（按 416 处理，对齐 S3 宽松策略）。
+func parseByteRange(rg string, size int64) (int64, int64, bool) {
+	rg = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rg), "bytes="))
+	if rg == "" || size <= 0 {
+		return 0, 0, false
+	}
+	dash := strings.IndexByte(rg, '-')
+	if dash < 0 {
+		return 0, 0, false
+	}
+	left, right := strings.TrimSpace(rg[:dash]), strings.TrimSpace(rg[dash+1:])
+	if strings.Contains(left, ",") || strings.Contains(right, ",") {
+		return 0, 0, false // 多区间不支持
+	}
+	switch {
+	case left == "" && right != "": // bytes=-N（末 N 字节）
+		n, err := strconv.ParseInt(right, 10, 64)
+		if err != nil || n <= 0 {
+			return 0, 0, false
+		}
+		if n > size {
+			n = size
+		}
+		return size - n, n, true
+	case left != "" && right == "": // bytes=a-
+		a, err := strconv.ParseInt(left, 10, 64)
+		if err != nil || a >= size || a < 0 {
+			return 0, 0, false
+		}
+		return a, size - a, true
+	default: // bytes=a-b（闭区间）
+		a, err1 := strconv.ParseInt(left, 10, 64)
+		b, err2 := strconv.ParseInt(right, 10, 64)
+		if err1 != nil || err2 != nil || a < 0 || b < a || a >= size {
+			return 0, 0, false
+		}
+		if b >= size {
+			b = size - 1
+		}
+		return a, b - a + 1, true
+	}
 }
 
 // usageOwner 记账归属：桶属主（计费实体），查不到回退请求用户。
@@ -1335,7 +1475,9 @@ func genRequestUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// imageProcessSave POST ?x-gimg-ops=...&x-gimg-save-as=b/k2 → 读源对象执行操作管道后另存（v1.3.7）。
+// imageProcessSave POST ?x-gimg-ops=...&x-gimg-save-as=key2 → 读源对象执行操作管道后
+// 另存（v1.3.7）。v1.3.11 权限修复：回写目标只允许同桶内的 key——save-as 值中出现
+// bucket 前缀（含 '/'）一律 400 拒绝，防止借处理管道向其他属主的桶写入。
 func (h *endpointHandler) imageProcessSave(w http.ResponseWriter, r *http.Request, bucket, key string,
 	img imgParams, owner, reqID string) {
 	if img.OpsErr != nil { // 非法管道：400（不再静默透传）
@@ -1348,10 +1490,9 @@ func (h *endpointHandler) imageProcessSave(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	dst := strings.TrimPrefix(img.SaveAs, "/")
-	dstBucket, dstKey := splitPathStyle(dst)
-	if dstBucket == "" || dstKey == "" {
+	if dst == "" || strings.Contains(dst, "/") {
 		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400,
-			Msg: "x-gimg-save-as expects bucket/key"})
+			Msg: "x-gimg-save-as expects a key within the source bucket (setting a bucket is not allowed since v1.3.11)"})
 		return
 	}
 	_, data, err := h.srv.store.GetObjectBytes(bucket, key, "")
@@ -1359,16 +1500,16 @@ func (h *endpointHandler) imageProcessSave(w http.ResponseWriter, r *http.Reques
 		writeErr(w, r, reqID, toS3Err(err))
 		return
 	}
-	out, ct, perr := processImage(data, img)
+	out, ct, perr := processImage(data, img, h.imgResolverFor(bucket))
 	if perr != nil {
 		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: perr.Error()})
 		return
 	}
 	attrs := ObjectAttrs{ContentType: ct, Metadata: map[string]string{}}
-	m, replaced, perr2 := h.srv.store.PutObject(dstBucket, dstKey, bytes.NewReader(out), int64(len(out)), attrs)
+	m, replaced, perr2 := h.srv.store.PutObject(bucket, dst, bytes.NewReader(out), int64(len(out)), attrs)
 	if perr2 != nil {
 		writeErr(w, r, reqID, toS3Err(perr2))
 		return
 	}
-	h.finishPut(w, r, dstBucket, dstKey, m, replaced, owner, reqID)
+	h.finishPut(w, r, bucket, dst, m, replaced, owner, reqID)
 }

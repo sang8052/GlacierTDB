@@ -47,10 +47,10 @@ var rollupGrains = []rollupGrain{
 var rollupMade sync.Map
 
 var (
-	// SELECT <list> FROM points [WHERE ...] [GROUP BY ...]
-	reRollSel = regexp.MustCompile("(?is)^SELECT\\s+(.+?)\\s+FROM\\s+`?points`?(?:\\s+AS\\s+\\w+)?\\s*(?:WHERE\\s+(.+?))?\\s*(?:GROUP\\s+BY\\s+(.+?))?\\s*$")
-	// INSERT INTO points（写路径懒建触发器用）
-	reRollInsert = regexp.MustCompile("(?i)^\\s*(?:INSERT\\s+(?:OR\\s+[A-Z]+\\s+)?INTO\\s+|REPLACE\\s+INTO\\s+)`?points`?(?:\\s|\\()")
+	// SELECT <list> FROM <tbl> [WHERE ...] [GROUP BY ...]（表名动态匹配，v1.3.11）
+	reRollSel = regexp.MustCompile(`(?is)^SELECT\s+(.+?)\s+FROM\s+` + "(`[^`]+`|[A-Za-z0-9_\\x{4e00}-\\x{9fa5}]+)" + `(?:\s+AS\s+\w+)?\s*(?:WHERE\s+(.+?))?\s*(?:GROUP\s+BY\s+(.+?))?\s*$`)
+	// INSERT INTO <tbl>（写路径懒建触发器用）
+	reRollInsert = regexp.MustCompile(`(?i)^\s*(?:INSERT\s+(?:OR\s+[A-Z]+\s+)?INTO\s+|REPLACE\s+INTO\s+)` + "(`[^`]+`|[A-Za-z0-9_\\x{4e00}-\\x{9fa5}]+)" + `(?:\s|\()`)
 	// GROUP BY [series_id,] (ts/N*N) | time(N)
 	reRollGB = regexp.MustCompile(`(?i)^\s*(?:series_id\s*,\s*)?(?:\(\s*ts\s*/\s*(\d+)\s*\*\s*\d+\s*\)|time\s*\(\s*(\d+)\s*\))\s*$`)
 	// WHERE 里的时间谓词：(ts|time) op <val>
@@ -72,29 +72,41 @@ type rollupSelItem struct {
 	alias string // 输出列名（缺省原样文本）
 }
 
-// ensureRollupTables 确保汇总表 + INSERT 触发器存在（幂等；schema 不符返回 false）。
+// ensureRollupTables 确保 points 汇总表 + INSERT 触发器存在（隐式 points 兼容入口）。
 func (h *Handler) ensureRollupTables() bool {
+	return h.ensureRollupTablesFor("points", "ms")
+}
+
+// ensureRollupTablesFor 确保指定时序表的汇总表 + INSERT 触发器存在
+//（幂等；schema 不符返回 false；unit 决定桶宽口径，v1.3.11）。
+func (h *Handler) ensureRollupTablesFor(tbl, unit string) bool {
 	db := h.session.CurrentDB()
-	key := db + "/points"
+	key := db + "/" + tbl
 	if _, ok := rollupMade.Load(key); ok {
 		// 缓存命中仍验证一次（库可能被 DROP/CREATE 重建或汇总表被删）：
 		// sqlite_master 探测开销极小，缺失则回落重建
-		if _, rows, err := h.session.Query(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='points_m1'`); err == nil && len(rows) > 0 {
+		if _, rows, err := h.session.Query(fmt.Sprintf(
+			`SELECT 1 FROM sqlite_master WHERE type='table' AND name=%s LIMIT 1`, quoteStr(tbl+"_m1"))); err == nil && len(rows) > 0 {
 			return true
 		}
 		rollupMade.Delete(key)
 	}
-	if ensureRollupTablesSess(h.session) {
+	if ensureRollupTablesSessFor(h.session, tbl, unit) {
 		rollupMade.Store(key, true)
 		return true
 	}
 	return false
 }
 
-// ensureRollupTablesSess 会话级建汇总表与触发器（cold 解冻后重建复用，v1.3.3）。
+// ensureRollupTablesSess 会话级建 points 汇总表与触发器（兼容旧调用点）。
 func ensureRollupTablesSess(sess *sqlite.Session) bool {
-	// schema 校验：points 必须有 series_id / ts / val 三列
-	_, ti, err := sess.Query(`PRAGMA main.table_info("points")`)
+	return ensureRollupTablesSessFor(sess, "points", "ms")
+}
+
+// ensureRollupTablesSessFor 会话级建 <tbl> 汇总表与触发器（桶宽按声明精度换算）。
+func ensureRollupTablesSessFor(sess *sqlite.Session, tbl, unit string) bool {
+	// schema 校验：<tbl> 必须有 series_id / ts / val 三列
+	_, ti, err := sess.Query(fmt.Sprintf(`PRAGMA main.table_info(%s)`, quoteIdent(tbl)))
 	if err != nil || len(ti) == 0 {
 		return false
 	}
@@ -108,7 +120,7 @@ func ensureRollupTablesSess(sess *sqlite.Session) bool {
 		return false
 	}
 	for _, g := range rollupGrains {
-		t := "points_" + g.suffix
+		t := tbl + "_" + g.suffix
 		ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
   series_id INTEGER NOT NULL,
   bucket_ts INTEGER NOT NULL,
@@ -118,35 +130,37 @@ func ensureRollupTablesSess(sess *sqlite.Session) bool {
   min_val REAL,
   max_val REAL,
   PRIMARY KEY (series_id, bucket_ts)
-)`, t)
+)`, quoteIdent(t))
 		if _, _, err := sess.Exec(ddl); err != nil {
 			logx.Warnf("rollup create %s: %v", t, err)
 			return false
 		}
 	}
-	ensureRollupTriggers(sess)
+	ensureRollupTriggersFor(sess, tbl, unit)
 	return true
 }
 
 // rebuildRollup 从原始表回填全部汇总表（REBUILD ROLLUP；返回各粒度行数）。
-func (h *Handler) rebuildRollup() ([]string, [][]any, error) {
-	if !h.ensureRollupTables() {
-		return nil, nil, fmt.Errorf("points 表不存在或 schema 不符（需要 series_id/ts/val）")
+// v1.3.11：表与精度参数化（默认 points/ms 兼容旧命令）。
+func (h *Handler) rebuildRollupFor(tbl, unit string) ([]string, [][]any, error) {
+	if !h.ensureRollupTablesFor(tbl, unit) {
+		return nil, nil, fmt.Errorf("%s 表不存在或 schema 不符（需要 series_id/ts/val）", tbl)
 	}
 	var rows [][]any
 	for _, g := range rollupGrains {
-		t := "points_" + g.suffix
-		if _, _, err := h.session.Exec("DELETE FROM " + t); err != nil {
+		p := msToUnitValue(g.periodMs, unit)
+		t := tbl + "_" + g.suffix
+		if _, _, err := h.session.Exec("DELETE FROM " + quoteIdent(t)); err != nil {
 			return nil, nil, err
 		}
 		q := fmt.Sprintf(`INSERT INTO %s(series_id,bucket_ts,cnt,cntv,sum_val,min_val,max_val)
 			SELECT series_id, ts/%d*%d, count(*), count(val), sum(val), min(val), max(val)
-			FROM points GROUP BY series_id, ts/%d*%d`, t, g.periodMs, g.periodMs, g.periodMs, g.periodMs)
+			FROM %s GROUP BY series_id, ts/%d*%d`, quoteIdent(t), p, p, quoteIdent(tbl), p, p)
 		if _, _, err := h.session.Exec(q); err != nil {
 			return nil, nil, err
 		}
 		var n int64
-		_, r, err := h.session.Query("SELECT count(*) FROM " + t)
+		_, r, err := h.session.Query("SELECT count(*) FROM " + quoteIdent(t))
 		if err == nil && len(r) > 0 {
 			n = cellInt(r[0][0])
 		}
@@ -155,13 +169,26 @@ func (h *Handler) rebuildRollup() ([]string, [][]any, error) {
 	return []string{"rollup_table", "rows", "bucket_ms"}, rows, nil
 }
 
+// rebuildRollup points 兼容入口。
+func (h *Handler) rebuildRollup() ([]string, [][]any, error) {
+	return h.rebuildRollupFor("points", "ms")
+}
+
 // tryRollup rollup 自动路由入口；ok=false 表示形态不匹配/无需路由（走原路径）。
+// v1.3.11：FROM 表动态识别——当前库声明的时序大表（含隐式 points）均可路由，
+// 粒度/桶宽按该表 ts 存储精度换算（谓词字面量已由 rewriteTsPredicates 归一）。
 func (h *Handler) tryRollup(sq string) (*mysql.Result, bool, error) {
 	if h.cfg.Rollup.Disable || !reRollSel.MatchString(sq) {
 		return nil, false, nil
 	}
 	m := reRollSel.FindStringSubmatch(sq)
-	selList, where, groupBy := strings.TrimSpace(m[1]), strings.TrimSpace(m[2]), strings.TrimSpace(m[3])
+	tbl := strings.Trim(m[2], "`")
+	t := h.tsTableForNamed(tbl)
+	if t == nil || t.Column != "ts" { // 未声明时序 / ts 列不叫 ts：不路由
+		return nil, false, nil
+	}
+	unit := t.Unit
+	selList, where, groupBy := strings.TrimSpace(m[1]), strings.TrimSpace(m[3]), strings.TrimSpace(m[4])
 
 	// 选择项解析
 	var items []rollupSelItem
@@ -208,8 +235,8 @@ func (h *Handler) tryRollup(sq string) (*mysql.Result, bool, error) {
 		groupSeries = strings.Contains(strings.ToLower(groupBy), "series_id")
 	}
 
-	// WHERE 解析：时间范围 + series_id 过滤（其余一票否决）
-	lo, hi, seriesCond, ok := parseRollupWhere(where)
+	// WHERE 解析：时间范围 + series_id 过滤（其余一票否决；数值已归一到存储精度）
+	lo, hi, seriesCond, ok := parseRollupWhereUnit(where, unit)
 	if !ok {
 		return nil, false, nil
 	}
@@ -217,19 +244,21 @@ func (h *Handler) tryRollup(sq string) (*mysql.Result, bool, error) {
 		return nil, false, nil
 	}
 
-	if !h.ensureRollupTables() {
+	if !h.ensureRollupTablesFor(tbl, unit) {
 		return nil, false, nil
 	}
 
 	// 粒度选择：最粗的满足（GROUP BY 桶宽整除 + 至少一个满桶）的粒度
+	//（period 换算到存储精度后参与取整/整除，全部在同一量纲下运算）
 	var gr rollupGrain
 	found := false
 	for _, g := range rollupGrains {
-		if bucketN > 0 && bucketN%g.periodMs != 0 {
+		pu := msToUnitValue(g.periodMs, unit)
+		if bucketN > 0 && bucketN%pu != 0 {
 			continue
 		}
-		loB := ceilDiv(lo, g.periodMs) * g.periodMs
-		hiB := floorDiv(hi-g.periodMs+1, g.periodMs) * g.periodMs
+		loB := ceilDiv(lo, pu) * pu
+		hiB := floorDiv(hi-pu+1, pu) * pu
 		if loB > hiB {
 			continue
 		}
@@ -239,7 +268,7 @@ func (h *Handler) tryRollup(sq string) (*mysql.Result, bool, error) {
 	if !found {
 		return nil, false, nil
 	}
-	p := gr.periodMs
+	p := msToUnitValue(gr.periodMs, unit)
 	loB := ceilDiv(lo, p) * p
 	hiB := floorDiv(hi-p+1, p) * p
 
@@ -249,14 +278,14 @@ func (h *Handler) tryRollup(sq string) (*mysql.Result, bool, error) {
 		cond = " AND (" + seriesCond + ")"
 	}
 	sub := fmt.Sprintf(
-		`SELECT bucket_ts AS ts, series_id, cnt, cntv, sum_val, min_val, max_val FROM points_%s WHERE bucket_ts >= %d AND bucket_ts <= %d%s
+		`SELECT bucket_ts AS ts, series_id, cnt, cntv, sum_val, min_val, max_val FROM %s WHERE bucket_ts >= %d AND bucket_ts <= %d%s
   UNION ALL
-  SELECT ts, series_id, 1 AS cnt, CASE WHEN val IS NULL THEN 0 ELSE 1 END AS cntv, val AS sum_val, val AS min_val, val AS max_val FROM points WHERE ts >= %d AND ts < %d%s
+  SELECT ts, series_id, 1 AS cnt, CASE WHEN val IS NULL THEN 0 ELSE 1 END AS cntv, val AS sum_val, val AS min_val, val AS max_val FROM %s WHERE ts >= %d AND ts < %d%s
   UNION ALL
-  SELECT ts, series_id, 1 AS cnt, CASE WHEN val IS NULL THEN 0 ELSE 1 END AS cntv, val AS sum_val, val AS min_val, val AS max_val FROM points WHERE ts > %d AND ts <= %d%s`,
-		gr.suffix, loB, hiB, cond,
-		lo, loB, cond,
-		hiB+p-1, hi, cond)
+  SELECT ts, series_id, 1 AS cnt, CASE WHEN val IS NULL THEN 0 ELSE 1 END AS cntv, val AS sum_val, val AS min_val, val AS max_val FROM %s WHERE ts > %d AND ts <= %d%s`,
+		quoteIdent(tbl+"_"+gr.suffix), loB, hiB, cond,
+		quoteIdent(tbl), lo, loB, cond,
+		quoteIdent(tbl), hiB+p-1, hi, cond)
 
 	var outerCols []string
 	for _, it := range items {
@@ -347,9 +376,15 @@ func parseRollupSelItem(t string) (rollupSelItem, bool) {
 	return it, false
 }
 
-// parseRollupWhere 解析 WHERE：时间范围 [lo,hi]（epoch ms，闭区间）+ series_id 条件透传。
+// parseRollupWhere 解析 WHERE：时间范围 [lo,hi]（存储精度口径）+ series_id 条件透传。
 // 其他谓词（如 val>5）出现时返回 ok=false（预聚合无法精确下推）。
-func parseRollupWhere(where string) (lo, hi int64, seriesCond string, ok bool) {
+func parseRollupWhere(where string) (int64, int64, string, bool) {
+	return parseRollupWhereUnit(where, "ms")
+}
+
+// parseRollupWhereUnit v1.3.11：unit 感知——数值字面量已在存储精度
+// （rewriteTsPredicates 先行归一，原样采用）；日期串 / NOW() 由 ms 换算到存储精度。
+func parseRollupWhereUnit(where, unit string) (lo, hi int64, seriesCond string, ok bool) {
 	lo, hi = 0, 0
 	hasLo, hasHi := false, false
 	if where == "" {
@@ -363,7 +398,8 @@ func parseRollupWhere(where string) (lo, hi int64, seriesCond string, ok bool) {
 			continue
 		}
 		if m := reRollTsPred.FindStringSubmatch(t); m != nil {
-			v, vok := evalRollupTime(strings.TrimSpace(m[3]))
+			raw := strings.TrimSpace(m[3])
+			v, vok := evalRollupTimeUnit(raw, unit)
 			if !vok {
 				return 0, 0, "", false
 			}
@@ -406,6 +442,19 @@ func parseRollupWhere(where string) (lo, hi int64, seriesCond string, ok bool) {
 		return 0, 0, "", false
 	}
 	return lo, hi, strings.Join(seriesTerms, " AND "), true
+}
+
+// evalRollupTimeUnit 计算时间表达式 → 指定存储精度。
+// 数值字面量原样（rewriter 已归一）；日期串(UTC)/NOW()±INTERVAL 由 ms 换算。
+func evalRollupTimeUnit(s, unit string) (int64, bool) {
+	if n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64); err == nil {
+		return n, true
+	}
+	v, ok := evalRollupTime(s)
+	if !ok {
+		return 0, false
+	}
+	return msToUnitValue(v, unit), true
 }
 
 // evalRollupTime 计算时间表达式 → epoch ms（整数 / 日期串(UTC) / NOW()±INTERVAL）。

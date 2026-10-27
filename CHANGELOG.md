@@ -2,6 +2,83 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.11.alpha] - 2026-10-27
+
+> 大版本：S3 底层存储重写（分片直写 + 零拷贝合并 + Range 读）· 图片裁剪融合 ·
+> S3 管理面异步任务（文本/文件检索 + 异步删除）· 空间免锁回收 · 时序大表谓词与
+> ts 秒/毫秒/微秒自动换算 · **租户隔离安全大修**（4 个 CRITICAL 漏洞修复）· 性能优化。
+
+### 安全（租户隔离专项审查）
+- **[CRITICAL] S3 `x-amz-copy-source` 跨租户读**：CopyObject / UploadPartCopy 的源桶
+  此前从不校验属主——任何租户凭自己桶里的 PUT + 拷贝头即可整读其他属主的对象（含任意
+  版本）。现于请求入口对源桶做与目标桶同等的 `canAccess` + 策略校验，跨属主一律 403。
+- **[CRITICAL] `DROP/CREATE DATABASE` 无鉴权**：任何账号（**含只读**）都可删除任意租户
+  的整库。现统一走 super + 非只读门禁（`CanAdminDB`）。
+- **[CRITICAL] `SUBMIT QUERY` 绕权执行**：异步引擎自开会话直跑 SQL，完全绕过语句权限层。
+  现提交口收权：ATTACH/DETACH 一律拒绝；USER 账号仅允许 SELECT 形态且须逐表过授权；
+  执行会话落在**提交者当前库**（不再恒用服务端默认库）。
+- **[CRITICAL] WITH 前缀 DML 误判为读**：`WITH x AS (…) DELETE …` 走读路径——SELECT
+  权限即可写、**只读账号可写**。现按 CTE 后主语句动词分类（`StripWithPrefix`）。
+- **[HIGH] 管理面禁入普通租户**：USER 账号 `USE GlacierTDB` → 1044（此前 SHOW S3 KEYS/
+  OBJECTS/USAGE、SHOW CLIENTS 等读命令无门禁，可枚举其他租户的桶/对象/密钥/账单）。
+- **[HIGH] 异步任务属主隔离**：Job 增加 Owner；SHOW QUERY JOBS 按属主过滤，FETCH/CANCEL/
+  DROP/PAUSE/RESUME 校验属主（super 不受限）——任务 ID 可枚举此前可跨租户读结果/杀任务。
+- **[HIGH] 只读账号 `COMPRESS/THAW COLD` 写通道关闭**；COM_INIT_DB / 握手默认库补 `USE`
+  同等的授权校验（防未授权库整库 schema 经 SHOW TABLES/DESC 泄露）。
+- **[MED] `SET GLOBAL_THREADS/PER_DB_READ_THREADS/DB_READ_THREADS` 补 super 门禁**；
+  预签名 URL `X-Amz-Date` 不可解析时 fail-closed（此前静默跳过时效校验）、`X-Amz-Expires`
+  上限对齐 AWS 7 天。
+- 图片处理越桶写修复：`x-gimg-save-as` 只接受**同桶 key**，出现 bucket 前缀一律 400
+  （此前可把处理结果写进其他属主的桶）；`blend` 融合源恒限定同桶。
+
+### 新增（S3）
+- **图片裁剪融合 `blend`**（OpenCV 风格管道新 op）：`blend('key'[,x,y[,alpha[,cx,cy,cw,ch]]])`
+  ——同桶对象作融合源，可选裁剪矩形后按权重贴入（alpha 语义 ≈ `cv2.addWeighted`）；
+  GET 即时处理 / PUT 上传即融合 / POST save-as 另存三链路全支持。
+- **管理面异步任务**（`SUBMIT S3 ...`，走异步引擎，FETCH/回调/EVERY 周期链与 SQL 任务一致）：
+  - `SUBMIT S3 TEXT SEARCH <bucket> MATCH 'text' [PREFIX/LIKE/SIZE/MODIFIED/CREATED/LIMIT ...]`
+    ——文本文件**内容级**检索（大小写不敏感，返回行号 + 命中行；content-type 语义 + 字节
+    嗅探双判定，>64MB 跳过）；
+  - `SUBMIT S3 FILE SEARCH <bucket> [同上过滤]` ——元数据级检索（文件名/大小/修改/创建）；
+  - `SUBMIT S3 DELETE <bucket> [过滤] [DRY RUN]` ——异步批量删除（尊重对象锁/WORM，被锁
+    对象报告 `locked` 不动）；
+  - 过滤语义：SIZE 支持 `>|>=|=|<|<=|BETWEEN`；MODIFIED = 最新版本写入时间；CREATED =
+    全版本最早写入时间；LIKE 为 SQL 通配。super 专用。
+- **空间回收**：`SHOW S3 SPACE`（页/空闲页统计）、`S3 VACUUM`（增量，每步 256 页短写事务，
+  WAL 下读不受影响）、`S3 VACUUM FULL`（排他重建并把存量库切换到增量模式）；后台生命周期
+  扫描顺带阈值自动回收（空闲 > 128MB 且 > 10% 文件大小才动手）。
+- **Range 读（HTTP 206）**：`bytes=a-b / a- / -n`，`Content-Range`/`Accept-Ranges` 齐备，
+  越界 416；分块对象按 manifest 直定位分块，不整读。
+
+### 变更（S3 存储层重写）
+- **默认参数**：`max_object_mb` 512→**16384**（16GB，可改，负值不限）；`chunk_kb` 256→
+  **8192**（8MB 分片）。
+- **分片上传直写 + 零拷贝合并**：分片内容流式按 8MB 分块直接落桶分块表暂存区
+  `(key, uploadId, partNumber*2^20+i)`（内存占用与分片大小无关，单分片可达对象上限）；
+  Complete 合并**不重写数据**——versioning 桶以 uploadId 为版本号原地转正，非 versioning
+  桶一条 UPDATE 改写 version_id；对象行 `manifest` 列记录各 part 分块布局供 Range 直定位
+  （旧版稠密布局对象自动兼容读）。
+- **写入/删除的版本域收窄**：普通 PUT/DELETE 只清理 `version_id=''` 的正式行，不再误删
+  进行中分片上传的暂存行。
+
+### 新增（时序）
+- **时序大表建表谓词**：`CREATE TABLE t (...) WITH (TIMESERIES, TS_UNIT='s|ms|us',
+  TS_COLUMN='ts')` ——声明后享受全套时序优化红利：**冷压缩/自动解冻/rollup 预聚合路由
+  不再固定 points 表名**（任意声明表可用）；`SHOW TS TABLES [ON <db>]` 查声明；
+  `REBUILD ROLLUP <db>.<tbl>` 按表回填。
+- **ts 三精度自动换算**：存储精度 s/ms/us 任选，查询谓词按数值量纲自动检测
+  （≥1e14 微秒 / ≥1e11 毫秒 / ≥1e9 秒）换算到存储精度——**存秒查毫秒 / 存毫秒查秒 /
+  日期串谓词**均正确命中；桶宽表达式 `ts/N*N`、`time(N)` 的 N（毫秒惯例）自动换算；
+  COMPRESS/THAW 边界与步长同口径换算。
+
+### 性能
+- S3 LIST/检索前缀过滤 `substr(key,1,?)=?` → **key 区间扫描**（走 PK 索引，大桶 LIST 从
+  全桶扫描+排序降为前缀区间直读）；
+- S3 读路径记账（GET/LIST）改**内存缓冲 + 批量落库**（每 256 次或 5 秒；此前每次读都拿
+  全局写锁写一行 UPSERT，全部 S3 读相互串行——最大读吞吐瓶颈消除）；
+- 对象写锁内聚合查询 2→1 条（size/计数合并为单条 SUM+CASE）；
+- `likeMatch`（information_schema / SHOW 过滤）正则编译结果缓存——此前逐行编译 O(rows) 次。
+
 ## [1.3.10.beta] - 2026-10-27
 
 > **版本基调转折**：自 1.3.10 起项目转向**稳定性更新**（性能优化 / BUG 修复 / 运维体验），

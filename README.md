@@ -8,7 +8,7 @@
 
 > 🤖 **本项目全程由 GLM5.3 驱动。**
 
-**当前版本：v1.3.10.beta**
+**当前版本：v1.3.11.alpha**
 
 > **版本基调（v1.3.10 起）**：FEATURE 整合已收官（MySQL 网关 / 时序冷库 / S3 / Redis / RabbitMQ / MQTT / 多租户 / 静态加密全量交付）；
 > **自 1.3.10 版本开始，项目转向稳定性更新**——以性能优化、BUG 修复与运维体验为主，不再新增大特性。
@@ -366,6 +366,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | 版本 | 主题 | 状态 |
 | --- | --- | --- |
 | v1.3.10 | **稳定性更新首个版本**：图片管道多核提速 + 结果磁盘缓存；防爆破本机回环豁免 + CLI 解锁；`mysql.enable` 开关；默认配置路径 `config.yaml`；boto3 CRC32 trailer 兼容 | ✅ |
+| v1.3.11 | **S3 存储层重写（8MB 分片直写 + 零拷贝合并 + manifest Range 206）· 图片裁剪融合 blend · SUBMIT S3 文本/文件检索与异步删除 · SHOW S3 SPACE / S3 VACUUM 空间回收 · 时序大表谓词（TS_UNIT 秒/毫秒/微秒自动换算，冷/rollup 不再固定 points）· **租户隔离安全大修**（copy-source 越权 / DROP DATABASE / SUBMIT 绕权 / WITH-DML 误判 / 管理面禁入 / 任务属主）· S3 读记账内存化 + LIST 索引区间化** | ✅ |
 
 历史版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)。
 
