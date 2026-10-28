@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -112,9 +111,9 @@ func (s *Store) uploadLocked(bucket, key, uploadID string) (ObjectAttrs, error) 
 	return attrs, nil
 }
 
-// UploadPart 上传一个分片：内容先暂存临时文件（内存有界），再按 8MB 分块直接
-// 落桶分块表暂存区 (key, uploadId, partNumber*stride+i)，返回该分片 MD5（hex）。
-// 同 partNumber 重传覆盖（S3 语义：最后一次为准）。
+// UploadPart 上传一个分片：内容先暂存（小分片内存/大分片临时文件，v1.3.12），
+// 再按 8MB 分块直接落桶分块表暂存区 (key, uploadId, partNumber*stride+i)，
+// 返回该分片 MD5（hex）。同 partNumber 重传覆盖（S3 语义：最后一次为准）。
 func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, r io.Reader, sizeHint int64) (string, error) {
 	if partNumber < 1 || partNumber > maxParts {
 		return "", &s3Error{Code: "InvalidArgument", Status: 400,
@@ -123,55 +122,43 @@ func (s *Store) UploadPart(bucket, key, uploadID string, partNumber int, r io.Re
 	if _, err := s.uploadLocked(bucket, key, uploadID); err != nil {
 		return "", err
 	}
-	tmp, size, sum, err := s.spoolPart(r)
+	sp, err := s.spoolPart(r)
 	if err != nil {
 		return "", err
 	}
-	etag := hex.EncodeToString(sum)
-	if sizeHint >= 0 && sizeHint != size {
+	etag := sp.md5Hex()
+	if sizeHint >= 0 && sizeHint != sp.size() {
+		sp.close()
 		return "", &s3Error{Code: "IncompleteBody", Status: 400,
 			Msg: "You did not provide the number of bytes specified by the Content-Length HTTP header"}
 	}
-	return s.writePartFromSpool(bucket, key, uploadID, partNumber, tmp, size, etag)
+	return s.writePartFromSpool(bucket, key, uploadID, partNumber, sp, etag)
 }
 
-// spoolPart 分片内容暂存临时文件并计算 MD5（大分片不进内存；v1.3.11）。
-// 返回（临时文件, 字节数, MD5 摘要）。
-func (s *Store) spoolPart(r io.Reader) (*os.File, int64, []byte, error) {
-	tmpDir := filepath.Join(s.dir, ".s3tmp")
-	_ = os.MkdirAll(tmpDir, 0o700)
-	tmp, err := os.CreateTemp(tmpDir, "part-*")
-	if err != nil {
-		return nil, 0, nil, err
-	}
-	md5h := md5.New()
-	var size int64
+// spoolPart 分片内容暂存并计算 MD5（v1.3.12：≤8MB 分片全程内存，大分片
+// 溢出临时文件不进内存）。
+func (s *Store) spoolPart(r io.Reader) (*spool, error) {
+	sp := newSpool(filepath.Join(s.dir, ".s3tmp"), s.spoolMemMax())
+	// maxObject 上限在 copyFrom 中以溢出文件先行保护，此处读满后统一校验
+	limited := r
 	if s.maxObject > 0 {
-		size, err = io.Copy(io.MultiWriter(tmp, md5h), io.LimitReader(r, s.maxObject+1))
-	} else {
-		size, err = io.Copy(io.MultiWriter(tmp, md5h), r)
+		limited = io.LimitReader(r, s.maxObject+1)
 	}
-	if err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return nil, 0, nil, err
+	if _, err := sp.copyFrom(limited); err != nil {
+		sp.close()
+		return nil, err
 	}
-	if s.maxObject > 0 && size > s.maxObject {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return nil, 0, nil, &s3Error{Code: "EntityTooLarge", Status: 400,
-			Msg: fmt.Sprintf("Part size %d exceeds max_object_mb limit %d", size, s.maxObject>>20)}
+	if s.maxObject > 0 && sp.size() > s.maxObject {
+		sp.close()
+		return nil, &s3Error{Code: "EntityTooLarge", Status: 400,
+			Msg: fmt.Sprintf("Part size %d exceeds max_object_mb limit %d", sp.size(), s.maxObject>>20)}
 	}
-	return tmp, size, md5h.Sum(nil), nil
+	return sp, nil
 }
 
-// writePartFromSpool 暂存文件 → 分块表暂存区 + s3_parts 元数据（调用方持 writeMu 前置检查后）。
-func (s *Store) writePartFromSpool(bucket, key, uploadID string, partNumber int,
-	tmp *os.File, size int64, etag string) (string, error) {
-	defer func() {
-		tmp.Close()
-		os.Remove(tmp.Name())
-	}()
+// writePartFromSpool 暂存内容 → 分块表暂存区 + s3_parts 元数据（调用方持 writeMu 前置检查后）。
+func (s *Store) writePartFromSpool(bucket, key, uploadID string, partNumber int, sp *spool, etag string) (string, error) {
+	defer sp.close()
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	if _, err := s.uploadLocked(bucket, key, uploadID); err != nil {
@@ -181,6 +168,7 @@ func (s *Store) writePartFromSpool(bucket, key, uploadID string, partNumber int,
 	if err != nil {
 		return "", err
 	}
+	size := sp.size()
 	tbl := chunkTableFor(b.TableName)
 	base := int64(partNumber) * mpuSeqStride
 
@@ -195,12 +183,13 @@ func (s *Store) writePartFromSpool(bucket, key, uploadID string, partNumber int,
 	}
 	chunks := int64(0)
 	if size > 0 {
-		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-			return "", err
+		rc, rerr := sp.reader()
+		if rerr != nil {
+			return "", rerr
 		}
 		buf := make([]byte, s.chunkSize)
 		for {
-			n, rerr := io.ReadFull(tmp, buf)
+			n, rerr := io.ReadFull(rc, buf)
 			if n > 0 {
 				if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,seq,data) VALUES(?,?,?,?)`, tbl),
 					key, uploadID, base+chunks, buf[:n]); err != nil {
@@ -225,7 +214,7 @@ func (s *Store) writePartFromSpool(bucket, key, uploadID string, partNumber int,
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
-	s.addUsageLocked(b.Owner, bucket, "PUT", size, 0)
+	s.AddUsage(b.Owner, bucket, "PUT", size, 0)
 	return etag, nil
 }
 
@@ -257,12 +246,12 @@ func (s *Store) UploadPartCopy(bucket, key, uploadID string, partNumber int,
 		return "", "", err
 	}
 	defer rc.Close()
-	tmp, size, sum, err := s.spoolPart(rc)
+	sp, err := s.spoolPart(rc)
 	if err != nil {
 		return "", "", err
 	}
-	etag := hex.EncodeToString(sum)
-	if _, err := s.writePartFromSpool(bucket, key, uploadID, partNumber, tmp, size, etag); err != nil {
+	etag := sp.md5Hex()
+	if _, err := s.writePartFromSpool(bucket, key, uploadID, partNumber, sp, etag); err != nil {
 		return "", "", err
 	}
 	return etag, nowTS(), nil
@@ -373,7 +362,6 @@ func (s *Store) CompleteMultipart(bucket, key, uploadID string, parts []PartSpec
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	oldStorage, oldCount := s.keyAggLocked(b, key)
 	// versioning 桶：uploadId 即最终版本号（分块行无需搬动）；
 	// 非 versioning 桶：最终 version_id=''，暂存行随后改写。
 	versionID := ""
@@ -400,12 +388,15 @@ func (s *Store) CompleteMultipart(bucket, key, uploadID string, parts []PartSpec
 		manifest = MarshalPolicy(mf)
 	}
 
+	// v1.3.12：删旧 + 转正 + 聚合 UPSERT 合并为单事务（此前聚合与记账是
+	// 提交后的独立写事务，Complete 全程持锁 6 次 commit）
 	tx, err := s.db.Begin()
 	if err != nil {
 		return out, false, err
 	}
 	defer tx.Rollback()
 
+	oldStorage, oldCount := s.keyAggLocked(tx, b, key)
 	if b.Versioning {
 		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET is_latest=0 WHERE key=? AND is_latest=1`, b.TableName), key); err != nil {
 			return out, false, err
@@ -482,13 +473,18 @@ func (s *Store) CompleteMultipart(bucket, key, uploadID string, parts []PartSpec
 	if _, err := tx.Exec(`DELETE FROM s3_uploads WHERE upload_id=?`, uploadID); err != nil {
 		return out, false, err
 	}
+
+	// 聚合算术增量随主事务提交（versioning = +size,+1；非 versioning 覆盖语义）
+	if b.Versioning {
+		s.adjustAggLocked(tx, b, key, total, 1)
+	} else {
+		s.adjustAggLocked(tx, b, key, total-oldStorage, 1-oldCount)
+	}
 	if err := tx.Commit(); err != nil {
 		return out, false, err
 	}
 
-	newStorage, newCount := s.keyAggLocked(b, key)
-	s.adjustAggLocked(b, key, newStorage-oldStorage, newCount-oldCount)
-	s.addUsageLocked(b.Owner, bucket, "PUT", total, 0)
+	s.AddUsage(b.Owner, bucket, "PUT", total, 0)
 
 	out = ObjectMeta{
 		Key: key, VersionID: versionID, IsLatest: true, Size: total, ETag: etag,
@@ -531,7 +527,7 @@ func (s *Store) AbortMultipart(bucket, key, uploadID string) error {
 	if _, err := s.db.Exec(`DELETE FROM s3_uploads WHERE upload_id=?`, uploadID); err != nil {
 		return err
 	}
-	s.addUsageLocked(b.Owner, bucket, "DELETE", 0, 0)
+	s.AddUsage(b.Owner, bucket, "DELETE", 0, 0)
 	return nil
 }
 

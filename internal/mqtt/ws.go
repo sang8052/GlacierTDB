@@ -6,6 +6,7 @@ package mqtt
 import (
 	"bufio"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -230,13 +231,18 @@ func IsHTTPRequest(line string) bool {
 	return false
 }
 
-// ListenAndServe 独立 MQTT 监听（tcp 与 ws 同端口自动识别）。
-func ListenAndServe(addr, wsPath string, store *mq.Store, auths *auth.Store, cfg *config.Config) error {
+// ListenAndServe 独立 MQTT 监听（tcp 与 ws 同端口自动识别；tlsCfg 非空时
+// 同端口支持 mqtts / wss 双模式接入——首字节 0x16 = TLS ClientHello，v1.3.12）。
+func ListenAndServe(addr, wsPath string, store *mq.Store, auths *auth.Store, cfg *config.Config, tlsCfg *tls.Config) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
-	logx.Infof("mqtt: standalone listener on %s (tcp + ws %s)", addr, wsPath)
+	proto := "tcp + ws " + wsPath
+	if tlsCfg != nil {
+		proto = "tcp/ws/mqtts/wss dual-mode tls"
+	}
+	logx.Infof("mqtt: standalone listener on %s (%s)", addr, proto)
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -248,6 +254,23 @@ func ListenAndServe(addr, wsPath string, store *mq.Store, auths *auth.Store, cfg
 			_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 			first, err := br.Peek(1)
 			_ = c.SetReadDeadline(time.Time{})
+			if err == nil && len(first) == 1 && first[0] == 0x16 && tlsCfg != nil {
+				// TLS 优先客户端（mqtts / wss）：终结 TLS 后内部按 tcp/ws 继续
+				tc := tls.Server(&bufConn{Conn: c, br: br}, tlsCfg)
+				br2 := bufio.NewReader(tc)
+				_ = tc.SetReadDeadline(time.Now().Add(10 * time.Second))
+				f2, e2 := br2.Peek(1)
+				_ = tc.SetReadDeadline(time.Time{})
+				if e2 == nil && len(f2) == 1 && (f2[0] == 'G' || f2[0] == 'g' || f2[0] == 'P' || f2[0] == 'p' ||
+					f2[0] == 'D' || f2[0] == 'O' || f2[0] == 'H' || f2[0] == 'o') {
+					if line, _ := br2.Peek(64); IsHTTPRequest(string(line)) {
+						ServeWSConn(tc, br2, wsPath, store, auths, cfg)
+						return
+					}
+				}
+				ServeConn(&bufConn{Conn: tc, br: br2}, store, auths, cfg)
+				return
+			}
 			if err == nil && len(first) > 0 && (first[0] == 'G' || first[0] == 'g' ||
 				first[0] == 'P' || first[0] == 'p' || first[0] == 'D' || first[0] == 'O' ||
 				first[0] == 'H' || first[0] == 'o') {

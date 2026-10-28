@@ -1,0 +1,13 @@
+# GlacierTDB 在线备份定时器（每天 04:30；按需调整 OnCalendar）
+# 运维提示：备份目录建议挂独立磁盘 / 远端 NFS，与数据目录物理隔离。
+
+[Unit]
+Description=Run GlacierTDB online backup daily
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

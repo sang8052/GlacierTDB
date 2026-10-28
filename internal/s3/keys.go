@@ -8,6 +8,7 @@ import (
 
 	"fmt"
 	"strings"
+	"time"
 )
 
 // AK 32 位（前缀 AS + 30 位大写字母数字）；SK 48 位（前缀 SK + 46 位字母数字）。
@@ -156,9 +157,29 @@ func (s *Store) DropKey(ak string) error {
 	return nil
 }
 
-// TouchKey 更新最后使用时间（fire-and-forget）。
+// TouchKey 标记密钥最近使用（v1.3.12：内存脏标记 + 定时批量落库——此前每个
+// S3 请求一次 UPDATE 写事务，是并行上传路径上与对象写竞争的固定开销；
+// last_used_ts 仅为展示元数据，30 秒级延迟无碍）。
 func (s *Store) TouchKey(ak string) {
-	_, _ = s.db.Exec(`UPDATE s3_keys SET last_used_ts=? WHERE ak=?`, nowTS(), ak)
+	s.touchMu.Lock()
+	s.touchBuf[ak] = struct{}{}
+	s.touchMu.Unlock()
+}
+
+// flushTouchKeys 批量落库脏标记的 last_used_ts。
+func (s *Store) flushTouchKeys() {
+	s.touchMu.Lock()
+	if len(s.touchBuf) == 0 {
+		s.touchMu.Unlock()
+		return
+	}
+	buf := s.touchBuf
+	s.touchBuf = make(map[string]struct{})
+	s.touchMu.Unlock()
+	now := nowTS()
+	for ak := range buf {
+		_, _ = s.db.Exec(`UPDATE s3_keys SET last_used_ts=? WHERE ak=?`, now, ak)
+	}
 }
 
 // KeyFor SigV4 查询回调：返回 (owner, SK 明文, status, policy, 存在)。
@@ -233,6 +254,7 @@ func (s *Store) SetBucketPolicy(bucket, policy string) error {
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	s.invalidatePolicy(bucket)
 	_, err := s.db.Exec(`INSERT INTO s3_policies(scope,policy) VALUES(?,?)
 		ON CONFLICT(scope) DO UPDATE SET policy=excluded.policy`, "bucket:"+bucket, policy)
 	return err
@@ -250,17 +272,35 @@ func (s *Store) ClearKeyPolicy(ak string) error {
 func (s *Store) ClearBucketPolicy(bucket string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	s.invalidatePolicy(bucket)
 	_, err := s.db.Exec(`DELETE FROM s3_policies WHERE scope=?`, "bucket:"+bucket)
 	return err
 }
 
-// BucketPolicy 取桶请求策略。
+// BucketPolicy 取桶请求策略（v1.3.12：带 TTL 缓存，策略写路径主动失效）。
 func (s *Store) BucketPolicy(bucket string) string {
+	now := time.Now()
+	s.cacheMu.Lock()
+	if e, ok := s.policyCache[bucket]; ok && now.Before(e.expires) {
+		s.cacheMu.Unlock()
+		return e.val
+	}
+	s.cacheMu.Unlock()
 	var p string
 	if err := s.db.QueryRow(`SELECT policy FROM s3_policies WHERE scope=?`, "bucket:"+bucket).Scan(&p); err != nil {
-		return ""
+		p = ""
 	}
+	s.cacheMu.Lock()
+	s.policyCache[bucket] = policyCacheEntry{val: p, expires: now.Add(bucketCacheTTL)}
+	s.cacheMu.Unlock()
 	return p
+}
+
+// invalidatePolicy 桶策略缓存失效。
+func (s *Store) invalidatePolicy(bucket string) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	delete(s.policyCache, bucket)
 }
 
 // Policies 全部请求策略（密钥 + 桶）。

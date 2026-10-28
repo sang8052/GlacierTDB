@@ -3,6 +3,8 @@ package proxy
 
 import (
 	"bufio"
+	"crypto/tls"
+	"fmt"
 	"net"
 	"regexp"
 	"runtime/debug"
@@ -235,7 +237,8 @@ var localAddrSeen sync.Map
 
 // newMySQLServer 构造 go-mysql 服务端：握手默认登录算法取配置（v1.1.1 支持
 // caching_sha2_password / sha256_password），并加载 RSA 密钥供非 TLS 密码交换。
-func newMySQLServer(cfg *config.Config) *server.Server {
+// tlsCfg 非空时握手报 CLIENT_SSL 能力位（标准 --ssl-mode 客户端协议内升级，v1.3.12）。
+func newMySQLServer(cfg *config.Config, tlsCfg *tls.Config) *server.Server {
 	plugin := cfg.Auth.AuthPlugin
 	if plugin == "" {
 		plugin = mysql.AUTH_NATIVE_PASSWORD
@@ -249,8 +252,11 @@ func newMySQLServer(cfg *config.Config) *server.Server {
 		logx.Warnf("no rsa key available: fallback to %s", mysql.AUTH_NATIVE_PASSWORD)
 		plugin = mysql.AUTH_NATIVE_PASSWORD
 	}
-	srv := server.NewServer(cfg.ServerVersion, mysql.DEFAULT_COLLATION_ID, plugin, rsaKey, nil)
+	srv := server.NewServer(cfg.ServerVersion, mysql.DEFAULT_COLLATION_ID, plugin, rsaKey, tlsCfg)
 	logx.Infof("mysql auth plugin (handshake default): %s", plugin)
+	if tlsCfg != nil {
+		logx.Infof("mysql: native TLS upgrade advertised (CLIENT_SSL capability)")
+	}
 	return srv
 }
 
@@ -275,8 +281,14 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 	}
 
 	var msrv *server.Server
+	// TLS（v1.3.12）：3309 双模式接入 + MySQL 协议内升级 + MQTT 独立监听共用
+	// 同一证书；证书缺失直接启动失败（fail-closed，不静默降级明文）
+	tlsCfg, terr := LoadTLSConfig(cfg)
+	if terr != nil {
+		return fmt.Errorf("load tls config: %w", terr)
+	}
 	if cfg.MySQL.Enable {
-		msrv = newMySQLServer(cfg)
+		msrv = newMySQLServer(cfg, tlsCfg)
 	} else {
 		logx.Infof("mysql: protocol service disabled (mysql.enable=false)")
 	}
@@ -286,7 +298,7 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 
 	// MQTT 独立监听（可选；3309 复用始终可用）
 	if cfg.MQ.Enable && cfg.MQ.MQTT.Enable && mqs != nil && cfg.MQ.MQTT.Listen != "" {
-		go mqtt.ListenAndServe(cfg.MQ.MQTT.Listen, cfg.MQ.MQTT.WsPath, mqs, store, cfg)
+		go mqtt.ListenAndServe(cfg.MQ.MQTT.Listen, cfg.MQ.MQTT.WsPath, mqs, store, cfg, tlsCfg)
 	}
 
 	// mysql.enable=false 且 kv/mq 也关闭：3309 无任何复用服务，不占用端口
@@ -299,19 +311,24 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 	if err != nil {
 		return err
 	}
-	logx.Infof("listening on %s (multiplex %s%s%s -> sqlite dir %s, default db=%s, user=%s)",
+	logx.Infof("listening on %s (multiplex %s%s%s%s -> sqlite dir %s, default db=%s, user=%s)",
 		cfg.Listen, map[bool]string{true: "mysql", false: ""}[cfg.MySQL.Enable],
 		map[bool]string{true: "+redis", false: ""}[cfg.KV.Enable],
 		map[bool]string{true: "+mqtt", false: ""}[cfg.MQ.Enable && cfg.MQ.MQTT.Enable],
+		map[bool]string{true: "+tls", false: ""}[tlsCfg != nil],
 		cfg.DBDir, cfg.DefaultDB, cfg.Auth.User)
 
+	sniff := time.Duration(cfg.MuxSniffMs) * time.Millisecond
+	if sniff <= 0 {
+		sniff = time.Millisecond
+	}
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			logx.Errorf("accept: %v", err)
 			continue
 		}
-		go sniffConn(msrv, c, cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm)
+		go sniffConn(msrv, maybeTLSConn(c, tlsCfg, sniff), cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm)
 	}
 }
 

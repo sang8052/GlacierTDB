@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GlacierTDB · 冰川数据库 | 边缘多协议数据一体机</title>
+    <meta name="description" content="GlacierTDB — 以 SQLite 为内核的多协议数据一体机：MySQL 网关 + 时序冷库 + S3 对象存储 + Redis 键值 + RabbitMQ 队列 + MQTT。一个静态二进制、一个数据目录、一个端口多协议。">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>❄</text></svg>">
+    <link href="https://cdn.jsdmirror.com/ajax/libs/twitter-bootstrap/5.3.7/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdmirror.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+        :root { --brand: #2f6fed; --brand-dark: #1d4fc4; --ink: #17233a; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color: var(--ink); }
+        .navbar { background: rgba(11,28,54,.92); backdrop-filter: blur(8px); box-shadow: 0 1px 12px rgba(0,0,0,.25); }
+        .navbar .nav-link, .navbar-brand { color: #cfe0ff; }
+        .navbar .nav-link:hover, .navbar-brand:hover { color: #fff; }
+        .navbar .nav-link.active { color: #fff; font-weight: 700; }
+        .logo-flake { font-size: 24px; color: #9cc3ff; }
+        .logo-word { font-weight: 800; letter-spacing: 1px; color: #fff; }
+        .btn-brand { background: var(--brand); border: none; }
+        .btn-brand:hover { background: var(--brand-dark); }
+
+        /* Hero */
+        .hero { position: relative; overflow: hidden; padding: 110px 0 96px; color: #eaf1ff;
+                background: radial-gradient(1200px 500px at 15% -10%, #1d4fc4 0%, transparent 55%),
+                            radial-gradient(900px 420px at 90% 110%, #123a8f 0%, transparent 50%),
+                            linear-gradient(160deg, #0b1c36 0%, #101a2e 100%); }
+        .hero::after { content:"❄"; position:absolute; right:-40px; top:-60px; font-size:340px; opacity:.05; transform: rotate(18deg); }
+        .hero h1 { font-weight: 800; letter-spacing: 1px; }
+        .hero .glacier-word { background: linear-gradient(90deg,#7db4ff,#b8e0ff); -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .hero .lead { color: #a9bce0; max-width: 720px; }
+        .hero-chip { display:inline-block; border:1px solid rgba(255,255,255,.22); color:#cfe0ff; border-radius:20px; padding:3px 14px; font-size:13px; margin:0 8px 8px 0; background:rgba(255,255,255,.05); }
+        .stat-dark { text-align:center; padding:18px 10px; border-radius:14px; background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.10); }
+        .stat-dark .num { font-size:30px; font-weight:800; color:#9cc3ff; }
+        .stat-dark .lbl { font-size:12px; color:#8fa3c8; letter-spacing:1px; }
+
+        /* Sections */
+        .icon-bubble { width: 52px; height: 52px; border-radius: 13px; background: #eaf1ff; color: var(--brand); display: flex; align-items: center; justify-content: center; font-size: 22px; margin-bottom: 14px; }
+        .card-hover { border: 0; border-radius: 14px; transition: .2s; height: 100%; }
+        .card-hover:hover { transform: translateY(-4px); box-shadow: 0 10px 28px rgba(31,74,180,.10); }
+        .tag-chip { display: inline-block; background: #eef4ff; color: #3a6ae0; border-radius: 20px; padding: 2px 10px; font-size: 12px; margin: 0 6px 6px 0; }
+        .feature-item { display: flex; gap: 10px; padding: 12px 0; border-bottom: 1px dashed #e6ecf6; }
+        .feature-item:last-child { border-bottom: 0; }
+        .feature-item i { color: var(--brand); margin-top: 4px; }
+        section h2 { font-weight: 800; }
+
+        /* Terminal */
+        .term { background:#0d1526; color:#c8d6f2; border-radius:14px; border:1px solid rgba(255,255,255,.08); box-shadow:0 18px 50px rgba(11,28,54,.35); overflow:hidden; }
+        .term-bar { background:rgba(255,255,255,.05); padding:10px 16px; font-size:12px; color:#8fa3c8; display:flex; align-items:center; gap:8px; }
+        .dot { width:10px;height:10px;border-radius:50%;display:inline-block; }
+        .term pre { margin:0; padding:18px 20px; font-size:13px; line-height:1.85; }
+        .tok-c { color:#5d719a; } .tok-p { color:#9cc3ff; } .tok-s { color:#8ee0b0; } .tok-k { color:#ffd479; }
+
+        /* Demo */
+        .demo-panel { border:1px solid #dfe8fa; border-radius:16px; background:linear-gradient(180deg,#f7faff,#fff); }
+        .cred-row { display:flex; align-items:center; gap:10px; padding:10px 0; border-bottom:1px dashed #e6ecf6; }
+        .cred-row:last-child { border-bottom:0; }
+        .cred-key { min-width:96px; color:#98a6c0; font-size:13px; font-weight:700; letter-spacing:1px; }
+        .cred-val { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size:13px; word-break: break-all; }
+        .copy-btn { border:0; background:#eef4ff; color:var(--brand); border-radius:8px; padding:2px 10px; font-size:12px; cursor:pointer; transition:.15s; flex:none; }
+        .copy-btn:hover { background:var(--brand); color:#fff; }
+        .warn-strip { background:#fff8e6; border:1px solid #f3e3ae; color:#8a6d1f; border-radius:12px; padding:14px 18px; font-size:14px; }
+
+        /* Architecture flow */
+        .flow-box { border-radius:12px; padding:14px 16px; text-align:center; font-size:14px; }
+        .flow-arr { color:#1d4fc4; text-align:center; font-size:18px; line-height:1.4; }
+
+        footer { background: #101a2e; color: #c6d2e8; }
+        footer a { color: #c6d2e8; text-decoration: none; }
+        footer a:hover { color: #fff; }
+    </style>
+</head>
+<body>
+
+<nav class="navbar navbar-expand-lg sticky-top">
+    <div class="container">
+        <a class="navbar-brand d-flex align-items-center gap-2" href="#"><span class="logo-flake">❄</span><span class="logo-word">GlacierTDB</span></a>
+        <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#nav"><span class="navbar-toggler-icon" style="filter:invert(1);"></span></button>
+        <div class="collapse navbar-collapse" id="nav">
+            <ul class="navbar-nav ms-auto align-items-lg-center gap-lg-2">
+                <li class="nav-item"><a class="nav-link" href="#features">能力全景</a></li>
+                <li class="nav-item"><a class="nav-link" href="#arch">架构</a></li>
+                <li class="nav-item"><a class="nav-link" href="#quickstart">快速上手</a></li>
+                <li class="nav-item"><a class="nav-link" href="#demo">在线演示</a></li>
+                <li class="nav-item"><a class="nav-link" href="https://github.com/sang8052/GlacierTDB" target="_blank"><i class="fab fa-github me-1"></i> GitHub</a></li>
+                <li class="nav-item ms-lg-2"><a class="btn btn-brand text-white px-3" href="https://github.com/sang8052/GlacierTDB/releases" target="_blank"><i class="fas fa-download me-1"></i> 下载</a></li>
+            </ul>
+        </div>
+    </div>
+</nav>
+
+<!-- HERO -->
+<header class="hero">
+    <div class="container position-relative" style="z-index:2;">
+        <div class="small text-uppercase fw-semibold mb-2" style="color:#7db4ff;letter-spacing:3px;">GlacierTDB · Edge Data Powerhouse</div>
+        <h1 class="display-4 mb-3">一个二进制<br>替代 <span class="glacier-word">MySQL + Redis + RabbitMQ + MinIO</span></h1>
+        <p class="lead mb-4">冰川数据库 —— 以 SQLite 为唯一存储内核的多协议数据一体机。MySQL 协议网关、时序冷库、S3 对象存储、Redis 键值队列、RabbitMQ 消息队列、MQTT 接入，全部内化于一个约 18 MB 的静态二进制。面向工控机与边缘弱硬件：备份 = 拷贝目录，迁移 = 拷贝文件。</p>
+        <div class="mb-2">
+            <span class="hero-chip">纯 Go · 无 CGO</span><span class="hero-chip">单端口多协议复用</span><span class="hero-chip">SQLite WAL 永不损坏</span><span class="hero-chip">三平台静态编译</span><span class="hero-chip">MIT 开源</span>
+        </div>
+        <div class="d-flex flex-wrap gap-3 mt-4">
+            <a class="btn btn-brand btn-lg text-white px-4" href="https://github.com/sang8052/GlacierTDB" target="_blank"><i class="fab fa-github me-2"></i>GitHub 开源仓库</a>
+            <a class="btn btn-outline-light btn-lg px-4" href="#demo"><i class="fas fa-flask me-2"></i>在线演示环境</a>
+        </div>
+        <div class="row g-3 mt-5" style="max-width:860px;">
+            <div class="col-6 col-md-3"><div class="stat-dark"><div class="num">1 个</div><div class="lbl">二进制 · 一体机</div></div></div>
+            <div class="col-6 col-md-3"><div class="stat-dark"><div class="num">5+1</div><div class="lbl">中间件能力内化</div></div></div>
+            <div class="col-6 col-md-3"><div class="stat-dark"><div class="num">:3309</div><div class="lbl">MySQL/Redis/AMQP 复用</div></div></div>
+            <div class="col-6 col-md-3"><div class="stat-dark"><div class="num">18 MB</div><div class="lbl">静态产物 · 零依赖</div></div></div>
+        </div>
+    </div>
+</header>
+
+<!-- 能力矩阵 -->
+<section id="features" class="py-5">
+    <div class="container py-4">
+        <h2 class="mb-2">六种中间件，一个进程</h2>
+        <p class="text-black-50 mb-4">客户端连上 3309，声明服务类型或由协议嗅探自动分发——存量客户端零改动。</p>
+        <div class="row g-4">
+            <div class="col-md-6 col-lg-4">
+                <div class="card card-hover p-4 shadow-sm">
+                    <div class="icon-bubble"><i class="fas fa-database"></i></div>
+                    <h5>MySQL 协议网关</h5>
+                    <p class="text-black-50 mb-2">mysql CLI / Navicat / PyMySQL / SQLAlchemy 直连。方言改写、多库事务、caching_sha2 认证、多核并行查询、管理面私有 SQL。</p>
+                    <div><span class="tag-chip">方言改写</span><span class="tag-chip">并行查询</span><span class="tag-chip">GRANT 权限</span></div>
+                </div>
+            </div>
+            <div class="col-md-6 col-lg-4">
+                <div class="card card-hover p-4 shadow-sm">
+                    <div class="icon-bubble"><i class="fas fa-chart-area"></i></div>
+                    <h5>时序冷库</h5>
+                    <p class="text-black-50 mb-2">series + points 聚簇模型、<code>GROUP BY time(N)</code> 桶化、rollup 多粒度预聚合自动路由、冷数据 gzip 固化（压缩比 ~3.8）。</p>
+                    <div><span class="tag-chip">rollup 预聚合</span><span class="tag-chip">冷压缩</span><span class="tag-chip">透明解冻</span></div>
+                </div>
+            </div>
+            <div class="col-md-6 col-lg-4">
+                <div class="card card-hover p-4 shadow-sm">
+                    <div class="icon-bubble"><i class="fas fa-box"></i></div>
+                    <h5>S3 对象存储</h5>
+                    <p class="text-black-50 mb-2">AWS SigV4 全兼容，boto3 / aws-cli 直连。multipart、版本、对象锁 WORM、限速、泛域名证书、OpenCV 风格图片处理管道。</p>
+                    <div><span class="tag-chip">SigV4</span><span class="tag-chip">multipart</span><span class="tag-chip">图片管道</span></div>
+                </div>
+            </div>
+            <div class="col-md-6 col-lg-4">
+                <div class="card card-hover p-4 shadow-sm">
+                    <div class="icon-bubble"><i class="fas fa-key"></i></div>
+                    <h5>Redis 键值 / 队列</h5>
+                    <p class="text-black-50 mb-2">RESP 协议：string / list、MULTI 事务、发布订阅、BLPOP 阻塞弹出、SCAN 真游标；TTL 与数据落盘，重启无损。</p>
+                    <div><span class="tag-chip">RESP2</span><span class="tag-chip">阻塞弹出</span><span class="tag-chip">LRU 淘汰</span></div>
+                </div>
+            </div>
+            <div class="col-md-6 col-lg-4">
+                <div class="card card-hover p-4 shadow-sm">
+                    <div class="icon-bubble"><i class="fas fa-envelope-open-text"></i></div>
+                    <h5>RabbitMQ 消息队列</h5>
+                    <p class="text-black-50 mb-2">AMQP 0-9-1：direct / fanout / topic 路由、confirm 发布确认、mandatory 回退；消息与消费游标落盘重启不丢。</p>
+                    <div><span class="tag-chip">AMQP</span><span class="tag-chip">发布确认</span><span class="tag-chip">断线重投</span></div>
+                </div>
+            </div>
+            <div class="col-md-6 col-lg-4">
+                <div class="card card-hover p-4 shadow-sm">
+                    <div class="icon-bubble"><i class="fas fa-tower-broadcast"></i></div>
+                    <h5>MQTT + 异步任务</h5>
+                    <p class="text-black-50 mb-2">MQTT 3.1.1（TCP + WebSocket）桥接消息队列；<code>SUBMIT QUERY</code> 异步引擎支持 AT / WINDOW / WHEN / EVERY 周期调度与四通道回调。</p>
+                    <div><span class="tag-chip">MQTT</span><span class="tag-chip">周期调度</span><span class="tag-chip">回调</span></div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- 架构 -->
+<section id="arch" class="py-5" style="background:#f6f9ff;">
+    <div class="container py-4">
+        <div class="row g-5 align-items-center">
+            <div class="col-lg-6">
+                <h2 class="mb-3">为无人值守的边缘而设计</h2>
+                <div class="feature-item"><i class="fas fa-circle-check"></i><div><b>SQLite 内核永不损坏</b> —— 单文件 + WAL，崩溃 / 掉电后已提交事务不丢，重启即恢复</div></div>
+                <div class="feature-item"><i class="fas fa-circle-check"></i><div><b>写安全·读并发</b> —— 每库一把写锁，多库写入天然并行；读多线程限流可配</div></div>
+                <div class="feature-item"><i class="fas fa-circle-check"></i><div><b>连接独占后端</b> —— 每客户端连接绑定一个 SQLite 连接，事务语义架构上根除错乱</div></div>
+                <div class="feature-item"><i class="fas fa-circle-check"></i><div><b>防爆破自动锁 + CLI 解锁</b> —— 本机回环永不锁定，管理面永远进得去</div></div>
+                <div class="feature-item"><i class="fas fa-circle-check"></i><div><b>底层静态加密</b> —— adiantum 全库加密，备份包即密文</div></div>
+                <div class="feature-item"><i class="fas fa-circle-check"></i><div><b>运维极简</b> —— 无守护进程依赖，一个目录拷走即迁移，systemd / Docker 双支持</div></div>
+            </div>
+            <div class="col-lg-6">
+                <div class="p-3">
+                    <div class="flow-box shadow-sm" style="background:#fff;border:1px solid #e3ecfd;">MySQL / redis-cli / pika / mqtt 客户端</div>
+                    <div class="flow-arr">↓ &nbsp;:3309 端口复用层（mode 声明 + 协议嗅探）</div>
+                    <div class="row g-2">
+                        <div class="col-4"><div class="flow-box" style="background:#eaf1ff;color:#1d4fc4;">MySQL 协议栈</div></div>
+                        <div class="col-4"><div class="flow-box" style="background:#eaf1ff;color:#1d4fc4;">RESP 栈</div></div>
+                        <div class="col-4"><div class="flow-box" style="background:#eaf1ff;color:#1d4fc4;">AMQP 栈</div></div>
+                    </div>
+                    <div class="flow-arr">↓</div>
+                    <div class="flow-box shadow-sm" style="background:#0d1526;color:#9cc3ff;">SQLite（WAL）· 业务库 + glacier_auth / glacier_s3 / glacier_kv / glacier_mq</div>
+                    <div class="text-center small text-black-50 mt-2">S3 对象存储独立监听 :9000（HTTP/S + virtual-host + TLS）</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- 快速体验 -->
+<section id="quickstart" class="py-5">
+    <div class="container py-4">
+        <h2 class="mb-2">30 秒上手</h2>
+        <p class="text-black-50 mb-4">下载即用，无需安装任何依赖。</p>
+        <div class="row g-4">
+            <div class="col-lg-7">
+                <div class="term">
+                    <div class="term-bar">
+                        <span class="dot" style="background:#ff5f57;"></span><span class="dot" style="background:#febc2e;"></span><span class="dot" style="background:#28c840;"></span>
+                        <span class="ms-2">bash — GlacierTDB</span>
+                    </div>
+<pre><span class="tok-c"># 下载 release（linux-amd64 / linux-arm64 / windows-amd64）</span>
+<span class="tok-p">sha256sum</span> -c SHA256SUMS
+<span class="tok-p">./glaciertdb-linux-amd64</span> -db-dir /srv/glacier/data
+
+<span class="tok-c"># mysql 客户端直连（存量工具零改动）</span>
+<span class="tok-p">mysql</span> -h 127.0.0.1 -P 3309 -uglacier -p <span class="tok-k">-e</span> <span class="tok-s">"SELECT glacier_version;"</span>
+
+<span class="tok-c"># redis 协议嗅探直接进</span>
+<span class="tok-p">redis-cli</span> -h 127.0.0.1 -p 3309 <span class="tok-k">SET</span> hello world
+
+<span class="tok-c"># 时序：建表即自动 rollup 预聚合</span>
+<span class="tok-p">mysql</span> ... <span class="tok-k">-e</span> <span class="tok-s">"SELECT avg(val) FROM points
+          WHERE ts &gt; now() - INTERVAL 7 DAY
+          GROUP BY series_id, time(1 HOUR);"</span></pre>
+                </div>
+            </div>
+            <div class="col-lg-5">
+                <div class="card border-0 shadow-sm p-4 h-100" style="border-radius:14px;">
+                    <h5 class="mb-3"><i class="fas fa-code-branch text-primary me-2"></i>技术栈</h5>
+                    <div><span class="tag-chip">Go · 纯静态无 CGO</span><span class="tag-chip">ncruces/go-sqlite3 (wazero)</span><span class="tag-chip">go-mysql</span><span class="tag-chip">自研 RESP / AMQP / MQTT / S3 栈</span><span class="tag-chip">adiantum 静态加密</span></div>
+                    <hr>
+                    <h5 class="mb-3"><i class="fas fa-file-lines text-primary me-2"></i>文档八册</h5>
+                    <p class="text-black-50 small mb-3">配置说明 · 系统SQL · 时序数据库 · 异步任务 · S3对象存储 · 键值队列 · 消息队列 · 部署运维，全部随仓库提供。</p>
+                    <a class="btn btn-outline-primary" href="https://github.com/sang8052/GlacierTDB#readme" target="_blank"><i class="fas fa-book me-1"></i> 阅读文档</a>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- 演示环境 -->
+<section id="demo" class="py-5" style="background:#f6f9ff;">
+    <div class="container py-4">
+        <h2 class="mb-2"><i class="fas fa-flask text-primary me-2"></i>在线演示评估环境</h2>
+        <p class="text-black-50 mb-4">开箱即连的公共演示实例，可直接体验 MySQL 网关与 S3 对象存储全流程。</p>
+        <div class="row g-4">
+            <div class="col-lg-7">
+                <div class="demo-panel p-4 h-100">
+                    <h5 class="mb-3"><i class="fas fa-database text-primary me-2"></i>MySQL 协议网关</h5>
+                    <div class="cred-row"><span class="cred-key">地址</span><span class="cred-val">beta-v6.glaciertdb.fun:3309</span><button class="copy-btn" data-copy="beta-v6.glaciertdb.fun:3309">复制</button></div>
+                    <div class="cred-row"><span class="cred-key">用户名</span><span class="cred-val">glaciert</span><button class="copy-btn" data-copy="glaciert">复制</button></div>
+                    <div class="cred-row"><span class="cred-key">密码</span><span class="cred-val">GlacierTDB@2026</span><button class="copy-btn" data-copy="GlacierTDB@2026">复制</button></div>
+                    <div class="cred-row"><span class="cred-key">连接示例</span><span class="cred-val">mysql -h beta-v6.glaciertdb.fun -P 3309 -uglaciert -p</span></div>
+                    <hr>
+                    <h5 class="mb-3"><i class="fas fa-box text-primary me-2"></i>S3 对象存储</h5>
+                    <div class="cred-row"><span class="cred-key">endpoint</span><span class="cred-val">https://s3.glaciertdb.fun</span><button class="copy-btn" data-copy="https://s3.glaciertdb.fun">复制</button></div>
+                    <div class="cred-row"><span class="cred-key">region</span><span class="cred-val">cn-sudemqaq</span><button class="copy-btn" data-copy="cn-sudemqaq">复制</button></div>
+                    <div class="cred-row"><span class="cred-key">AK</span><span class="cred-val">AS4BQQ2OKJZV9LHMED8XO3JO6UHE2BO2</span><button class="copy-btn" data-copy="AS4BQQ2OKJZV9LHMED8XO3JO6UHE2BO2">复制</button></div>
+                    <div class="cred-row"><span class="cred-key">SK</span><span class="cred-val">SKPHKJtd2tlax0tOOVVMpOmZllMnYo9raQmytsE10ly4MPpl</span><button class="copy-btn" data-copy="SKPHKJtd2tlax0tOOVVMpOmZllMnYo9raQmytsE10ly4MPpl">复制</button></div>
+                </div>
+            </div>
+            <div class="col-lg-5">
+                <div class="warn-strip mb-3">
+                    <b><i class="fas fa-triangle-exclamation me-1"></i>演示环境须知</b>
+                    <ul class="mb-0 mt-2 ps-3">
+                        <li class="mb-1">仅支持 <b>IPv6</b> 网络接入；</li>
+                        <li class="mb-1">不保证服务可靠性，演示数据可能随时清除或重载；</li>
+                        <li>请勿保存任何生产数据。</li>
+                    </ul>
+                </div>
+                <div class="warn-strip" style="background:#eef4ff;border-color:#c9dcfb;color:#1d4fc4;">
+                    <b><i class="fas fa-shield-halved me-1"></i>安全说明</b>
+                    <div class="mt-2">因安全性原因，演示服务器暂不开启 <b>RabbitMQ</b> 与 <b>EMQX (MQTT)</b> 功能，本地部署后即可体验全部六种中间件能力。</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- CTA -->
+<section class="py-5" style="background:linear-gradient(160deg,#0b1c36,#123a8f);color:#eaf1ff;">
+    <div class="container py-3 text-center">
+        <h2 class="mb-3">让边缘数据，冰川般可靠</h2>
+        <p class="mb-4" style="color:#a9bce0;">MIT 开源 · 三平台静态二进制 · 八册中文手册</p>
+        <div class="d-flex flex-wrap justify-content-center gap-3">
+            <a class="btn btn-light btn-lg px-4" href="https://github.com/sang8052/GlacierTDB/releases" target="_blank"><i class="fas fa-download me-2"></i>下载 Release</a>
+            <a class="btn btn-outline-light btn-lg px-4" href="https://github.com/sang8052/GlacierTDB" target="_blank"><i class="fab fa-github me-2"></i>GitHub 仓库</a>
+        </div>
+    </div>
+</section>
+
+<footer class="pt-5 pb-4">
+    <div class="container">
+        <div class="row g-4">
+            <div class="col-lg-5">
+                <div class="mb-3"><span class="logo-flake">❄</span> <span class="logo-word">GlacierTDB</span></div>
+                <p class="small mb-3">以 SQLite 为内核的边缘多协议数据一体机 —— MySQL 网关 · 时序冷库 · S3 · Redis · RabbitMQ · MQTT。</p>
+                <ul class="list-unstyled small">
+                    <li class="mb-2"><i class="fas fa-snowflake me-2"></i><a href="https://www.glaciertdb.fun" target="_blank">www.glaciertdb.fun</a></li>
+                    <li class="mb-2"><i class="fab fa-github me-2"></i><a href="https://github.com/sang8052/GlacierTDB" target="_blank">github.com/sang8052/GlacierTDB</a></li>
+                </ul>
+            </div>
+            <div class="col-6 col-lg-2 offset-lg-1">
+                <h6 class="text-white mb-3">产品</h6>
+                <ul class="list-unstyled small">
+                    <li class="mb-2"><a href="#features">能力全景</a></li>
+                    <li class="mb-2"><a href="#arch">架构</a></li>
+                    <li class="mb-2"><a href="#demo">在线演示</a></li>
+                </ul>
+            </div>
+            <div class="col-6 col-lg-4">
+                <h6 class="text-white mb-3">资源</h6>
+                <ul class="list-unstyled small">
+                    <li class="mb-2"><a href="https://github.com/sang8052/GlacierTDB#readme" target="_blank">文档与手册</a></li>
+                    <li class="mb-2"><a href="https://github.com/sang8052/GlacierTDB/releases" target="_blank">下载 Release</a></li>
+                    <li class="mb-2"><a href="https://github.com/sang8052/GlacierTDB/blob/main/CHANGELOG.md" target="_blank">更新日志</a></li>
+                </ul>
+            </div>
+        </div>
+        <hr style="border-color:rgba(255,255,255,.12);">
+        <div class="d-flex flex-wrap justify-content-center gap-2 small">
+            <span>Copyright © 2026 GlacierTDB · MIT License</span>
+        </div>
+    </div>
+</footer>
+
+<script src="https://cdn.jsdmirror.com/ajax/libs/twitter-bootstrap/5.3.7/js/bootstrap.bundle.min.js"></script>
+<script>
+document.querySelectorAll('.copy-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+        var text = btn.getAttribute('data-copy');
+        function done() { var old = btn.textContent; btn.textContent = '已复制'; setTimeout(function(){ btn.textContent = old; }, 1200); }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(done);
+        } else {
+            var ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta);
+            ta.select(); document.execCommand('copy'); document.body.removeChild(ta); done();
+        }
+    });
+});
+</script>
+</body>
+</html>

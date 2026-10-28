@@ -4,3 +4,4 @@ tests/
 *.db-wal
 *.db-shm
 .git/
+web/

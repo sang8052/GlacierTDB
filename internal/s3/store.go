@@ -86,6 +86,7 @@ type Store struct {
 	chunkSize int64
 	maxObject             int64
 	abortIncompleteDays   int
+	globalRegion string // 服务端全局 region（v1.3.12：桶不再单独存 region，'/' 统一展示）
 
 	limits       config.S3Limit
 	bucketLimits map[string]config.S3Limit
@@ -94,7 +95,32 @@ type Store struct {
 	usageMu  sync.Mutex
 	usageBuf map[string]*usageDelta // 读写操作计数内存缓冲（v1.3.11）
 	usageOps int
+
+	// 热路径读缓存（v1.3.12 并行上传优化）：每请求原本要对 s3_buckets /
+	// s3_policies 做 3-5 次元数据 SELECT；短 TTL 缓存后并行上传命中内存。
+	// 桶/策略写路径（建桶/删桶/UPDATE/SET POLICY）主动失效。
+	cacheMu      sync.Mutex
+	bucketCache  map[string]bucketCacheEntry
+	policyCache  map[string]policyCacheEntry
+
+	touchMu  sync.Mutex
+	touchBuf map[string]struct{} // 密钥 last_used 脏标记（定时批量落库，v1.3.12）
 }
+
+// bucketCacheEntry 桶行缓存条目（2 秒 TTL：元数据展示级一致性足够）。
+type bucketCacheEntry struct {
+	b       Bucket
+	expires time.Time
+}
+
+// policyCacheEntry 桶策略缓存条目。
+type policyCacheEntry struct {
+	val     string
+	expires time.Time
+}
+
+// bucketCacheTTL 桶/策略行缓存时长。
+const bucketCacheTTL = 2 * time.Second
 
 // usageDelta 单 (owner,bucket) 的操作计数增量。
 type usageDelta struct {
@@ -123,6 +149,10 @@ func Open(backend *sqlite.Backend, cfg *config.Config) (*Store, error) {
 		abortIncompleteDays: cfg.S3.AbortIncompleteDays,
 		limits:       cfg.S3.Limits,
 		bucketLimits: cfg.S3.BucketLimits,
+		globalRegion: cfg.S3.Region,
+		bucketCache:  make(map[string]bucketCacheEntry),
+		policyCache:  make(map[string]policyCacheEntry),
+		touchBuf:     make(map[string]struct{}),
 	}
 	if s.chunkSize <= 0 {
 		s.chunkSize = 256 << 10
@@ -133,6 +163,9 @@ func Open(backend *sqlite.Backend, cfg *config.Config) (*Store, error) {
 	if err := s.initSchema(); err != nil {
 		return nil, err
 	}
+	// v1.3.12：桶不再单独存 region（存储与隔离均与 region 无关，签名校验走
+	// 全局配置）——存量桶的 region 值启动时幂等清空
+	_, _ = s.db.Exec(`UPDATE s3_buckets SET region='' WHERE region<>''`)
 	// 存量桶补 manifest 列（v1.3.11：ALTER 只在建桶时执行，升级部署的旧桶表
 	// 缺列会导致对象写入直接 500——启动时全量幂等补跑一次）
 	for _, b := range s.ListBuckets("") {
@@ -140,14 +173,26 @@ func Open(backend *sqlite.Backend, cfg *config.Config) (*Store, error) {
 			logx.Warnf("s3: migrate bucket table %s: %v", b.TableName, err)
 		}
 	}
-	go func() { // 记账缓冲定时落库（v1.3.11）
+	go func() { // 记账缓冲定时落库（v1.3.11）+ 密钥 last_used 批量落库（v1.3.12）
 		t := time.NewTicker(usageFlushEvery)
 		defer t.Stop()
 		for range t.C {
 			s.flushUsage()
+			s.flushTouchKeys()
 		}
 	}()
 	return s, nil
+}
+
+// GlobalRegion 服务端全局 region（'*'/空 = 未限定）。
+func (s *Store) GlobalRegion() string { return s.globalRegion }
+
+// DisplayRegion 展示用 region（'*' → ''）。
+func (s *Store) DisplayRegion() string {
+	if s.globalRegion == "*" {
+		return ""
+	}
+	return s.globalRegion
 }
 
 // loadMasterKey 加载 / 首次生成 SK 加密主密钥（<db_dir>/glacier_s3.key）。
@@ -341,7 +386,9 @@ CREATE TABLE IF NOT EXISTS %s (
 // ---------------------------------------------------------------------------
 
 // CreateBucket 建桶（bucket 从属用户 owner，命名空间隔离）。
-func (s *Store) CreateBucket(name, owner, region string, versioning, objectLock bool) (Bucket, error) {
+// v1.3.12：region 不再按桶存储（签名校验走全局配置，location 恒返回全局值），
+// region 参数保留只为兼容旧调用方，值被忽略。
+func (s *Store) CreateBucket(name, owner string, _ string, versioning, objectLock bool) (Bucket, error) {
 	var b Bucket
 	if !ValidBucketName(name) {
 		return b, fmt.Errorf("invalid bucket name %q (3-63 chars, lowercase letters/digits/./-)", name)
@@ -374,11 +421,12 @@ func (s *Store) CreateBucket(name, owner, region string, versioning, objectLock 
 		ol = 1
 	}
 	if _, err := s.db.Exec(`INSERT INTO s3_buckets(name,owner,region,table_name,versioning,object_lock,created_ts)
-		VALUES(?,?,?,?,?,?,?)`, name, owner, region, t, ver, ol, nowTS()); err != nil {
+		VALUES(?,?,?,?,?,?,?)`, name, owner, "", t, ver, ol, nowTS()); err != nil {
 		return b, err
 	}
-	b = Bucket{Name: name, Owner: owner, Region: region, TableName: t,
+	b = Bucket{Name: name, Owner: owner, Region: "", TableName: t,
 		Versioning: versioning, ObjectLock: objectLock, CreatedTS: nowTS()}
+	s.invalidateBucket(name)
 	logx.Infof("s3: bucket %s created (owner=%s, versioning=%v, object_lock=%v)", name, owner, versioning, objectLock)
 	return b, nil
 }
@@ -419,6 +467,7 @@ func (s *Store) DropBucket(name string, force bool) error {
 	_, _ = s.db.Exec(`DELETE FROM s3_domains WHERE bucket=?`, name)
 	_, _ = s.db.Exec(`DELETE FROM s3_lifecycle WHERE bucket=?`, name)
 	_, _ = s.db.Exec(`UPDATE s3_usage SET storage_bytes=0, object_count=0 WHERE bucket=?`, name)
+	s.invalidateBucket(name)
 	logx.Infof("s3: bucket %s dropped (force=%v)", name, force)
 	return nil
 }
@@ -447,9 +496,35 @@ func (s *Store) bucketLocked(name string) (Bucket, error) {
 	return b, nil
 }
 
-// Bucket 查询桶（纯读，不占写锁——WAL 下读写并行）。
+// Bucket 查询桶（纯读，不占写锁——WAL 下读写并行；v1.3.12 起带 2 秒 TTL 缓存，
+// 桶管理写路径主动失效。写事务内部请用 bucketLocked 取实时行）。
 func (s *Store) Bucket(name string) (Bucket, error) {
-	return s.bucketLocked(name)
+	now := time.Now()
+	s.cacheMu.Lock()
+	if e, ok := s.bucketCache[name]; ok && now.Before(e.expires) {
+		s.cacheMu.Unlock()
+		return e.b, nil
+	}
+	s.cacheMu.Unlock()
+	b, err := s.bucketLocked(name)
+	if err != nil {
+		return b, err
+	}
+	s.cacheMu.Lock()
+	s.bucketCache[name] = bucketCacheEntry{b: b, expires: now.Add(bucketCacheTTL)}
+	s.cacheMu.Unlock()
+	return b, nil
+}
+
+// invalidateBucket 桶行缓存失效（桶管理写路径调用；name 为空 = 全清）。
+func (s *Store) invalidateBucket(name string) {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if name == "" {
+		s.bucketCache = make(map[string]bucketCacheEntry)
+		return
+	}
+	delete(s.bucketCache, name)
 }
 
 // ListBuckets 全部桶（可按 owner 过滤，空 = 全部）。
@@ -488,6 +563,7 @@ func (s *Store) UpdateBucket(name string, owner *string, versioning, objectLock 
 	callbackURL, callbackSecret *string, perConnBps, perUserBps *int64, perUserConns *int) (Bucket, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	defer s.invalidateBucket(name)
 	b, err := s.bucketLocked(name)
 	if err != nil {
 		return b, err
@@ -699,14 +775,14 @@ func (s *Store) RunLifecycle() int {
 
 // deleteAllVersionsLocked 删除一个 key 的全部版本（生命周期用；调用方持 writeMu）。
 func (s *Store) deleteAllVersionsLocked(b Bucket, key string) error {
-	oldStorage, oldCount := s.keyAggLocked(b, key)
+	oldStorage, oldCount := s.keyAggLocked(s.db, b, key)
 	if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=?`, chunkTableFor(b.TableName)), key); err != nil {
 		return err
 	}
 	if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=?`, b.TableName), key); err != nil {
 		return err
 	}
-	s.adjustAggLocked(b, key, -oldStorage, -oldCount)
+	s.adjustAggLocked(s.db, b, key, -oldStorage, -oldCount)
 	return nil
 }
 
@@ -717,7 +793,9 @@ func (s *Store) deleteAllVersionsLocked(b Bucket, key string) error {
 // AddUsage 记账一次操作（class: GET/PUT/LIST/DELETE）。
 // v1.3.11 性能：改为内存缓冲 + 批量落库——此前每次 GET/LIST 都拿全局写锁写一行
 // UPSERT，全部 S3 读流量相互串行且与写竞争；现在读路径零锁零 SQL，
-// 每 256 次操作或 5 秒合并落库（写路径的 addUsageLocked 仍即时落）。
+// 每 256 次操作或 5 秒合并落库。v1.3.12 起对象写路径同样走缓冲（PUT 的
+// put_count/bytes_in UPSERT 移出写锁临界区）；阈值触发的落库异步执行——
+// 持有 writeMu 的调用方不会自陷（flush 需要 writeMu）。
 func (s *Store) AddUsage(owner, bucket, class string, bytesIn, bytesOut int64) {
 	s.usageMu.Lock()
 	if s.usageBuf == nil {
@@ -745,7 +823,7 @@ func (s *Store) AddUsage(owner, bucket, class string, bytesIn, bytesOut int64) {
 	flush := s.usageOps >= usageFlushOps
 	s.usageMu.Unlock()
 	if flush {
-		s.flushUsage()
+		go s.flushUsage()
 	}
 }
 
@@ -787,45 +865,31 @@ func (s *Store) usageSnapshot() map[string]usageDelta {
 	return out
 }
 
-func (s *Store) addUsageLocked(owner, bucket, class string, bytesIn, bytesOut int64) {
-	getN, putN, listN, delN := int64(0), int64(0), int64(0), int64(0)
-	switch strings.ToUpper(class) {
-	case "GET":
-		getN = 1
-	case "PUT":
-		putN = 1
-	case "LIST":
-		listN = 1
-	case "DELETE":
-		delN = 1
-	}
-	_, _ = s.db.Exec(`INSERT INTO s3_usage(owner,bucket,get_count,put_count,list_count,delete_count,
-		bytes_in,bytes_out,updated_ts) VALUES(?,?,?,?,?,?,?,?,?)
-		ON CONFLICT(owner,bucket) DO UPDATE SET
-		get_count=get_count+excluded.get_count, put_count=put_count+excluded.put_count,
-		list_count=list_count+excluded.list_count, delete_count=delete_count+excluded.delete_count,
-		bytes_in=bytes_in+excluded.bytes_in, bytes_out=bytes_out+excluded.bytes_out,
-		updated_ts=excluded.updated_ts`,
-		owner, bucket, getN, putN, listN, delN, bytesIn, bytesOut, nowTS())
+// dbtx *sql.DB 与 *sql.Tx 的公共子集（聚合/记账可在事务内执行，v1.3.12：
+// 对象写路径的删旧 + 插新 + 聚合 UPSERT 合并为单事务一次提交）。
+type dbtx interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
 }
 
-// adjustAggLocked 调整桶与用量的存储字节 / 对象数（delta 可为负；调用方持 writeMu）。
-func (s *Store) adjustAggLocked(b Bucket, key string, dBytes, dCount int64) {
-	_, _ = s.db.Exec(`UPDATE s3_buckets SET storage_bytes=MAX(0,storage_bytes+?), object_count=MAX(0,object_count+?) WHERE name=?`,
+// adjustAggLocked 调整桶与用量的存储字节 / 对象数（delta 可为负；调用方持
+// writeMu；q 传事务则随主事务一起提交）。
+func (s *Store) adjustAggLocked(q dbtx, b Bucket, key string, dBytes, dCount int64) {
+	_, _ = q.Exec(`UPDATE s3_buckets SET storage_bytes=MAX(0,storage_bytes+?), object_count=MAX(0,object_count+?) WHERE name=?`,
 		dBytes, dCount, b.Name)
-	_, _ = s.db.Exec(`INSERT INTO s3_usage(owner,bucket,storage_bytes,object_count,updated_ts) VALUES(?,?,?,?,?)
-		ON CONFLICT(owner,bucket) DO UPDATE SET
-		storage_bytes=MAX(0,storage_bytes+excluded.storage_bytes),
-		object_count=MAX(0,object_count+excluded.object_count),
-		updated_ts=excluded.updated_ts`,
+	_, _ = q.Exec(`INSERT INTO s3_usage(owner,bucket,storage_bytes,object_count,updated_ts) VALUES(?,?,?,?,?)
+	ON CONFLICT(owner,bucket) DO UPDATE SET
+	storage_bytes=MAX(0,storage_bytes+excluded.storage_bytes),
+	object_count=MAX(0,object_count+excluded.object_count),
+	updated_ts=excluded.updated_ts`,
 		b.Owner, b.Name, dBytes, dCount, nowTS())
 }
 
 // keyAggLocked 某 key 当前的存储字节与对象计数贡献（调用方持 writeMu）。
 // v1.3.11：两条聚合合并为一条（每次对象写少一半锁内查询）。
-func (s *Store) keyAggLocked(b Bucket, key string) (int64, int64) {
+func (s *Store) keyAggLocked(q dbtx, b Bucket, key string) (int64, int64) {
 	var bytes, nLatest int64
-	_ = s.db.QueryRow(fmt.Sprintf(
+	_ = q.QueryRow(fmt.Sprintf(
 		`SELECT COALESCE(SUM(size),0), COALESCE(SUM(CASE WHEN is_latest=1 AND delete_marker=0 THEN 1 ELSE 0 END),0)
 		FROM %s WHERE key=?`, b.TableName), key).Scan(&bytes, &nLatest)
 	return bytes, nLatest

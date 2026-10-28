@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -97,7 +98,116 @@ func (m *ObjectMeta) lockViolation(bypassGovernance bool) error {
 	return nil
 }
 
-// PutObject 写对象（内容先落临时文件做哈希校验，再事务写入内联 / 分块表）。
+// spool 上传内容暂存（v1.3.12）：小对象全部驻留内存（省去临时文件一写一读
+// 两次磁盘 I/O），超过阈值溢出 <db_dir>/.s3tmp 临时文件（内存占用与对象大小
+// 解耦）。全程同步计算 MD5。
+type spool struct {
+	buf    bytes.Buffer
+	tmp    *os.File
+	tmpDir string
+	memMax int
+	sz     int64
+	md5h   hash.Hash
+}
+
+// spoolMemMax 内存暂存阈值（字节）：内联阈值与 1MB 取大——小对象（延迟敏感、
+// 吞吐主力）全内存省两次磁盘 I/O；更大对象溢出临时文件流式处理，避免并行
+// 大对象上传时数十 MB 级堆驻留推高 GC、拖慢单写临界区（实测 5MB×16 路并行
+// 内存驻留使写路径降速 ~18%，v1.3.12 调优）。
+func (s *Store) spoolMemMax() int {
+	m := int(s.inlineMax)
+	if m < 1<<20 {
+		m = 1 << 20
+	}
+	return m
+}
+
+func newSpool(tmpDir string, memMax int) *spool {
+	return &spool{tmpDir: tmpDir, memMax: memMax, md5h: md5.New()}
+}
+
+// copyFrom 流式暂存并计算 MD5，返回总字节数。
+func (p *spool) copyFrom(r io.Reader) (int64, error) {
+	_ = os.MkdirAll(p.tmpDir, 0o700)
+	chunk := make([]byte, 256<<10)
+	for {
+		n, rerr := r.Read(chunk)
+		if n > 0 {
+			if p.tmp == nil && p.buf.Len()+n > p.memMax {
+				t, err := os.CreateTemp(p.tmpDir, "put-*")
+				if err != nil {
+					return p.sz, err
+				}
+				if _, err := t.Write(p.buf.Bytes()); err != nil {
+					t.Close()
+					os.Remove(t.Name())
+					return p.sz, err
+				}
+				p.buf.Reset()
+				p.tmp = t
+			}
+			if p.tmp != nil {
+				if _, err := p.tmp.Write(chunk[:n]); err != nil {
+					return p.sz, err
+				}
+			} else {
+				p.buf.Write(chunk[:n])
+			}
+			_, _ = p.md5h.Write(chunk[:n])
+			p.sz += int64(n)
+		}
+		if rerr == io.EOF {
+			return p.sz, nil
+		}
+		if rerr != nil {
+			return p.sz, rerr
+		}
+	}
+}
+
+// md5Hex 暂存内容的 MD5（hex）。
+func (p *spool) md5Hex() string { return hex.EncodeToString(p.md5h.Sum(nil)) }
+
+// size 暂存字节数。
+func (p *spool) size() int64 { return p.sz }
+
+// bytes 取全部暂存字节（小对象内存态零拷贝；已溢出文件时回读）。
+func (p *spool) bytes() ([]byte, error) {
+	if p.tmp == nil {
+		return p.buf.Bytes(), nil
+	}
+	if _, err := p.tmp.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(p.tmp)
+}
+
+// reader 回读句柄（内存态或临时文件，Seek(0) 已就位）。
+func (p *spool) reader() (io.Reader, error) {
+	if p.tmp == nil {
+		return bytes.NewReader(p.buf.Bytes()), nil
+	}
+	if _, err := p.tmp.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return p.tmp, nil
+}
+
+// close 释放暂存资源（溢出临时文件删除）。
+func (p *spool) close() {
+	if p.tmp != nil {
+		name := p.tmp.Name()
+		p.tmp.Close()
+		_ = os.Remove(name)
+		p.tmp = nil
+	}
+}
+
+// PutObject 写对象：内容暂存（小对象内存/大对象临时文件）做 MD5 校验后，
+// 删旧 + 插新 + 桶聚合 UPSERT 在**单个事务**内一次提交（v1.3.12 重写：
+// 此前锁内 2 条隐式 DELETE 事务 + 主事务 + 提交后 2 条聚合/记账 UPSERT，
+// 每个对象 6 次左右 commit 且全程持有全局写锁——并行上传在锁上排队；
+// 现临界区 = 1 个短事务，记账走内存缓冲）。
 // 返回新版本元数据与是否覆盖已有对象（versioning 关闭时）。
 func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs ObjectAttrs) (ObjectMeta, bool, error) {
 	var out ObjectMeta
@@ -118,23 +228,14 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 		}
 	}
 
-	// 暂存：小对象内存、大对象临时文件（<db_dir>/.s3tmp）
-	tmpDir := filepath.Join(s.dir, ".s3tmp")
-	_ = os.MkdirAll(tmpDir, 0o700)
-	tmp, err := os.CreateTemp(tmpDir, "put-*")
+	// 暂存（锁外完成：MD5 / 上限校验 / 内联字节备好——不占全局写锁）
+	sp := newSpool(filepath.Join(s.dir, ".s3tmp"), s.spoolMemMax())
+	size, err := sp.copyFrom(r)
 	if err != nil {
+		sp.close()
 		return out, false, err
 	}
-	defer func() {
-		tmp.Close()
-		os.Remove(tmp.Name())
-	}()
-
-	md5h := md5.New()
-	size, err := io.Copy(io.MultiWriter(tmp, md5h), r)
-	if err != nil {
-		return out, false, err
-	}
+	defer sp.close()
 	if s.maxObject > 0 && size > s.maxObject {
 		return out, false, &s3Error{Code: "EntityTooLarge", Status: 400,
 			Msg: fmt.Sprintf("Object size %d exceeds max_object_mb limit %d", size, s.maxObject>>20)}
@@ -144,45 +245,29 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 		return out, false, &s3Error{Code: "IncompleteBody", Status: 400,
 			Msg: "You did not provide the number of bytes specified by the Content-Length HTTP header"}
 	}
-	etag := hex.EncodeToString(md5h.Sum(nil))
-
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	oldStorage, oldCount := s.keyAggLocked(b, key)
-	versionID := ""
-	if b.Versioning {
-		versionID = genVersionID()
-	} else {
-		// 清理旧版本（含分块；只清正式行 version_id=''——不碰进行中分片上传的
-		// 暂存行 (key, uploadId)，v1.3.11）
-		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, chunkTableFor(b.TableName)), key); err != nil {
-			return out, false, err
-		}
-		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, b.TableName), key); err != nil {
-			return out, false, err
-		}
-		replaced = oldCount > 0
-	}
+	etag := sp.md5Hex()
 
 	storage := "inline"
 	var content []byte
 	if size <= s.inlineMax {
-		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-			return out, false, err
-		}
-		content, err = io.ReadAll(tmp)
+		content, err = sp.bytes()
 		if err != nil {
 			return out, false, err
 		}
 	} else {
 		storage = "chunk"
 	}
-
 	metaJSON := "{}"
 	if len(attrs.Metadata) > 0 {
 		metaJSON = MarshalPolicy(attrs.Metadata)
 	}
+	manifest := ""
+	if storage == "chunk" {
+		manifest = MarshalPolicy(chunkManifest{CS: s.chunkSize, Parts: [][4]int64{{0, (size + s.chunkSize - 1) / s.chunkSize, size, s.chunkSize}}})
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -190,15 +275,25 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 	}
 	defer tx.Rollback()
 
+	oldStorage, oldCount := s.keyAggLocked(tx, b, key)
+	versionID := ""
 	if b.Versioning {
+		versionID = genVersionID()
 		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET is_latest=0 WHERE key=? AND is_latest=1`, b.TableName), key); err != nil {
 			return out, false, err
 		}
+	} else {
+		// 清理旧版本（含分块；只清正式行 version_id=''——不碰进行中分片上传的
+		// 暂存行 (key, uploadId)，v1.3.11）
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, chunkTableFor(b.TableName)), key); err != nil {
+			return out, false, err
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, b.TableName), key); err != nil {
+			return out, false, err
+		}
+		replaced = oldCount > 0
 	}
-	manifest := ""
-	if storage == "chunk" {
-		manifest = MarshalPolicy(chunkManifest{CS: s.chunkSize, Parts: [][4]int64{{0, (size + s.chunkSize - 1) / s.chunkSize, size, s.chunkSize}}})
-	}
+
 	_, err = tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,is_latest,delete_marker,size,etag,
 		content_type,content_encoding,cache_control,content_disposition,metadata,content,storage,manifest,
 		legal_hold,retention_mode,retain_until,created_ts)
@@ -211,33 +306,40 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 	}
 
 	if storage == "chunk" {
-		chunk := make([]byte, s.chunkSize)
-		if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-			return out, false, err
+		rc, rerr := sp.reader()
+		if rerr != nil {
+			return out, false, rerr
 		}
+		chunk := make([]byte, s.chunkSize)
 		for seq := int64(0); ; seq++ {
-			n, rerr := io.ReadFull(tmp, chunk)
+			n, err := io.ReadFull(rc, chunk)
 			if n > 0 {
 				if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,seq,data) VALUES(?,?,?,?)`,
 					chunkTableFor(b.TableName)), key, versionID, seq, chunk[:n]); err != nil {
 					return out, false, err
 				}
 			}
-			if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break
 			}
-			if rerr != nil {
-				return out, false, rerr
+			if err != nil {
+				return out, false, err
 			}
 		}
+	}
+
+	// 桶聚合按算术增量随本事务提交（省去提交后的第二次聚合 SELECT）：
+	// versioning = (+size, +1)；非 versioning 覆盖后 = (size-旧, 1-旧)
+	if b.Versioning {
+		s.adjustAggLocked(tx, b, key, size, 1)
+	} else {
+		s.adjustAggLocked(tx, b, key, size-oldStorage, 1-oldCount)
 	}
 	if err := tx.Commit(); err != nil {
 		return out, false, err
 	}
 
-	newStorage, newCount := s.keyAggLocked(b, key)
-	s.adjustAggLocked(b, key, newStorage-oldStorage, newCount-oldCount)
-	s.addUsageLocked(b.Owner, bucket, "PUT", size, 0)
+	s.AddUsage(b.Owner, bucket, "PUT", size, 0)
 
 	out = ObjectMeta{
 		Key: key, VersionID: versionID, IsLatest: true, Size: size, ETag: etag,
@@ -547,7 +649,7 @@ func (s *Store) DeleteObject(bucket, key, versionID string, bypassGovernance boo
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	oldStorage, oldCount := s.keyAggLocked(b, key)
+	oldStorage, oldCount := s.keyAggLocked(s.db, b, key)
 
 	del := ObjectMeta{Key: key, VersionID: versionID}
 	switch {
@@ -627,9 +729,9 @@ func (s *Store) DeleteObject(bucket, key, versionID string, bypassGovernance boo
 		}
 	}
 
-	newStorage, newCount := s.keyAggLocked(b, key)
-	s.adjustAggLocked(b, key, newStorage-oldStorage, newCount-oldCount)
-	s.addUsageLocked(b.Owner, bucket, "DELETE", 0, 0)
+	newStorage, newCount := s.keyAggLocked(s.db, b, key)
+	s.adjustAggLocked(s.db, b, key, newStorage-oldStorage, newCount-oldCount)
+	s.AddUsage(b.Owner, bucket, "DELETE", 0, 0)
 	return del, nil
 }
 

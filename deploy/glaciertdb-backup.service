@@ -1,0 +1,17 @@
+# GlacierTDB 在线备份定时器（v1.3.12，配合 glaciertdb.service 使用）
+# 安装：cp deploy/glaciertdb-backup.{service,timer} /etc/systemd/system/
+#      systemctl daemon-reload && systemctl enable --now glaciertdb-backup.timer
+#
+# 备份为在线执行（服务运行中可用）：全部库逐个 VACUUM INTO 单文件快照
+# （WAL 读快照不阻塞业务写入），全部成功后原子落位 /data/backups/glaciertdb
+# （旧一代自动轮转为 <target>.old；单库失败整体中止不留半成品）。
+# 备份产物为普通 SQLite 单文件（加密部署下为同口令密文单文件），
+# 恢复 = 停服后把文件拷回 db_dir（或按需改名），即「拷贝文件即迁移」。
+
+[Unit]
+Description=GlacierTDB online backup (VACUUM INTO snapshot)
+
+[Service]
+Type=oneshot
+# -backup-verify=false 可跳过 integrity_check（快几秒，损失确定性）
+ExecStart=/data/GlacierTDB/glaciertdb -config /data/GlacierTDB/config.yaml -backup /data/backups/glaciertdb -backup-verify=true

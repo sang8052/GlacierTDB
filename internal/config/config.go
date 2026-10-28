@@ -11,7 +11,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.3.11.beta"
+const GlacierVersion = "1.3.12.beta"
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -118,7 +118,8 @@ type S3Opts struct {
 	BucketLimits    map[string]S3Limit `yaml:"bucket_limits"` // 按 bucket 覆盖（字段非 0 生效）
 	LifecycleIntervalSec int `yaml:"lifecycle_interval_sec"` // 生命周期（自动删除）扫描周期
 	AbortIncompleteDays  int `yaml:"abort_incomplete_days"`  // 未完成分片上传自动回收天数（v1.3.5；默认 7，0=关闭）
-	CallbackSecret  string   `yaml:"callback_secret"`        // 上传回调默认 HMAC 签名密钥
+	CallbackURL      string   `yaml:"callback_url"`           // 上传回调默认 URL（v1.3.12；桶级/请求级可覆盖）
+	CallbackSecret   string   `yaml:"callback_secret"`        // 上传回调默认 HMAC 签名密钥
 	ImageFont       string   `yaml:"image_font"`             // 图片文字渲染 ttf 字体路径（空 = 内置 ASCII）
 	ImageCache      bool     `yaml:"image_cache"`            // 图片预处理结果磁盘缓存（GET 加工链路；默认开）
 	ImageCacheMB    int      `yaml:"image_cache_mb"`         // 缓存目录容量上限 MB（默认 1024；-1 = 不限）
@@ -175,10 +176,23 @@ type Auth struct {
 }
 
 type SQLiteOpts struct {
-	Synchronous   string `yaml:"synchronous"` // OFF|NORMAL|FULL|EXTRA
-	BusyTimeoutMs int    `yaml:"busy_timeout_ms"`
-	CacheSizeKB   int    `yaml:"cache_size_kb"`
-	MaxResultRows int64  `yaml:"max_result_rows"` // 单条查询最大返回行数保护
+	Synchronous        string `yaml:"synchronous"`         // OFF|NORMAL|FULL|EXTRA
+	BusyTimeoutMs      int    `yaml:"busy_timeout_ms"`
+	CacheSizeKB        int    `yaml:"cache_size_kb"`
+	WalAutocheckpoint  int    `yaml:"wal_autocheckpoint"`  // WAL 自动 checkpoint 页数（0 = SQLite 默认 1000；v1.3.12）
+	JournalSizeLimitKB int    `yaml:"journal_size_limit_kb"` // WAL 文件空间回收上限（0 = 不限；v1.3.12）
+	MaxResultRows      int64  `yaml:"max_result_rows"` // 单条查询最大返回行数保护
+}
+
+// TLSOpts 3309 复用端口（MySQL/RESP/AMQP/MQTT）与 MQTT 独立监听的 TLS 加密
+//（v1.3.12）。MySQL 另支持协议内升级（握手报 SSL 能力位，--ssl-mode 客户端
+// 直连可用）；RESP/AMQP/MQTT 为 TLS 优先（redis-cli --tls / amqps:// / mqtts）。
+// 同端口明文与 TLS 客户端可共存（首字节 0x16 = TLS ClientHello 自动识别）。
+type TLSOpts struct {
+	Enable     bool   `yaml:"enable"`      // true = 启用 TLS（证书必填）
+	CertFile   string `yaml:"cert_file"`   // PEM 证书
+	KeyFile    string `yaml:"key_file"`    // PEM 私钥
+	MinVersion string `yaml:"min_version"` // "1.2"（默认）| "1.3"
 }
 
 type LogOpts struct {
@@ -218,6 +232,7 @@ type Config struct {
 
 	Auth   Auth       `yaml:"auth"`
 	SQLite SQLiteOpts `yaml:"sqlite"`
+	TLS    TLSOpts    `yaml:"tls"`
 	Log    LogOpts    `yaml:"log"`
 }
 
@@ -383,6 +398,19 @@ func (c *Config) Fill() {
 	}
 	if c.SQLite.CacheSizeKB <= 0 {
 		c.SQLite.CacheSizeKB = 256
+	}
+	if c.SQLite.WalAutocheckpoint < 0 {
+		c.SQLite.WalAutocheckpoint = 0
+	}
+	if c.SQLite.JournalSizeLimitKB < 0 {
+		c.SQLite.JournalSizeLimitKB = 0
+	}
+	// TLS（v1.3.12）：开启时证书必填（校验在 main，fail-closed 不静默降级）；
+	// min_version 非法回退 1.2
+	switch c.TLS.MinVersion {
+	case "", "1.2", "1.3":
+	default:
+		c.TLS.MinVersion = "1.2"
 	}
 	if c.SQLite.MaxResultRows <= 0 {
 		c.SQLite.MaxResultRows = 1000000

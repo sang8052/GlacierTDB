@@ -204,18 +204,16 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 解析桶 / 对象键（virtual-host 或 path-style）
 	bucket, key := h.resolveBucketKey(r)
 
-	// SigV4 鉴权（表头或预签名 URL）
+	// SigV4 鉴权（表头或预签名 URL）；owner/policy 由鉴权查询顺带带回（v1.3.12：
+	// 此前每个请求都要二次 KeyFor 查库）
 	cs, payloadHash, err := verifySigV4(r, s.cfg.S3.Region, s.store.KeyFor)
 	if err != nil {
 		writeErr(w, r, reqID, toS3Err(err))
 		return
 	}
 	s.store.TouchKey(cs.AK)
-	owner, _, status, keyPolicy, _ := s.store.KeyFor(cs.AK)
-	if status != "active" {
-		writeErr(w, r, reqID, &s3Error{Code: "InvalidAccessKeyId", Status: 403, Msg: "The AWS Access Key Id is " + status})
-		return
-	}
+	owner := cs.Owner
+	keyPolicy := cs.Policy
 
 	// 请求策略条件（密钥级 + 桶级，参考阿里云 OSS policy 条件匹配）
 	ip := clientIP(r)
@@ -311,8 +309,38 @@ func (h *endpointHandler) resolveBucketKey(r *http.Request) (bucket, key string)
 			return prefix, path
 		}
 	}
+	// 2.5) 未配置 server_names 的域名部署兜底（v1.3.12 修复）：此前未知主机名
+	// 一律落 path-style，bucket.s3.example.com 的 GET / 会被误当 ListBuckets、
+	// PUT /obj 被误当建桶。现对「非 IP 的多段域名」把首段当桶名探一次库——
+	// 命中已存在桶则按 virtual-host 处理；未命中维持 path-style（端点裸域名
+	// 访问 GET / 仍正确列桶）。配置了 server_names 的环境不受影响。
+	if host != "" && host[0] != '[' && !isIPHost(host) {
+		if i := strings.IndexByte(host, '.'); i > 0 && i < len(host)-1 {
+			cand := host[:i]
+			if ValidBucketName(cand) {
+				if _, err := h.srv.store.Bucket(cand); err == nil {
+					return cand, path
+				}
+			}
+		}
+	}
 	// 3) path-style：/{bucket}/{key...}
 	return splitPathStyle(path)
+}
+
+// isIPHost 判断主机名是否 IPv4/IPv6 字面量（vhost 剥离不适用于 IP 访问）。
+func isIPHost(host string) bool {
+	if strings.Contains(host, ":") { // IPv6 字面量（端口已剥）
+		return true
+	}
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		if (c >= '0' && c <= '9') || c == '.' {
+			continue
+		}
+		return false
+	}
+	return host != ""
 }
 
 func splitPathStyle(path string) (bucket, key string) {
@@ -437,15 +465,13 @@ func (h *endpointHandler) handleBucket(w http.ResponseWriter, r *http.Request, b
 			return
 		}
 		if q.Has("location") {
-			reg := ""
-			if b, err := h.srv.store.Bucket(bucket); err == nil {
-				reg = b.Region
-			}
+			// v1.3.12：桶不再单独存 region，LocationConstraint 恒返回服务端全局
+			// 配置（'*'/空 → 空串，客户端按 us-east-1 语义理解）
 			writeXML(w, http.StatusOK, struct {
 				XMLName xml.Name `xml:"LocationConstraint"`
 				Xmlns   string   `xml:"xmlns,attr"`
 				Value   string   `xml:",chardata"`
-			}{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Value: reg}, reqID, r.Method == http.MethodHead)
+			}{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/", Value: h.srv.store.DisplayRegion()}, reqID, r.Method == http.MethodHead)
 			return
 		}
 		if q.Has("versioning") {
@@ -839,7 +865,7 @@ func (h *endpointHandler) putObject(w http.ResponseWriter, r *http.Request, buck
 func (h *endpointHandler) finishPut(w http.ResponseWriter, r *http.Request, bucket, key string,
 	m ObjectMeta, replaced bool, owner, reqID string) {
 	if b, err := h.srv.store.Bucket(bucket); err == nil {
-		h.srv.notifyPut(b, m, replaced)
+		h.srv.notifyPut(b, m, replaced, reqCallbackOverride(r))
 	}
 	// 记账（PUT + bytes_in）已在 store.PutObject 内按桶属主完成
 	w.Header().Set("ETag", "\""+m.ETag+"\"")
@@ -847,6 +873,20 @@ func (h *endpointHandler) finishPut(w http.ResponseWriter, r *http.Request, buck
 		w.Header().Set("x-amz-version-id", m.VersionID)
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// callbackOverride 请求级回调覆盖（v1.3.12）：PUT / CompleteMultipartUpload 的
+// x-glacier-callback-url / x-glacier-callback-secret 请求头，仅对该次上传生效，
+// 优先级：请求级 > 桶级（SET S3 CALLBACK）> 全局（s3.callback_url）。
+type callbackOverride struct{ url, secret string }
+
+// reqCallbackOverride 从请求头提取请求级回调参数（无 = nil）。
+func reqCallbackOverride(r *http.Request) *callbackOverride {
+	u := r.Header.Get("X-Glacier-Callback-Url")
+	if u == "" {
+		return nil
+	}
+	return &callbackOverride{url: u, secret: r.Header.Get("X-Glacier-Callback-Secret")}
 }
 
 // getObject 下载对象（限速 + 图片加工[磁盘缓存] + 记账）。
@@ -1270,7 +1310,7 @@ func (h *endpointHandler) completeMultipart(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if b, berr := h.srv.store.Bucket(bucket); berr == nil {
-		h.srv.notifyPut(b, m, replaced)
+		h.srv.notifyPut(b, m, replaced, reqCallbackOverride(r))
 	}
 	writeXML(w, http.StatusOK, struct {
 		XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
@@ -1362,7 +1402,7 @@ func (h *endpointHandler) serveInternal(w http.ResponseWriter, r *http.Request, 
 		writeErr(w, r, reqID, toS3Err(err))
 		return
 	}
-	owner, _, _, _, _ := s.store.KeyFor(cs.AK)
+	owner := cs.Owner
 	target := r.URL.Query().Get("owner")
 	format := strings.ToLower(r.URL.Query().Get("format"))
 	super := s.auths != nil && s.auths.UserType(owner) == auth.TypeSuper

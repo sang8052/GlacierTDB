@@ -2,6 +2,83 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.12.beta] - 2026-10-28
+
+> 稳定性系列：**S3 并行上传性能重构**（单事务写路径 + 元数据缓存 + 暂存内存化）·
+> **TLS 全面上线**（3309 复用端口双模式 + MySQL 协议内升级 + mqtts/wss）·
+> **在线备份 `-backup`**（VACUUM INTO 快照，不阻塞业务）· SQLite 调优参数暴露 ·
+> S3 region 统一 / 上传回调三级配置 / virtual-host 域名兜底解析修复。
+
+### 性能（S3 并行上传专项）
+- **对象写路径单事务化**：`PutObject` 此前在全局写锁内跑约 6 次独立事务
+  （2 条隐式 DELETE 事务 + 主事务 + 提交后聚合/记账 UPSERT），并行上传全部在
+  `writeMu` 上排队；现删旧 + 插新 + 桶聚合 UPSERT 合并为**一个短事务**一次提交，
+  聚合改算术增量（省去提交后的第二次聚合 SELECT），操作计数走内存缓冲。
+  `CompleteMultipartUpload` 同样单事务化。小对象（≤ 1MB）暂存全内存（省去
+  临时文件一写一读两次磁盘 I/O；更大对象溢出 `.s3tmp` 流式处理——实测并行
+  大对象全内存驻留会推高 GC 反而降速，阈值据此调定）。
+- **[BUG 修复] 并行写 `database is locked`**：对象写事务是「先读（聚合 SELECT）
+  后写」形态，deferred 事务在 WAL 下跨连接并行提交时撞 `BUSY_SNAPSHOT`
+  （读快照过期 → 升级写锁立即 BUSY，busy_timeout 重试无效；5MB 级对象并行
+  上传实测可 500）。S3 系统库连接改为 **`_txlock=immediate`**（BEGIN 即取
+  写锁），从根上消除。
+- **请求热路径去查询**：每个 S3 请求原本要做 5-7 次元数据 SELECT + 1 次
+  `s3_keys.last_used` UPDATE（`verifySigV4` 后又 `KeyFor` 二次查库、桶行
+  `s3_buckets` 反复查 3-4 次）；现鉴权查询顺带带回 owner/policy、桶行/桶策略
+  带 2 秒 TTL 缓存（写路径主动失效）、`TouchKey` 改内存脏标记 + 定时批量落库。
+- **S3 系统库连接池 4 → 16**（读侧元数据并发不再被压到 4 连接；写仍由
+  `s3.Store` 串行化）。
+- 基准（`tests/bench/s3_bench.py`，共享构建机 docker 环境实测）：GET 并行
+  吞吐提升且更稳（小对象 ~90 ops/s → 数百 ops/s 量级）；PUT 吞吐与 v1.3.11
+  持平（该环境单写临界区本就由 SQLite 单写者主导）——收益体现在**正确性**
+  （并行不再 500）、**原子性**（单事务）与**元数据开销消除**；
+  目标硬件规格表待 v1.4.x 写入合批后按路线图实测发布。
+
+### 新增
+- **TLS 加密（v1.3.12 主特性）**：`tls:` 配置段（cert/key/min_version），
+  对 **3309 复用端口（MySQL/RESP/AMQP/MQTT/ws）与 MQTT 独立监听**生效：
+  - 同端口**明文与 TLS 客户端自动共存**（首字节 `0x16` 识别 TLS ClientHello）：
+    `redis-cli --tls -p 3309`、`amqps://`、`mqtts://`、`wss://` 直连即用；
+  - MySQL 标准客户端走**协议内升级**（握手报 `CLIENT_SSL` 能力位，
+    `--ssl-mode=REQUIRED` 等 mysql 客户端直连可用）；
+  - 证书缺失时启动失败（fail-closed，不静默降级明文）；S3 端点 TLS 维持
+    `s3.endpoints[].tls` 独立配置不变。
+- **在线备份 CLI `-backup <dir>`**（P0-1）：服务运行中对全部库（sys/ + user/）
+  逐个 `VACUUM INTO` 快照单文件——WAL 读快照**不阻塞业务写入**；全部成功后原子
+  落位（旧一代轮转为 `<target>.old`，单库失败整体中止不留半成品）；默认对产物
+  做 `integrity_check` + 对象数比对（`-backup-verify=false` 跳过）。备份产物保持
+  普通 SQLite 单文件（加密部署下为同口令密文单文件），恢复 = 拷贝文件回 db_dir。
+  配套 `deploy/glaciertdb-backup.{service,timer}` systemd 定时样例。
+- **SQLite 调优参数暴露**（P0-2）：`sqlite.wal_autocheckpoint`（默认 1000 页）与
+  `sqlite.journal_size_limit_kb`（WAL 空间回收上限，0=不限）——SD 卡 / eMMC 场景
+  「写入顺畅 ↔ WAL 膨胀 ↔ 崩溃恢复速度」的关键旋钮；生效值随启动日志打印。
+- **上传回调三级配置**：全局 `s3.callback_url` / `s3.callback_secret` → 桶级
+  `SET S3 CALLBACK`（原有）→ **请求级** `PUT / CompleteMultipartUpload` 请求头
+  `x-glacier-callback-url` / `x-glacier-callback-secret`（仅该次上传生效，
+  优先级最高）。
+- **systemd 看门狗样例**（P0-4）：`deploy/glaciertdb.service`（`Type=notify` +
+  `WatchdogSec=30`，心跳 = 程序内每 WatchdogSec/2 对系统库 `SELECT 1` 后发
+  `WATCHDOG=1`——探活探真依赖；`READY=1`/`STOPPING=1` 生命周期通知齐备；
+  含 GOMEMLIMIT 按内存档位建议）；SIGTERM 优雅退出补 `STOPPING=1`。
+- **IPv6 监听样例**：config.yaml 补 `[::]:3309`（双栈）/ `[::1]` / 指定地址
+  写法说明（S3 endpoint 与 mqtt.listen 同语法）。
+
+### 变更（S3 语义）
+- **region 不再按桶存储**：`s3_buckets.region` 列弃用（启动时幂等清空存量值），
+  签名校验与展示恒走全局 `s3.region`；`GET ?location` 返回全局值、
+  `CREATE BUCKET ... REGION` 子句仅为兼容旧脚本保留（值被忽略）。
+  存储布局 / 租户隔离本就与 region 无关，此变更消除「同桶不同 region」的歧义。
+- **virtual-host 兜底解析修复**：此前未配置 `server_names` 的域名访问（如
+  `bucket.s3.example.com`）一律按 path-style 处理——`GET /` 被误当 ListBuckets、
+  `PUT /obj` 被误当建桶。现对非 IP 多段域名把首段当桶名探一次库，**命中已建桶
+  即按 virtual-host 处理**；未命中维持 path-style（端点裸域名 `GET /` 仍正确
+  列桶）。配置了 `server_names` 的环境行为不变。
+
+### 工程化
+- 全套黑盒回归新增 `test_v1312`（写路径回归 / region 统一 / 回调三级 / vhost
+  兜底 / 并行冒烟）、TLS 双模式专项（独立容器 + 自签证书）、备份 CLI 专项；
+  `go vet` 全绿。
+
 ## [1.3.11.beta] - 2026-10-28
 
 > 大版本：S3 底层存储重写（分片直写 + 零拷贝合并 + Range 读）· 图片裁剪融合 ·

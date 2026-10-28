@@ -2,6 +2,11 @@
 # 多库模型：一个库 = db_dir 目录下一个 <库名>.db 文件
 # 所有项均可省略，省略时使用内置默认值。
 
+# 监听地址（MySQL/RESP/AMQP/MQTT 端口复用）——IPv6 示例：
+#   0.0.0.0:3309                    仅 IPv4（默认）
+#   [::]:3309                       IPv6 双栈（Linux 同时接受 v4-mapped 与 v6；推荐）
+#   [::1]:3309                      仅本机 IPv6
+#   [240e:3a6:e15:e451::d24]:3309   绑定指定全球单播 IPv6
 listen: 0.0.0.0:3309
 db_dir: /data          # 库目录（必须挂载目录，WAL 需可写）
 default_db: backup     # 连接未指定库时的默认库（不存在则自动创建）
@@ -22,7 +27,23 @@ sqlite:
   synchronous: NORMAL      # OFF | NORMAL | FULL | EXTRA（持久化强度）
   busy_timeout_ms: 5000
   cache_size_kb: 256       # 每连接页缓存
+  # --- SQLite 调优（v1.3.12；按「安全/性能/存储磨损」权衡，生效值启动日志可见）---
+  wal_autocheckpoint: 1000     # WAL 自动 checkpoint 页数（默认 1000 = SQLite 缺省；
+                               #   调大 → 写入更顺但 WAL 更大、崩溃恢复更慢；SD 卡关键旋钮）
+  journal_size_limit_kb: 65536 # WAL 文件空间回收上限（0 = 不限；建议开启，防 -wal 膨胀）
   max_result_rows: 1000000 # 单查询返回行数上限（内存保护）
+
+# TLS 加密（v1.3.12）：对 3309 复用端口（MySQL/RESP/AMQP/MQTT/ws）与 MQTT 独立
+# 监听生效；同端口明文与 TLS 客户端自动共存（首字节 0x16 识别 TLS）：
+#   redis-cli --tls -p 3309 / amqps:// / mqtts:// / wss:// 直连；
+#   MySQL 标准客户端（--ssl-mode=REQUIRED）走握手协议内升级。
+# 证书缺失时启动失败（fail-closed，不静默降级明文）。
+# S3 端点 TLS 用 s3.endpoints[].tls / cert_file / key_file 单独配置。
+tls:
+  enable: false
+  cert_file: ""        # 例：/data/certs/glaciertdb.pem
+  key_file: ""         # 例：/data/certs/glaciertdb.key
+  min_version: "1.2"   # 1.2 | 1.3
 
 # 并发模型：读并发多线程（可按库限流）；写单库单线程互斥（多库写入并行）。
 # 均可被管理面热改（USE GlacierTDB; SET GLOBAL_THREADS=32; 重启失效回到此处值）
@@ -110,7 +131,7 @@ mq:
   server_version: "3.13.0"   # 对外宣称的 RabbitMQ 版本串（Connection.Start server-properties，v1.3.3）
   mqtt:                   # MQTT 接入（v1.3.3）：桥接进 mqtt topic 交换机，认证走统一账号
     enable: true          # 开关（依赖 mq.enable）
-    listen: ""            # 可选独立监听（tcp+ws 同端口，如 0.0.0.0:1883；空 = 仅 3309 复用）
+    listen: ""            # 可选独立监听（tcp+ws 同端口，如 0.0.0.0:1883 或 [::]:1883；空 = 仅 3309 复用）
     ws_path: /mqtt        # 3309 上 WebSocket 升级路径
 
 # 时序冷压缩与固化（v1.3.3）：points 表超龄数据自动 gzip 固化进 points_cold，
@@ -124,12 +145,15 @@ timeseries:
 s3:
   enable: false             # 开关（默认关）
   region: "*"               # '*' / 空 = 客户端任意 region 或不传；具体值 = 签名 scope 必须一致
+                            # v1.3.12：region 仅作为全局签名校验维度，桶不再单独存储 region
   endpoints:
     - listen: 0.0.0.0:9000          # HTTP（可配多个端点；HTTPS 独立端口加 tls: true + 证书）
+      # listen: "[::]:9000"         # IPv6 / 双栈监听写法（同 3309）
       # tls: true
       # cert_file: /data/certs/wildcard.pem   # 端点泛域名证书（SNI 兜底）
       # key_file: /data/certs/wildcard.key
-      server_names: []              # virtual-host 后缀（客户端访问主机名，如 s3.example.com）
+      server_names: []              # virtual-host 后缀（客户端访问主机名，如 s3.example.com）；
+                                    # 未配置时域名访问也能按「首段命中已建桶」自动识别（v1.3.12）
   max_object_mb: 16384      # 单对象上限（默认 16GB；-1 = 不限制，v1.3.5）
   abort_incomplete_days: 7  # 未完成分片上传自动回收天数（v1.3.5；0 = 关闭）
   inline_max_kb: 64         # 内联存储阈值（超过走分块表）
@@ -141,7 +165,11 @@ s3:
     per_user_conns: 0       # 单用户并发连接上限（超限 503 SlowDown）
   bucket_limits: {}         # 按桶覆盖，如 backup: { per_conn_bps: 1048576 }
   lifecycle_interval_sec: 3600   # 生命周期（自动删除）扫描周期
-  callback_secret: ""       # 上传回调默认 HMAC 签名密钥（桶级 SET S3 CALLBACK 覆盖）
+  # --- 上传回调三级配置（v1.3.12）：请求级 > 桶级 > 全局 ---
+  # 请求级：PUT / CompleteMultipartUpload 带 x-glacier-callback-url / -secret 请求头
+  # 桶级：SET S3 CALLBACK <bucket> URL '<url>' [SECRET '<s>']
+  callback_url: ""          # 全局默认回调 URL（空 = 关闭）
+  callback_secret: ""       # 全局默认 HMAC 签名密钥
   # image_font: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf  # 图片文字 ttf 字体（空=内置 ASCII）
   image_cache: true         # 图片预处理结果磁盘缓存（GET 加工链路；<db_dir>/sys/gimg_cache/）
   image_cache_mb: 1024      # 缓存容量上限（MB；超出按最久未用淘汰；-1 = 不限）

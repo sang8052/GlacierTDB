@@ -15,13 +15,27 @@ import (
 
 // notifyPut 对象写入完成回调：POST JSON（HMAC 签名、退避重试，fire-and-forget）。
 // 通道与用户系统告警一致：X-Glacier-Signature: sha256=<hmac_hex>。
-func (s *Server) notifyPut(b Bucket, m ObjectMeta, replaced bool) {
-	if b.CallbackURL == "" {
-		return
+// URL / 密钥三级优先（v1.3.12）：请求级头 x-glacier-callback-url[-secret] >
+// 桶级（SET S3 CALLBACK）> 全局（s3.callback_url / s3.callback_secret）。
+func (s *Server) notifyPut(b Bucket, m ObjectMeta, replaced bool, ov *callbackOverride) {
+	url, secret := "", ""
+	if ov != nil && ov.url != "" {
+		url, secret = ov.url, ov.secret
 	}
-	secret := b.CallbackSecret
+	if url == "" {
+		url = b.CallbackURL
+	}
+	if url == "" {
+		url = s.cfg.S3.CallbackURL
+	}
+	if secret == "" {
+		secret = b.CallbackSecret
+	}
 	if secret == "" {
 		secret = s.cfg.S3.CallbackSecret
+	}
+	if url == "" {
+		return
 	}
 	payload := map[string]any{
 		"event":        "object_created",
@@ -38,7 +52,7 @@ func (s *Server) notifyPut(b Bucket, m ObjectMeta, replaced bool) {
 		body, _ := json.Marshal(payload)
 		for attempt, backoff := range []time.Duration{0, time.Second, 5 * time.Second, 15 * time.Second} {
 			time.Sleep(backoff)
-			req, err := http.NewRequest(http.MethodPost, b.CallbackURL, bytes.NewReader(body))
+			req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 			if err != nil {
 				return
 			}
@@ -57,7 +71,7 @@ func (s *Server) notifyPut(b Bucket, m ObjectMeta, replaced bool) {
 					return
 				}
 			}
-			logx.Warnf("s3 upload callback %s attempt %d failed (bucket=%s key=%s)", b.CallbackURL, attempt+1, b.Name, m.Key)
+			logx.Warnf("s3 upload callback %s attempt %d failed (bucket=%s key=%s)", url, attempt+1, b.Name, m.Key)
 		}
 	}()
 }

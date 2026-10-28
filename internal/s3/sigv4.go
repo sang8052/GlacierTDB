@@ -51,6 +51,8 @@ type credScope struct {
 	Presigned     bool
 	Expires       int    // 预签名有效秒数
 	ReqDateTime   string // yyyymmddThhmmssZ
+	Owner         string // 密钥属主（v1.3.12：鉴权时顺带带出，免调用方二次查库）
+	Policy        string // 密钥级策略 JSON
 }
 
 // awsURIEncode AWS 规则百分号编码（unreserved: A-Za-z0-9-_.~；encodeSlash=false 时保留 /）。
@@ -365,8 +367,8 @@ func verifySigV4(r *http.Request, region string,
 		return cs, "", &s3Error{Code: "InvalidAccessKeyId", Status: 403,
 			Msg: "The AWS Access Key Id you provided does not exist in our records: " + cs.AK}
 	}
-	_ = owner
-	_ = policy
+	cs.Owner = owner
+	cs.Policy = policy
 	if status != "active" {
 		return cs, "", &s3Error{Code: "InvalidAccessKeyId", Status: 403,
 			Msg: "The AWS Access Key Id is " + status}

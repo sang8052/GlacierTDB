@@ -116,6 +116,7 @@ func NewBackend(cfg *config.Config) (*Backend, error) {
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", fmt.Sprintf("synchronous(%d)", cfg.SQLite.SynchronousLevel()))
 	q.Add("_pragma", fmt.Sprintf("cache_size(-%d)", cfg.SQLite.CacheSizeKB))
+	addTuningPragmas(q, cfg)
 	b.dsnOpts = q.Encode()
 	b.encrypt = cfg.Security.Encrypt
 	b.passphrase = cfg.Security.Passphrase
@@ -323,6 +324,7 @@ func OpenAuthDBDirect(cfg *config.Config) (*sql.DB, error) {
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", fmt.Sprintf("synchronous(%d)", cfg.SQLite.SynchronousLevel()))
 	q.Add("_pragma", fmt.Sprintf("cache_size(-%d)", cfg.SQLite.CacheSizeKB))
+	addTuningPragmas(q, cfg)
 	b := &Backend{
 		dir:       cfg.DBDir,
 		encrypt:   cfg.Security.Encrypt,
@@ -333,15 +335,46 @@ func OpenAuthDBDirect(cfg *config.Config) (*sql.DB, error) {
 	return b.openFileRetry(b.fileFor(SystemAuthDB), 2)
 }
 
+// addTuningPragmas SQLite 调优参数注入（v1.3.12 P0-2）：wal_autocheckpoint 与
+// journal_size_limit 可按硬件权衡（SD 卡磨损 / WAL 膨胀 / 崩溃恢复速度）。
+func addTuningPragmas(q url.Values, cfg *config.Config) {
+	if cfg.SQLite.WalAutocheckpoint > 0 {
+		q.Add("_pragma", fmt.Sprintf("wal_autocheckpoint(%d)", cfg.SQLite.WalAutocheckpoint))
+	}
+	if cfg.SQLite.JournalSizeLimitKB > 0 {
+		q.Add("_pragma", fmt.Sprintf("journal_size_limit(%d)", cfg.SQLite.JournalSizeLimitKB<<10))
+	}
+}
+
+// openFileRetryDSN 带 DSN 覆盖的重试打开（S3 库注入 _txlock=immediate 用）。
+func (b *Backend) openFileRetryDSN(dsn string, attempts int) (*sql.DB, error) {
+	var db *sql.DB
+	var err error
+	for i := 0; i < attempts; i++ {
+		db, err = driver.Open(dsn, registerCompatFuncs)
+		if err == nil {
+			if _, perr := db.Exec("SELECT 1"); perr == nil {
+				return db, nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return driver.Open(dsn, registerCompatFuncs)
+}
+
 // OpenS3DB 打开对象存储系统库（glacier_s3.db，v1.1.0），供 s3 包使用。
-// 对象存储需并发读 + 流式取内容，物理连接池放宽到 4（写仍由 s3.Store 串行化）。
+// 对象存储需并发读 + 流式取内容，物理连接池放宽到 16（v1.3.12：并行上传/
+// 下载每请求 3-5 次元数据查询，4 连接在读侧形成瓶颈；写仍由 s3.Store 串行化）。
+// v1.3.12：事务一律 BEGIN IMMEDIATE——对象写事务是「先读(聚合 SELECT)后写」，
+// deferred 事务在 WAL 下跨连接并行提交时会撞 BUSY_SNAPSHOT（读快照过期，
+// 升级写锁立即 BUSY，重试无效）；立即取写锁从根上消除该类等待/报错。
 func (b *Backend) OpenS3DB() (*sql.DB, error) {
-	db, err := b.openFileRetry(b.fileFor(SystemS3DB), 2)
+	db, err := b.openFileRetryDSN(b.dsnFor(b.fileFor(SystemS3DB))+"&_txlock=immediate", 2)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(4)
-	db.SetMaxIdleConns(4)
+	db.SetMaxOpenConns(16)
+	db.SetMaxIdleConns(16)
 	return db, nil
 }
 

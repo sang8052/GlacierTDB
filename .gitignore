@@ -11,3 +11,13 @@ bugs/
 
 # 智能体工作指南（本地保留，不入仓库）
 AGENTS.md
+
+# 证书与私钥（本地留存，绝不入仓库）
+certs/
+
+# 临时调试脚本 / 上传工具（含线上凭据）
+py_debug/
+
+# 压测临时脚本
+tests/par_stress.py
+tests/imgs/

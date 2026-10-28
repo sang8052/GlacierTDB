@@ -1,0 +1,38 @@
+# GlacierTDB systemd 部署样例（v1.3.12）
+# 安装：cp deploy/glaciertdb.service /etc/systemd/system/ && systemctl daemon-reload
+#      systemctl enable --now glaciertdb
+#
+# 看门狗：Type=notify + WatchdogSec=30，程序内每 WatchdogSec/2 对系统库做一次
+# SELECT 1 并发 WATCHDOG=1 心跳（探活探真依赖：存储层不可用即停发心跳，
+# 30 秒内被 systemd 自动重启）。Restart=always + StartLimitIntervalSec 防崩溃风暴。
+#
+# 内存建议（GOMEMLIMIT，防 OOM kill 后未落盘批次悬空）：
+#   1GB 设备 → Environment=GOMEMLIMIT=700MiB
+#   2GB 设备 → Environment=GOMEMLIMIT=1536MiB
+#   4GB 设备 → Environment=GOMEMLIMIT=3GiB
+
+[Unit]
+Description=GlacierTDB Server (SQLite-based MySQL/Redis/S3 compatible storage)
+Documentation=https://github.com/sang8052/GlacierTDB
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
+ExecStart=/data/GlacierTDB/glaciertdb -config /data/GlacierTDB/config.yaml
+WorkingDirectory=/data/GlacierTDB
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=120
+StartLimitBurst=5
+# 按设备内存档位调整（见上方建议）
+Environment=GOMEMLIMIT=1536MiB
+# 优雅退出：SIGTERM 后程序发 STOPPING=1 并退出（WAL 崩溃安全，重启自动恢复）
+KillSignal=SIGTERM
+TimeoutStopSec=15
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

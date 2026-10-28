@@ -180,6 +180,7 @@ echo "---- test_v138.py ----"; python /tests/test_v138.py || rc=1
 echo "---- test_v1310.py ----"; python /tests/test_v1310.py || rc=1
 
 echo "---- test_v1311.py ----"; python /tests/test_v1311.py || rc=1
+echo "---- test_v1312.py ----"; python /tests/test_v1312.py || rc=1
 exit $rc
 EOF
 )
@@ -316,6 +317,74 @@ else
     echo "[FAIL] docker restart $PROXY 失败"
     record "test_v120 restart persistence : FAIL"
 fi
+
+# ----------------------------------------------------------------------------
+# 3.6 v1.3.12：在线备份 CLI + TLS 双模式专项
+# ----------------------------------------------------------------------------
+step "步骤 3.6/4: v1.3.12 在线备份 CLI / TLS 双模式"
+
+# ① 在线备份（服务运行中）：全部库 VACUUM INTO 快照 → integrity_check 校验
+BK_OUT=$(docker exec "$PROXY" /app/glaciertdb -config /app/config.yaml -db-dir /data \
+    -backup /data/backup-test -backup-verify=true 2>&1 || true)
+echo "$BK_OUT" | tail -8 | tee "$LOG_DIR/backup_cli.out"
+BK_FILES=$(docker exec "$PROXY" sh -c 'ls /data/backup-test/*.db 2>/dev/null | wc -l' 2>/dev/null || echo 0)
+if echo "$BK_OUT" | grep -q "backup done" && [ "$BK_FILES" -ge 1 ]; then
+    record "CLI -backup 在线备份 + 校验     : PASS"
+else
+    record "CLI -backup 在线备份 + 校验     : FAIL"
+fi
+# 备份后服务写路径仍健康（REPLACE 保证重复执行幂等）
+if docker run --rm -i --network "$NET" "$MYSQL_IMG" mysql "${MYSQL_AUTH_ARGS[@]}" \
+        -e "source /dev/stdin" <<< "USE backup; CREATE TABLE IF NOT EXISTS bk_alive_v1312(id INT PRIMARY KEY); REPLACE INTO bk_alive_v1312 VALUES(1);" >/dev/null 2>&1; then
+    record "备份后服务写路径健康           : PASS"
+else
+    record "备份后服务写路径健康           : FAIL"
+fi
+docker exec "$PROXY" sh -c 'rm -rf /data/backup-test' >/dev/null 2>&1 || true
+
+# ② TLS 双模式：自签证书起独立容器（tls.enable=true），验证
+#    TLS-first RESP / 同端口明文 RESP / MySQL over TLS / 明文 MySQL 共存
+TLSC=/tmp/gt-tls-$$
+rm -rf "$TLSC" && mkdir -p "$TLSC/data" "$TLSC/certs"
+openssl req -x509 -newkey rsa:2048 -keyout "$TLSC/certs/key.pem" -out "$TLSC/certs/cert.pem" \
+    -days 2 -nodes -subj "/CN=gt-tls" \
+    -addext "subjectAltName=DNS:gt-tls,DNS:proxy,DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+cat > "$TLSC/config.yaml" <<CFG
+listen: 0.0.0.0:3399
+db_dir: /data
+default_db: t
+auth:
+  user: glacier
+  password: "iloveyou~"
+kv:
+  enable: true
+mysql:
+  enable: true
+mq:
+  enable: false
+security:
+  encrypt: false
+tls:
+  enable: true
+  cert_file: /certs/cert.pem
+  key_file: /certs/key.pem
+CFG
+TN="gt-tls-$$"
+docker rm -f "$TN" >/dev/null 2>&1 || true
+docker run -d --name "$TN" --network "$NET" --network-alias gt-tls \
+    -v "$TLSC/config.yaml":/app/config.yaml -v "$TLSC/data":/data \
+    -v "$TLSC/certs":/certs glaciertdb:latest >/dev/null 2>&1
+sleep 3
+if docker run --rm --network "$NET" -v "$TESTS_DIR":/tests:ro -v "$TLSC/certs":/certs:ro "$PY_IMG" bash -c \
+    "pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple PyMySQL >/dev/null 2>&1 && python /tests/test_v1312_tls.py gt-tls 3399 /certs/cert.pem" \
+    2>&1 | tee "$LOG_DIR/tls_test.out" | grep -q "0 fail"; then
+    record "TLS 双模式（RESP/MySQL/明文共存）: PASS"
+else
+    record "TLS 双模式（RESP/MySQL/明文共存）: FAIL"
+fi
+docker logs "$TN" 2>&1 | grep -E "tls:|listening" | head -4 | tee "$LOG_DIR/tls_server.log" || true
+docker rm -f "$TN" >/dev/null 2>&1 || true
+rm -rf "$TLSC"
 
 # ----------------------------------------------------------------------------
 # 4. 汇总

@@ -231,7 +231,6 @@ func (h *Handler) s3CreateBucket(toks []string) (*mysql.Result, bool, error) {
 	}
 	name := toks[2]
 	owner := h.cfg.S3.DefaultOwner
-	region := ""
 	versioning, objectLock := false, false
 	for i := 3; i < len(toks); i++ {
 		switch strings.ToUpper(toks[i]) {
@@ -239,8 +238,10 @@ func (h *Handler) s3CreateBucket(toks []string) (*mysql.Result, bool, error) {
 			i++
 			owner = argVal(toks, i)
 		case "REGION":
+			// v1.3.12：桶不再单独存 region（签名校验与存储均走全局配置），
+			// 子句仅为兼容旧脚本保留，值被忽略
 			i++
-			region = argVal(toks, i)
+			_ = argVal(toks, i)
 		case "VERSIONING":
 			i++
 			versioning = strings.EqualFold(argVal(toks, i), "ON")
@@ -255,13 +256,13 @@ func (h *Handler) s3CreateBucket(toks []string) (*mysql.Result, bool, error) {
 			return nil, true, mysql.NewError(1105, fmt.Sprintf("no such account %q (bucket owner must be an existing user)", owner))
 		}
 	}
-	b, err := h.s3store.CreateBucket(name, owner, region, versioning, objectLock)
+	b, err := h.s3store.CreateBucket(name, owner, "", versioning, objectLock)
 	if err != nil {
 		return nil, true, s3ErrToMySQL(err)
 	}
 	logx.Infof("s3: bucket %s created by conn %d (owner=%s)", b.Name, h.connID, b.Owner)
 	res, err := meta.SimpleRS([]string{"bucket", "owner", "region", "versioning", "object_lock"},
-		[][]any{{b.Name, b.Owner, b.Region, b2s(b.Versioning), b2s(b.ObjectLock)}})
+		[][]any{{b.Name, b.Owner, h.s3store.DisplayRegion(), b2s(b.Versioning), b2s(b.ObjectLock)}})
 	return res, true, err
 }
 
@@ -286,9 +287,10 @@ func (h *Handler) s3DropBucket(toks []string) (*mysql.Result, bool, error) {
 }
 
 func (h *Handler) s3ShowBuckets() (*mysql.Result, bool, error) {
+	reg := h.s3store.DisplayRegion() // v1.3.12：region 全局统一展示
 	var rows [][]any
 	for _, b := range h.s3store.ListBuckets("") {
-		rows = append(rows, []any{b.Name, b.Owner, b.Region, b2s(b.Versioning), b2s(b.ObjectLock),
+		rows = append(rows, []any{b.Name, b.Owner, reg, b2s(b.Versioning), b2s(b.ObjectLock),
 			b.ObjectCount, b.StorageBytes, b.CallbackURL, b.CreatedTS})
 	}
 	res, err := meta.SimpleRS([]string{"bucket", "owner", "region", "versioning", "object_lock",

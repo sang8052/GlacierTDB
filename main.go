@@ -4,8 +4,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"time"
 	"path/filepath"
 	"strings"
@@ -33,6 +35,8 @@ func main() {
 		forceUnlock = flag.Bool("force-unlock", false, "db 目录锁被异常占用时强制解锁启动（拒绝抢活进程的锁）")
 		vacuumMode  = flag.Bool("vacuum", false, "CLI 真空模式：VACUUM 库目录（服务必须停止；与目录锁互斥）")
 		vacuumDB    = flag.String("vacuum-db", "", "仅 VACUUM 指定库（默认目录内全部库）")
+		backupDir   = flag.String("backup", "", "CLI 在线备份：全部库 VACUUM INTO 目标目录（服务运行中可用；v1.3.12）")
+		backupChk   = flag.Bool("backup-verify", true, "备份产物 integrity_check + 对象数校验（默认开）")
 		unlockUser  = flag.String("unlock-user", "", "CLI 解锁账号（清除自动锁/手动锁/失败计数；服务运行中可用）")
 		unlockIP    = flag.String("unlock-ip", "", "CLI 解锁 IP（清除自动锁/失败计数/防火墙封锁）")
 		showLocks   = flag.Bool("show-locks", false, "CLI 查看当前防爆破锁定列表（账号 + IP）")
@@ -70,6 +74,13 @@ func main() {
 	}
 	logx.SetLevel(logx.ParseLevel(cfg.Log.Level))
 
+	// CLI 在线备份模式（v1.3.12 P0-1）：不抢目录锁（WAL 多进程读安全），
+	// 全部库 VACUUM INTO 快照单文件；全部成功后原子落位目标目录
+	if *backupDir != "" {
+		cliBackup(cfg, *backupDir, *backupChk)
+		return
+	}
+
 	// CLI 解锁 / 查锁模式：旁路 dirlock（服务运行中可用），直连 glacier_auth 系统库
 	// 做小事务（WAL 多进程并发安全），完成后退出、不启动任何监听。
 	if *unlockUser != "" || *unlockIP != "" || *showLocks {
@@ -91,9 +102,10 @@ func main() {
 		logx.Infof("memory limit set to %d MB (soft, GOMEMLIMIT)", cfg.MemoryLimitMB)
 	}
 
-	logx.Infof("GlacierTDB %s starting: version=%s db_dir=%s default_db=%s sync=%s busy_timeout=%dms cache=%dKB",
+	logx.Infof("GlacierTDB %s starting: version=%s db_dir=%s default_db=%s sync=%s busy_timeout=%dms cache=%dKB wal_autocheckpoint=%d journal_size_limit=%dKB tls=%v",
 		config.GlacierVersion, cfg.ServerVersion, cfg.DBDir, cfg.DefaultDB, cfg.SQLite.Synchronous,
-		cfg.SQLite.BusyTimeoutMs, cfg.SQLite.CacheSizeKB)
+		cfg.SQLite.BusyTimeoutMs, cfg.SQLite.CacheSizeKB,
+		walCheckpointDisplay(cfg.SQLite.WalAutocheckpoint), cfg.SQLite.JournalSizeLimitKB, cfg.TLS.Enable)
 
 	// db 目录唯一锁：服务与 CLI（-vacuum）互斥，同一目录仅一个进程
 	lock, lerr := dirlock.Acquire(cfg.DBDir, *forceUnlock)
@@ -211,17 +223,116 @@ func main() {
 			cfg.Timeseries.ColdAfterDays, cfg.Timeseries.ColdScanMinSec)
 	}
 
+	// 看门狗（v1.3.12 P0-4）：systemd Type=notify + WatchdogSec 部署下，
+	// 启动就绪发 READY=1，之后周期心跳 WATCHDOG=1——心跳 = 一次 SQLite
+	// SELECT 1（探真依赖，探活要探存储层）；NOTIFY_SOCKET 未设置时全部空转
+	sdNotify("READY=1")
+	go watchdogLoop(backend)
+
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
 		logx.Infof("shutting down")
+		sdNotify("STOPPING=1")
 		os.Exit(0)
 	}()
 
 	if err := proxy.Run(cfg, backend, authStore, s3store, s3srv, kvstore, mqstore, cmeta); err != nil {
 		logx.Errorf("listen %s: %v", cfg.Listen, err)
+		sdNotify("STOPPING=1")
 		os.Exit(1)
+	}
+}
+
+// walCheckpointDisplay 调优项展示值（0 = SQLite 默认 1000）。
+func walCheckpointDisplay(v int) int {
+	if v == 0 {
+		return 1000
+	}
+	return v
+}
+
+// ---------------------------------------------------------------------------
+// 在线备份 CLI（v1.3.12 P0-1）
+// ---------------------------------------------------------------------------
+
+func cliBackup(cfg *config.Config, target string, verify bool) {
+	start := time.Now()
+	res, err := sqlite.BackupAll(cfg, target, verify)
+	if err != nil {
+		logx.Errorf("backup failed: %v（半成品临时目录已被清理，不影响现有备份）", err)
+		os.Exit(1)
+	}
+	var total int64
+	for _, r := range res {
+		total += r.Size
+		fmt.Printf("%-24s %10d bytes  %s\n", r.File, r.Size, r.Cost.Round(time.Millisecond))
+	}
+	fmt.Printf("backup done: %d dbs, %d bytes total, cost %s -> %s\n",
+		len(res), total, time.Since(start).Round(time.Millisecond), target)
+}
+
+// ---------------------------------------------------------------------------
+// systemd 看门狗（sd_notify 最小实现，v1.3.12 P0-4）
+// ---------------------------------------------------------------------------
+
+// sdNotify 向 NOTIFY_SOCKET 写一条状态（未设置/发送失败静默——裸跑无 systemd）。
+func sdNotify(state string) {
+	sock := os.Getenv("NOTIFY_SOCKET")
+	if sock == "" {
+		return
+	}
+	if !strings.HasPrefix(sock, "@") {
+		c, err := net.DialTimeout("unixgram", sock, time.Second)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = c.Write([]byte(state))
+		return
+	}
+	// @ 开头的抽象命名空间 socket（Linux）：以 NUL 打头地址
+	c, err := net.DialTimeout("unixgram", "\x00"+sock[1:], time.Second)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+	_, _ = c.Write([]byte(state))
+}
+
+// watchdogLoop 心跳：每 10 秒对系统库做一次 SELECT 1，成功即 WATCHDOG=1。
+// WatchdogSec 建议 30（心跳间隔的一半）——探活覆盖存储层真实可用性。
+func watchdogLoop(backend *sqlite.Backend) {
+	sock := os.Getenv("NOTIFY_SOCKET")
+	watchdogUsec := os.Getenv("WATCHDOG_USEC")
+	if sock == "" || watchdogUsec == "" {
+		return // 非 systemd notify 部署：空转
+	}
+	iv := 10 * time.Second
+	if usec, err := strconv.ParseInt(watchdogUsec, 10, 64); err == nil && usec > 0 {
+		// 心跳间隔 = WatchdogSec / 2，下限 2s、上限 30s
+		half := time.Duration(usec/2) * time.Microsecond
+		if half < 2*time.Second {
+			half = 2 * time.Second
+		}
+		if half > 30*time.Second {
+			half = 30 * time.Second
+		}
+		iv = half
+	}
+	db, err := backend.OpenSystemDB()
+	if err != nil {
+		return
+	}
+	defer db.Close()
+	t := time.NewTicker(iv)
+	defer t.Stop()
+	for range t.C {
+		if _, err := db.Exec("SELECT 1"); err != nil {
+			continue // 存储层异常：停发心跳，等 systemd WatchdogSec 到期重启
+		}
+		sdNotify("WATCHDOG=1")
 	}
 }
 

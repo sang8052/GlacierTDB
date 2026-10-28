@@ -4,16 +4,43 @@
 > 以 **SQLite** 为唯一存储内核的**多中间件一体机**：MySQL 协议网关 + 时序冷库 + S3 对象存储 +
 > Redis 键值队列 + RabbitMQ 消息队列（**全部已实现**）——**一个静态二进制、一个数据目录、
 > 一个端口多协议**。面向工控机 / 物联网边缘环境，一台设备替代 MySQL + Redis + RabbitMQ + MinIO
-> 的组合：备份 = 拷贝目录，迁移 = 拷贝文件。
+> 的组合：**运行中安全备份 = `glaciertdb -backup <dir>`（v1.3.12 起，不阻塞业务写入）；
+> 停机状态下备份 = 拷贝目录，迁移 = 拷贝文件**。
 
 > 🤖 **本项目全程由 GLM5.3 驱动。**
 
-**当前版本：v1.3.11.beta**
+**当前版本：v1.3.12.beta**
 
 > **版本基调（v1.3.10 起）**：FEATURE 整合已收官（MySQL 网关 / 时序冷库 / S3 / Redis / RabbitMQ / MQTT / 多租户 / 静态加密全量交付）；
 > **自 1.3.10 版本开始，项目转向稳定性更新**——以性能优化、BUG 修复与运维体验为主，不再新增大特性。
 > · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
 （三平台 + SHA256SUMS）· 许可：MIT
+
+---
+
+## 🎯 定位前提（先读这个）
+
+GlacierTDB 的所有设计取舍基于以下共识：
+
+1. **目标环境是 1~4 核、1~8GB RAM、SD 卡 / eMMC / SATA SSD 的工控机与轻量服务器，不是数据中心**；
+2. **单机架构是产品决策，不是待修复缺陷**——容灾逻辑 = 盒子可弃、数据北上（备份北上传中心）、换机重部署；
+3. **"大而全"是特性**：一个二进制替代 MySQL + Redis + RabbitMQ + MinIO 的组合部署，降低边缘环境的运维负担；
+4. **无人值守是常态**：没有 DBA、没有运维、出问题需要现场出差。因此弱硬件上每个模块的资源纪律比服务器环境更严格，不是更宽松。
+
+### ❌ 明确不做清单
+
+以下事项已评估并**明确不做**，避免重复讨论（详见 [bugs/分析建议.md](bugs/分析建议.md)）：
+
+| 事项 | 不做的理由 |
+| --- | --- |
+| 工业协议接入 | 职责归数据采集系统。GlacierTDB 是中间件，不做 PLC 侧的活 |
+| armv7 支持 | 算力无法支撑全套服务，32 位生态正在消亡 |
+| 高可用 / 副本 / 分片 | 与单机定位冲突。容灾由部署架构（数据北上传中心）解决 |
+| 环境变量配置 | 非必需。目标用户具备写自动化脚本的能力，YAML 已足够 |
+| 启动日志打印兼容清单 | 启动日志职责是版本 / 环境 / 依赖 / 核心配置，使用说明属于手册 |
+
+> 由此推导的硬边界：**单实例单写者**；传输加密走 v1.3.12 起的内置 TLS（3309 复用端口 +
+> MySQL 协议内升级 + S3 端点独立证书），未启用 TLS 时仅限内网可信环境（详见文末「已知限制」）。
 
 | 📄 文档 | 说明 |
 | --- | --- |
@@ -260,7 +287,8 @@ services:
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o glaciertdb .
 ```
 
-> ⚠️ **数据目录必须可写，且挂载目录而非单个文件**；无 TLS，**仅限内网可信环境**（公网请前置认证代理）；
+> ⚠️ **数据目录必须可写，且挂载目录而非单个文件**；默认无 TLS（内网可信环境），公网暴露请开启
+> v1.3.12 内置 TLS（`tls:` 配置段，见配置手册）或前置认证代理；
 > 首次启动后 `USE GlacierTDB; SET PASSWORD='<强口令>';`。部署/升级/备份见 [docs/部署运维.md](docs/部署运维.md)。
 
 ### 连接测试（五种客户端）
@@ -367,6 +395,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | --- | --- | --- |
 | v1.3.10 | **稳定性更新首个版本**：图片管道多核提速 + 结果磁盘缓存；防爆破本机回环豁免 + CLI 解锁；`mysql.enable` 开关；默认配置路径 `config.yaml`；boto3 CRC32 trailer 兼容 | ✅ |
 | v1.3.11 | **S3 存储层重写（8MB 分片直写 + 零拷贝合并 + manifest Range 206）· 图片裁剪融合 blend · SUBMIT S3 文本/文件检索与异步删除 · SHOW S3 SPACE / S3 VACUUM 空间回收 · 时序大表谓词（TS_UNIT 秒/毫秒/微秒自动换算，冷/rollup 不再固定 points）· **租户隔离安全大修**（copy-source 越权 / DROP DATABASE / SUBMIT 绕权 / WITH-DML 误判 / 管理面禁入 / 任务属主）· S3 读记账内存化 + LIST 索引区间化** | ✅ |
+| v1.3.12 | **S3 并行上传性能重构（写路径单事务化 + 请求热路径元数据缓存 + 暂存内存化 + 连接池 4→16）· TLS 全面上线（3309 双模式共存 + MySQL 协议内升级 + mqtts/wss）· 在线备份 CLI `-backup`（VACUUM INTO 快照不阻塞业务）· SQLite 调优暴露（wal_autocheckpoint / journal_size_limit）· S3 region 统一 + 回调三级配置 + virtual-host 域名兜底解析修复 · systemd 看门狗样例** | ✅ |
 
 历史版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)。
 
@@ -376,7 +405,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 
 **协议层**
 
-- 不支持预处理语句（`COM_STMT_*`），客户端走文本协议；不支持 TLS / XA / `LOAD DATA` / `LOCK TABLES` / 复制协议（公网暴露请前置认证代理）；
+- 不支持预处理语句（`COM_STMT_*`），客户端走文本协议；不支持 XA / `LOAD DATA` / `LOCK TABLES` / 复制协议；TLS 已于 v1.3.12 支持（3309 双模式 + MySQL 协议内升级 + S3 端点独立证书），未启用时公网暴露请前置认证代理；
 - S3 multipart 完整支持 **UploadPartCopy 拷贝分片**（`x-amz-copy-source [+range]`)）与**未完成会话自动回收**（`s3.abort_incomplete_days`，默认 7 天，0=关闭）；单对象上限 `max_object_mb`（**`-1` = 不限制**)）；
 - Redis 为 RESP2（`HELLO` 应答 `proto:2` 自动降级不升级 RESP3；BLPOP/BRPOP 单连接串行阻塞，`timeout=0` 无限等待；事务为队列执行语义无 WATCH；SCAN 为快照游标——遍历期间写入可能漏见/重见）；
 - AMQP 为基本队列（无镜像/仲裁队列、无事务性队列；confirm 为逐条 ack、无 `immediate` 位；pika 1.4.4 客户端 close() 有自身 bug，见消息队列手册）。
@@ -390,8 +419,11 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 **部署层**
 
 - 单实例单写者（红线：不做多机/复制）；`db_dir` 必须可写；
-- 无 TLS、无列级权限——仅限内网可信环境；
-- 备份 = 拷贝 `db_dir`（务必含 `glacier.json` / `glacier_s3.key` / `glacier_rsa.pem` 等密钥文件，见部署运维手册）；底层文件默认 adiantum 加密（固定口令)），备份包即密文，恢复需同版本服务；库文件分类存放：`sys/`（系统库）与 `user/`（用户库，自动归类）。
+- TLS 为 v1.3.12 新增（默认关）；无列级权限——未启用 TLS 时仅限内网可信环境；
+- **备份两条路径**：运行中安全备份 = `glaciertdb -backup <dir>`（v1.3.12 起，全部库
+  VACUUM INTO 快照单文件，不阻塞业务写入，配套 systemd timer 样例）；冷拷贝 = 停机后
+  直接拷贝 `db_dir`（运行中直接拷贝可能得到主库与 WAL 不一致的组合）；
+  （务必含 `glacier.json` / `glacier_s3.key` / `glacier_rsa.pem` 等密钥文件，见部署运维手册）；底层文件默认 adiantum 加密（固定口令）），备份包即密文，恢复需同版本服务；库文件分类存放：`sys/`（系统库）与 `user/`（用户库，自动归类）。
 
 ---
 
@@ -399,7 +431,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 
 ```
 GlacierTDB/
-├── main.go               # 入口：配置/后端/监听启动（-vacuum / -unlock-user / -unlock-ip / -show-locks CLI）
+├── main.go               # 入口：配置/后端/监听启动（-backup 在线备份 / -vacuum / -unlock-* / -show-locks CLI + systemd 看门狗）
 ├── config.yaml           # 带注释配置样例（全部配置段；默认配置路径即 config.yaml）
 ├── internal/
 │   ├── proxy/            # 3309 端口复用（mode 声明 + 嗅探 + mysql.enable 门控）与连接生命周期
