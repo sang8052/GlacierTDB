@@ -1307,6 +1307,166 @@ func (s *Store) copyObjectRefs(srcBucket, srcKey string, m ObjectMeta, dstBucket
 	return out, nil
 }
 
+// MoveObject 原子移动（x-glacier-move，v1.3.14 §3）：同一事务内「建新 + 删源」，
+// 外部观察不到中间态。语义定稿：
+//   - 同桶改名 = 对象/分块引用行整体 UPDATE key（数据零触碰）；
+//   - 跨桶 = 源全部版本行 + 引用行平移到目标表（chunk 引用使然零数据拷贝，
+//     池 refcnt 不动——引用行平移天然平衡）；
+//   - versioning 桶：全部版本行随迁，**不产生 delete marker**（move = 改名，非删除）；
+//   - WORM / legal_hold：桶内 move 允许（retention 元数据随行迁移）、跨桶 move 拒绝
+//     （保留策略绑定桶配置）；
+//   - 覆盖目标已存在对象语义与 CopyObject 一致（非 versioning 删旧、versioning 置
+//     非最新）；元数据随行保留（move 不改写属性，attrs 忽略）；
+//   - 未完成 multipart 会话不参与 move（暂存行留在源 key，按需重传）；
+//   - 记账：目标桶 PUT + 源桶 DELETE；同步引擎：dst 入队 + src 删除传播。
+func (s *Store) MoveObject(srcBucket, srcKey, dstBucket, dstKey string, _ ObjectAttrs) (ObjectMeta, error) {
+	if dstKey == "" || len(dstKey) > 1024 {
+		return ObjectMeta{}, &s3Error{Code: "InvalidArgument", Status: 400, Msg: "Invalid object key"}
+	}
+	sb, err := s.Bucket(srcBucket)
+	if err != nil {
+		return ObjectMeta{}, err
+	}
+	db, err := s.Bucket(dstBucket)
+	if err != nil {
+		return ObjectMeta{}, err
+	}
+	if srcBucket == dstBucket && srcKey == dstKey {
+		return ObjectMeta{}, &s3Error{Code: "InvalidRequest", Status: 400,
+			Msg: "move source and destination are identical"}
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return ObjectMeta{}, err
+	}
+	defer tx.Rollback()
+
+	// 源 key 全部版本行（move = 整 key 改名；无任何行 → NoSuchKey）
+	rows, err := s.db.Query(fmt.Sprintf(`SELECT %s FROM %s WHERE key=?`, objectCols, sb.TableName), srcKey)
+	if err != nil {
+		return ObjectMeta{}, err
+	}
+	var srcRows []ObjectMeta
+	var versionIDs []string
+	for rows.Next() {
+		m, serr := scanObject(rows)
+		if serr != nil {
+			rows.Close()
+			return ObjectMeta{}, serr
+		}
+		srcRows = append(srcRows, m)
+	}
+	rows.Close()
+	if len(srcRows) == 0 {
+		return ObjectMeta{}, &s3Error{Code: "NoSuchKey", Status: 404, Msg: "The specified key does not exist"}
+	}
+	for _, m := range srcRows {
+		versionIDs = append(versionIDs, m.VersionID)
+	}
+	// 跨桶 WORM 拒绝（保留策略绑定桶配置；桶内允许随行迁移）
+	if srcBucket != dstBucket {
+		for _, m := range srcRows {
+			if m.LegalHold || m.RetentionMode != "" {
+				return ObjectMeta{}, &s3Error{Code: "AccessDenied", Status: 403,
+					Msg: "object under retention/legal-hold cannot move across buckets (in-bucket rename is allowed)"}
+			}
+		}
+	}
+
+	srcSt, srcCnt := s.keyAggLocked(tx, sb, srcKey)
+	dstSt, dstCnt := s.keyAggLocked(tx, db, dstKey)
+
+	// 覆盖目标（与 CopyObject 一致）：非 versioning 过对象锁后删旧；versioning 置非最新
+	if !db.Versioning {
+		if cur, cerr := s.headLatestLocked(db, dstKey); cerr == nil {
+			if err := cur.lockViolation(false); err != nil {
+				return ObjectMeta{}, err
+			}
+		}
+		if err := s.deleteObjectRowsTx(tx, db, dstKey, ""); err != nil {
+			return ObjectMeta{}, err
+		}
+	} else {
+		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET is_latest=0 WHERE key=? AND is_latest=1`, db.TableName), dstKey); err != nil {
+			return ObjectMeta{}, err
+		}
+	}
+
+	// 版本行 + 引用行平移（只动源对象版本——未完成 multipart 暂存行不参与）
+	verIn := make([]string, 0, len(versionIDs))
+	argsVer := make([]any, 0, len(versionIDs)+1)
+	argsVer = append(argsVer, srcKey)
+	for _, v := range versionIDs {
+		verIn = append(verIn, "?")
+		argsVer = append(argsVer, v)
+	}
+	verCond := fmt.Sprintf("key=? AND version_id IN (%s)", strings.Join(verIn, ","))
+	srcObj, srcChk := sb.TableName, chunkTableFor(sb.TableName)
+	dstObj, dstChk := db.TableName, chunkTableFor(db.TableName)
+	if srcBucket == dstBucket {
+		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET key=? WHERE key=?`, srcObj), dstKey, srcKey); err != nil {
+			return ObjectMeta{}, err
+		}
+		// verCond = "key=? AND version_id IN (...)"：绑定参数 = 源 key + 版本号序列，
+		// 目标 key 以 SET 绑定参数前置
+		mvArgs := append([]any{dstKey}, argsVer...)
+		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET key=? WHERE %s`, srcChk, verCond), mvArgs...); err != nil {
+			return ObjectMeta{}, err
+		}
+	} else {
+		if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,is_latest,delete_marker,size,etag,
+			content_type,content_encoding,cache_control,content_disposition,metadata,content,storage,manifest,
+			legal_hold,retention_mode,retain_until,created_ts)
+			SELECT ?,version_id,is_latest,delete_marker,size,etag,content_type,content_encoding,
+			cache_control,content_disposition,metadata,content,storage,manifest,legal_hold,retention_mode,
+			retain_until,created_ts FROM %s WHERE key=?`, dstObj, srcObj), dstKey, srcKey); err != nil {
+			return ObjectMeta{}, err
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,seq,hash,data)
+			SELECT ?,version_id,seq,hash,data FROM %s WHERE %s`, dstChk, srcChk, verCond),
+			append([]any{dstKey}, argsVer...)...); err != nil {
+			return ObjectMeta{}, err
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE %s`, srcChk, verCond), argsVer...); err != nil {
+			return ObjectMeta{}, err
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=?`, srcObj), srcKey); err != nil {
+			return ObjectMeta{}, err
+		}
+	}
+
+	// 聚合调整：目标桶净增（含覆盖抵扣）；源桶（跨桶时）清零
+	newDstSt, newDstCnt := s.keyAggLocked(tx, db, dstKey)
+	s.adjustAggLocked(tx, db, dstKey, newDstSt-dstSt, newDstCnt-dstCnt)
+	if srcBucket != dstBucket {
+		s.adjustAggLocked(tx, sb, srcKey, -srcSt, -srcCnt)
+	}
+	if err := tx.Commit(); err != nil {
+		return ObjectMeta{}, err
+	}
+
+	s.AddUsage(db.Owner, dstBucket, "PUT", 0, 0)
+	s.AddUsage(sb.Owner, srcBucket, "DELETE", 0, 0)
+	if s.syncHook != nil {
+		s.syncHook.objectDeleted(srcBucket, srcKey) // 源删除传播（规则开启时）
+	}
+	// 返回移动后的最新非标记版本
+	out := ObjectMeta{Key: dstKey, IsLatest: true}
+	for _, m := range srcRows {
+		if m.IsLatest && !m.DeleteMarker {
+			out = m
+			out.Key = dstKey
+			break
+		}
+	}
+	// 源 key 的魔法 token 级联失效（已持 writeMu）；目标 key 沿用既有 token
+	s.dropObjectTokensLocked(srcBucket, srcKey)
+	return out, nil
+}
+
 // ---------------------------------------------------------------------------
 // 对象检索（管理面 SUBMIT S3 TEXT/FILE SEARCH / DELETE，v1.3.11）
 // ---------------------------------------------------------------------------

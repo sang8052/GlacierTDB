@@ -6,11 +6,13 @@
 //	  [CALLBACK url [SIGN s]] [TIMEOUT s] [AT ...] [WINDOW ...] [WHEN ...] [EVERY ...] [RETAIN ...]
 //	SUBMIT S3 FILE SEARCH <bucket> [同上过滤（无 MATCH）] [LIMIT n] [通用选项]
 //	SUBMIT S3 DELETE <bucket> [同上过滤] [DRY RUN] [LIMIT n] [通用选项]
+//	SUBMIT S3 COPY <src-bucket> [PREFIX '<p>' | 同上过滤] TO <dst-bucket> [PREFIX '<dp>']
+//	  [DRY RUN] [LIMIT n] [通用选项]（v1.3.14 §3：零拷贝批量迁移）
 //
 // 过滤语义：SIZE 按 latest 版本大小；MODIFIED = 最新版本写入时间；
 // CREATED = 全版本最早写入时间（同表对象首次出现）。任务经 asyncq（Kind="s3"）
 // 执行，FETCH QUERY RESULT / 回调 / EVERY 周期链与 SQL 异步任务一致。
-// 提交要求 super 账号（检索/删除横贯整桶对象，属管理面能力）。
+// 提交要求 super 账号（检索/删除/复制横贯整桶对象，属管理面能力）。
 package handler
 
 import (
@@ -27,7 +29,7 @@ import (
 	"glaciertdb/internal/s3"
 )
 
-var reSubmitS3 = regexp.MustCompile(`(?is)^SUBMIT\s+S3\s+(TEXT\s+SEARCH|FILE\s+SEARCH|DELETE)\s+(.*)$`)
+var reSubmitS3 = regexp.MustCompile(`(?is)^SUBMIT\s+S3\s+(TEXT\s+SEARCH|FILE\s+SEARCH|DELETE|COPY)\s+(.*)$`)
 
 // genericOptStart 通用 SUBMIT 选项关键词（出现即视为 S3 过滤段结束）。
 var genericOptStart = map[string]bool{
@@ -104,6 +106,8 @@ func (h *Handler) handleSubmitS3(q string) (*mysql.Result, bool, error) {
 		action = "text"
 	case "FILE SEARCH":
 		action = "file"
+	case "COPY":
+		action = "copy"
 	default:
 		action = "delete"
 	}
@@ -116,6 +120,7 @@ func (h *Handler) handleSubmitS3(q string) (*mysql.Result, bool, error) {
 
 	genericOff := len(rest)
 	parseErr := ""
+	afterDst := false // COPY：TO 之后的 PREFIX 归目标前缀
 	i := 1
 	nextTok := func() (tok, bool) {
 		if i < len(toks) {
@@ -146,6 +151,8 @@ func (h *Handler) handleSubmitS3(q string) (*mysql.Result, bool, error) {
 			v, ok := nextTok()
 			if !ok {
 				parseErr = "PREFIX expects a value"
+			} else if afterDst {
+				task.DstPrefix = v.val // COPY：目标前缀（TO 之后首个 PREFIX）
 			} else {
 				task.Prefix = v.val
 			}
@@ -247,6 +254,15 @@ func (h *Handler) handleSubmitS3(q string) (*mysql.Result, bool, error) {
 			} else {
 				task.DryRun = true
 			}
+		case "TO":
+			// SUBMIT S3 COPY ... TO <dst-bucket>（v1.3.14 §3）
+			v, ok := nextTok()
+			if !ok || v.val == "" {
+				parseErr = "TO expects <dst-bucket>"
+			} else {
+				task.DstBucket = v.val
+				afterDst = true
+			}
 		default:
 			parseErr = "unknown SUBMIT S3 option near " + strconv.Quote(t.val)
 		}
@@ -262,6 +278,14 @@ func (h *Handler) handleSubmitS3(q string) (*mysql.Result, bool, error) {
 	}
 	if _, err := h.s3store.Bucket(task.Bucket); err != nil {
 		return nil, true, s3ErrToMySQL(err)
+	}
+	if action == "copy" {
+		if task.DstBucket == "" {
+			return nil, true, mysql.NewError(1064, "SUBMIT S3 COPY requires TO <dst-bucket>")
+		}
+		if _, err := h.s3store.Bucket(task.DstBucket); err != nil {
+			return nil, true, s3ErrToMySQL(err)
+		}
 	}
 
 	payload, _ := json.Marshal(task)

@@ -12,7 +12,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.3.13.beta"
+const GlacierVersion = "1.3.14.beta"
 
 // hideVersion 版本号隐藏开关（security.hide_version，v1.3.13）：开启后 S3 响应头 /
 // Redis INFO·HELLO / 管理面 glacier_version 等对外面不再携带真实版本号；

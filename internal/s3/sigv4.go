@@ -53,6 +53,7 @@ type credScope struct {
 	ReqDateTime   string // yyyymmddThhmmssZ
 	Owner         string // 密钥属主（v1.3.12：鉴权时顺带带出，免调用方二次查库）
 	Policy        string // 密钥级策略 JSON
+	Scope         string // 密钥资源范围 JSON（v1.3.14 §2：随行带回，热路径零额外查询）
 }
 
 // awsURIEncode AWS 规则百分号编码（unreserved: A-Za-z0-9-_.~；encodeSlash=false 时保留 /）。
@@ -289,9 +290,9 @@ func requestPathCandidates(r *http.Request) []string {
 }
 
 // verifySigV4 校验请求签名（表头鉴权或预签名 URL），返回签名身份与负载哈希声明。
-// secretFor(ak) 返回 (owner, sk, status, policyJSON)。
+// secretFor(ak) 返回 (owner, sk, status, policyJSON, scopeJSON)。
 func verifySigV4(r *http.Request, region string,
-	secretFor func(ak string) (owner, sk, status, policy string, ok bool)) (credScope, string, error) {
+	secretFor func(ak string) (owner, sk, status, policy, scope string, ok bool)) (credScope, string, error) {
 	var cs credScope
 	rawQuery := requestRawQuery(r)
 
@@ -362,13 +363,14 @@ func verifySigV4(r *http.Request, region string,
 		return cs, "", fmt.Errorf("region mismatch: signature %q, server %q", cs.Region, region)
 	}
 
-	owner, sk, status, policy, ok := secretFor(cs.AK)
+	owner, sk, status, policy, keyScope, ok := secretFor(cs.AK)
 	if !ok {
 		return cs, "", &s3Error{Code: "InvalidAccessKeyId", Status: 403,
 			Msg: "The AWS Access Key Id you provided does not exist in our records: " + cs.AK}
 	}
 	cs.Owner = owner
 	cs.Policy = policy
+	cs.Scope = keyScope
 	if status != "active" {
 		return cs, "", &s3Error{Code: "InvalidAccessKeyId", Status: 403,
 			Msg: "The AWS Access Key Id is " + status}

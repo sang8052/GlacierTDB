@@ -182,6 +182,7 @@ echo "---- test_v1310.py ----"; python /tests/test_v1310.py || rc=1
 echo "---- test_v1311.py ----"; python /tests/test_v1311.py || rc=1
 echo "---- test_v1312.py ----"; python /tests/test_v1312.py || rc=1
 echo "---- test_v1313.py ----"; python /tests/test_v1313.py || rc=1
+echo "---- test_v1314.py ----"; python /tests/test_v1314.py || rc=1
 exit $rc
 EOF
 )

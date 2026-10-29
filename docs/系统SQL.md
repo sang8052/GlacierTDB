@@ -214,9 +214,22 @@ ALTER BUCKET <b> LIMIT (CONN_BPS|USER_BPS|USER_CONNS) = <n>;   -- 限速热改�
 
 -- ---- AK/SK 密钥（SK 明文仅签发/轮换时返回一次）----
 CREATE S3 KEY [FOR '<u>'];            -- 返回 AK(32位 AS 前缀) + SK(48位 SK 前缀)
+CREATE S3 KEY [FOR '<u>'] [BUCKETS ('a','b*')] [PREFIXES ('p/')] [READONLY];  -- v1.3.14 资源范围
+ALTER S3 KEY '<ak>' SET SCOPE [BUCKETS (...)] [PREFIXES (...)] [READONLY|READWRITE|CLEAR];
 RENEW S3 KEY '<ak>';                  -- 轮换 SK
 DISABLE S3 KEY '<ak>';  ENABLE S3 KEY '<ak>';  DROP S3 KEY '<ak>';
-SHOW S3 KEYS [FOR '<u>'];             -- 不含 SK 明文（仅指纹）
+SHOW S3 KEYS [FOR '<u>'];             -- 不含 SK 明文（仅指纹 + scope 摘要列）
+
+-- ---- 桶共享（多用户读写两权，v1.3.14；不支持转授）----
+GRANT S3 <b> TO '<u>' [READONLY|READWRITE];
+REVOKE S3 <b> FROM '<u>';
+SHOW S3 GRANTS [FOR '<u>' | FOR BUCKET <b>];
+SHOW S3 USAGE OPERATORS [FOR '<u>'];  -- 操作者维度计数（共享桶分摊）
+
+-- ---- 魔法 Token（前端对象级直访凭证，v1.3.14；≤1h 可吊销）----
+CREATE S3 TOKEN ON <b>/<key> [PUT|GET|GIMG('<params>')] [EXPIRE <s<=3600>];
+REVOKE S3 TOKEN '<t>';
+SHOW S3 TOKENS [FOR '<u>' | ON <b>];
 
 -- ---- 请求策略条件（UA / IP / Referer / 自定义 header / 方法，AND 语义）----
 SET S3 POLICY KEY '<ak>' '{"ua":"app/*","ip":["192.168.0.0/16"],"headers":{"x-app":"iot"}}';

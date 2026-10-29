@@ -28,6 +28,7 @@ type KeyRow struct {
 	SKHash     string // SHA-256(SK) 指纹（审计/展示）
 	Status     string // active | disabled | revoked
 	Policy     string // 请求策略条件 JSON
+	Scope      string // 资源范围 JSON（v1.3.14 §2；空 = 全量）
 	CreatedTS  string
 	UpdatedTS  string
 	LastUsedTS string
@@ -88,6 +89,14 @@ func (s *Store) decryptSK(enc string) (string, error) {
 
 // CreateKey 签发密钥：返回 (AK, SK 明文)——SK 仅此一次可见。
 func (s *Store) CreateKey(owner string) (string, string, error) {
+	return s.CreateKeyScoped(owner, "")
+}
+
+// CreateKeyScoped 签发带资源范围的密钥（v1.3.14 §2；scopeJSON 空 = 全量）。
+func (s *Store) CreateKeyScoped(owner, scopeJSON string) (string, string, error) {
+	if _, err := ParseKeyScope(scopeJSON); err != nil {
+		return "", "", err
+	}
 	ak := akPrefix + randString(akBodyLen, keyAlphabet)
 	sk := skPrefix + randString(skBodyLen, skAlphabet)
 	enc, err := s.encryptSK(sk)
@@ -97,8 +106,8 @@ func (s *Store) CreateKey(owner string) (string, string, error) {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	now := nowTS()
-	if _, err := s.db.Exec(`INSERT INTO s3_keys(ak,owner,sk_hash,sk_enc,status,created_ts,updated_ts)
-		VALUES(?,?,?,?,'active',?,?)`, ak, owner, hexSHA256([]byte(sk)), enc, now, now); err != nil {
+	if _, err := s.db.Exec(`INSERT INTO s3_keys(ak,owner,sk_hash,sk_enc,status,scope,created_ts,updated_ts)
+		VALUES(?,?,?,?,'active',?,?,?)`, ak, owner, hexSHA256([]byte(sk)), enc, scopeJSON, now, now); err != nil {
 		return "", "", err
 	}
 	return ak, sk, nil
@@ -182,27 +191,28 @@ func (s *Store) flushTouchKeys() {
 	}
 }
 
-// KeyFor SigV4 查询回调：返回 (owner, SK 明文, status, policy, 存在)。
-func (s *Store) KeyFor(ak string) (string, string, string, string, bool) {
-	var owner, skHash, enc, status, policy string
-	err := s.db.QueryRow(`SELECT owner,sk_hash,sk_enc,status,policy FROM s3_keys WHERE ak=?`, ak).
-		Scan(&owner, &skHash, &enc, &status, &policy)
+// KeyFor SigV4 查询回调：返回 (owner, SK 明文, status, policy, scope, 存在)。
+// scope 随行带回（v1.3.14 §2：鉴权热路径零额外查询）。
+func (s *Store) KeyFor(ak string) (string, string, string, string, string, bool) {
+	var owner, skHash, enc, status, policy, scope string
+	err := s.db.QueryRow(`SELECT owner,sk_hash,sk_enc,status,policy,scope FROM s3_keys WHERE ak=?`, ak).
+		Scan(&owner, &skHash, &enc, &status, &policy, &scope)
 	if err != nil {
-		return "", "", "", "", false
+		return "", "", "", "", "", false
 	}
 	sk, err := s.decryptSK(enc)
 	if err != nil {
-		return "", "", "", "", false
+		return "", "", "", "", "", false
 	}
-	return owner, sk, status, policy, true
+	return owner, sk, status, policy, scope, true
 }
 
 // KeyRowFor 查询密钥行（不含 SK）。
 func (s *Store) KeyRowFor(ak string) (KeyRow, bool) {
 	var k KeyRow
-	err := s.db.QueryRow(`SELECT ak,owner,sk_hash,status,policy,created_ts,updated_ts,last_used_ts
+	err := s.db.QueryRow(`SELECT ak,owner,sk_hash,status,policy,scope,created_ts,updated_ts,last_used_ts
 		FROM s3_keys WHERE ak=?`, ak).
-		Scan(&k.AK, &k.Owner, &k.SKHash, &k.Status, &k.Policy, &k.CreatedTS, &k.UpdatedTS, &k.LastUsedTS)
+		Scan(&k.AK, &k.Owner, &k.SKHash, &k.Status, &k.Policy, &k.Scope, &k.CreatedTS, &k.UpdatedTS, &k.LastUsedTS)
 	if err != nil {
 		return k, false
 	}
@@ -211,7 +221,7 @@ func (s *Store) KeyRowFor(ak string) (KeyRow, bool) {
 
 // Keys 密钥列表（owner 为空 = 全部）。
 func (s *Store) Keys(owner string) []KeyRow {
-	q := `SELECT ak,owner,sk_hash,status,policy,created_ts,updated_ts,last_used_ts FROM s3_keys`
+	q := `SELECT ak,owner,sk_hash,status,policy,scope,created_ts,updated_ts,last_used_ts FROM s3_keys`
 	var args []any
 	if owner != "" {
 		q += ` WHERE owner=?`
@@ -226,11 +236,28 @@ func (s *Store) Keys(owner string) []KeyRow {
 	var out []KeyRow
 	for rows.Next() {
 		var k KeyRow
-		if err := rows.Scan(&k.AK, &k.Owner, &k.SKHash, &k.Status, &k.Policy, &k.CreatedTS, &k.UpdatedTS, &k.LastUsedTS); err == nil {
+		if err := rows.Scan(&k.AK, &k.Owner, &k.SKHash, &k.Status, &k.Policy, &k.Scope, &k.CreatedTS, &k.UpdatedTS, &k.LastUsedTS); err == nil {
 			out = append(out, k)
 		}
 	}
 	return out
+}
+
+// SetKeyScope 更新密钥资源范围（v1.3.14 §2；ALTER S3 KEY <ak> SET SCOPE）。
+func (s *Store) SetKeyScope(ak, scopeJSON string) error {
+	if _, err := ParseKeyScope(scopeJSON); err != nil {
+		return err
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	res, err := s.db.Exec(`UPDATE s3_keys SET scope=?, updated_ts=? WHERE ak=?`, scopeJSON, nowTS(), ak)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return &s3Error{Code: "NoSuchKey", Status: 404, Msg: "The specified access key does not exist"}
+	}
+	return nil
 }
 
 // SetKeyPolicy 设置密钥请求策略（条件 JSON）。

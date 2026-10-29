@@ -178,6 +178,9 @@ func (s *Server) lifecycleLoop() {
 		if n := s.store.GCChunkTombstones(); n > 0 { // 墓碑 chunk 到期清理（v1.3.13，挂现有框架不新造调度器）
 			logx.Infof("s3: chunk tombstone GC removed %d pool chunks", n)
 		}
+		if n := s.store.GCMagicTokens(); n > 0 { // 过期魔法 token 清理（v1.3.14 §4）
+			logx.Infof("s3: magic token GC removed %d expired tokens", n)
+		}
 		if s.imgcache.enabled() { // 图片缓存顺带做一轮容量回收
 			s.imgcache.enforce()
 		}
@@ -249,35 +252,105 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 解析桶 / 对象键（virtual-host 或 path-style）
 	bucket, key := h.resolveBucketKey(r)
 
-	// SigV4 鉴权（表头或预签名 URL）；owner/policy 由鉴权查询顺带带回（v1.3.12：
-	// 此前每个请求都要二次 KeyFor 查库）
-	cs, payloadHash, err := verifySigV4(r, s.cfg.S3.Region, s.store.KeyFor)
-	if err != nil {
-		writeErr(w, r, reqID, toS3Err(err))
-		return
+	// 魔法 Token 鉴权路径（v1.3.14 §4）：?token=<uuid> 命中 → 跳过 SigV4，
+	// token 即凭证（对象 + 动作 + 未过期全匹配，gimg 参数签发时钉死）。
+	// usage / 限速照常，身份归因 token 签发者（created_by）。
+	var tokenAuth bool
+	if tok := r.URL.Query().Get("token"); tok != "" {
+		if bucket == "" || key == "" {
+			writeErr(w, r, reqID, &s3Error{Code: "InvalidRequest", Status: 400,
+				Msg: "magic token is object-level: use /<bucket>/<key>?token=<uuid>"})
+			return
+		}
+		mt, terr := s.store.LookupMagicToken(tok, bucket, key)
+		if terr != nil {
+			writeErr(w, r, reqID, toS3Err(terr))
+			return
+		}
+		// gimg 参数钉死注入（先于动作判定——GIMG token 注入后请求即图片处理形态）：
+		// token 携带参数时剥离请求自带 x-gimg-*，以签发值为准（前端 URL 不出现
+		// 处理参数明文；签发后不可改写）
+		if mt.GimgParams != "" {
+			q := r.URL.Query()
+			for k := range q {
+				if strings.HasPrefix(strings.ToLower(k), "x-gimg-") || k == "x-gimg" {
+					q.Del(k)
+				}
+			}
+			for _, kv := range mt.GimgQueryParams() {
+				q.Set(kv[0], kv[1])
+			}
+			r.URL.RawQuery = q.Encode()
+		}
+		if e := tokenActionOK(mt, r); e != nil {
+			writeErr(w, r, reqID, e)
+			return
+		}
+		tokenAuth = true
 	}
-	s.store.TouchKey(cs.AK)
+
+	// SigV4 鉴权（表头或预签名 URL）；owner/policy/scope 由鉴权查询顺带带回
+	//（v1.3.12：此前每个请求都要二次 KeyFor 查库；v1.3.14 §2 scope 随行）。
+	var cs credScope
+	var payloadHash string
+	if !tokenAuth {
+		var err error
+		cs, payloadHash, err = verifySigV4(r, s.cfg.S3.Region, s.store.KeyFor)
+		if err != nil {
+			writeErr(w, r, reqID, toS3Err(err))
+			return
+		}
+		s.store.TouchKey(cs.AK)
+	} else {
+		cs.Owner = ""                     // token 路径无 AK；身份取签发者
+		payloadHash = "UNSIGNED-PAYLOAD"  // token 请求无签名负载哈希，PUT 哈希校验跳过
+	}
 	owner := cs.Owner
+	if tokenAuth {
+		if mt, ok := s.store.tokenOwnerFor(r.URL.Query().Get("token")); ok {
+			owner = mt
+		}
+	}
 	keyPolicy := cs.Policy
 
-	// 请求策略条件（密钥级 + 桶级，参考阿里云 OSS policy 条件匹配）
+	// 请求策略条件（密钥级 + 桶级，参考阿里云 OSS policy 条件匹配；token 路径双空直过）
 	ip := clientIP(r)
 	if err := checkPolicies(keyPolicy, s.store.BucketPolicy(bucket), r, ip); err != nil {
 		writeErr(w, r, reqID, toS3Err(err))
 		return
 	}
 
-	// 命名空间隔离：key 属主只能访问自己的桶（super 用户全放行）
-	if bucket != "" {
+	// AK scope 二次校验（v1.3.14 §2）：桶越权 / 前缀越权 / ro 写动词 三类细分 403；
+	// 预签名继承天然成立（预签名请求同样走本校验，服务端拒写即可）。
+	var keyScope KeyScope
+	if !tokenAuth {
+		ks, kerr := ParseKeyScope(cs.Scope)
+		if kerr != nil {
+			writeErr(w, r, reqID, &s3Error{Code: "AccessDenied", Status: 403, Msg: "key scope invalid: " + kerr.Error()})
+			return
+		}
+		keyScope = ks
+		q := r.URL.Query()
+		isList := key == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead)
+		if e := checkKeyScope(ks, bucket, key, q.Get("prefix"), q.Get("marker"),
+			isWriteRequestMethod(r), isList); e != nil {
+			writeErr(w, r, reqID, e)
+			return
+		}
+	}
+
+	// 命名空间隔离 + 桶共享（v1.3.14 §1）：属主 / super 全权；grant ro 读过写拒；
+	// grant rw 全放行（DELETE 仍受 WORM/对象锁约束——权限模型不越过保留策略）。
+	// token 路径跳过（token 即授权，签发时已按判定链校验）。
+	if bucket != "" && !tokenAuth {
 		if b, berr := h.srv.store.Bucket(bucket); berr != nil {
 			if !(r.Method == http.MethodPut && key == "") {
 				// 建桶（PUT /bucket）允许桶不存在，其余 404
 				writeErr(w, r, reqID, toS3Err(berr))
 				return
 			}
-		} else if !s.canAccess(owner, b.Owner) {
-			writeErr(w, r, reqID, &s3Error{Code: "AccessDenied", Status: 403,
-				Msg: "Access Denied: bucket " + bucket + " belongs to another owner"})
+		} else if e := s.canAccessBucket(owner, b, isWriteRequestMethod(r)); e != nil {
+			writeErr(w, r, reqID, e)
 			return
 		}
 	}
@@ -285,6 +358,7 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 拷贝源桶 ACL（v1.3.11 修复跨租户读漏洞）：x-amz-copy-source 引入了第二个
 	// 攻击者可控的桶引用，此前从未校验——任何租户可凭自己桶里的 PUT+copy-source
 	// 整读其他属主的对象（CopyObject 与 UploadPartCopy 同一入口堵死）。
+	// v1.3.14 §1：源桶读权限接受 ro/rw 共享授权。
 	if key != "" && r.Method == http.MethodPut {
 		if src := r.Header.Get("X-Amz-Copy-Source"); src != "" {
 			if e := h.checkCopySourceACL(owner, keyPolicy, src, r, ip); e != nil {
@@ -303,10 +377,19 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 
+	// 操作者维度记账（v1.3.14 §1 定稿）：存储字节仍记桶属主；操作计数在
+	// operator != 桶属主（共享桶场景）时分摊记 s3_usage_op（super 管理动作不计）。
+	if bucket != "" && owner != "" {
+		if b, berr := s.store.Bucket(bucket); berr == nil && b.Owner != owner &&
+			(s.auths == nil || s.auths.UserType(owner) != auth.TypeSuper) {
+			s.store.AddOpUsage(owner, bucket, opClassFor(r, key))
+		}
+	}
+
 	switch {
 	case bucket == "" && key == "":
 		r = withReqInfo(r, owner, "", "", lim, userTB)
-		h.handleService(w, r, owner, reqID)
+		h.handleService(w, r, owner, keyScope, reqID)
 	case key == "":
 		r = withReqInfo(r, owner, bucket, "", lim, userTB)
 		h.handleBucket(w, r, bucket, owner, reqID)
@@ -314,6 +397,79 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		r = withReqInfo(r, owner, bucket, key, lim, userTB)
 		h.handleObject(w, r, bucket, key, owner, payloadHash, lim, userTB, reqID)
 	}
+}
+
+// isWriteRequestMethod 写动词单一判定点（v1.3.14 §1/§2 共用 choke point）：
+// S3 写路径分散（PUT obj / DELETE / POST ?delete / multipart 全链 / x-gimg save-as
+// / PUT policy…），逐路由补判必漏——集中按方法分类：GET/HEAD = 读，其余 = 写。
+func isWriteRequestMethod(r *http.Request) bool {
+	return r.Method != http.MethodGet && r.Method != http.MethodHead
+}
+
+// opClassFor 操作者维度计数分类（与属主记账口径对齐）。
+func opClassFor(r *http.Request, key string) string {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		if key == "" {
+			return "LIST"
+		}
+		return "GET"
+	case http.MethodPut, http.MethodPost:
+		return "PUT"
+	case http.MethodDelete:
+		return "DELETE"
+	}
+	return "GET"
+}
+
+// tokenActionOK token 动作集匹配（§4：签发即钉死，不允许扩展到其他动作）。
+// GET/HEAD 裸读 → GET 动作；带 x-gimg-* → GIMG 动作；PUT/POST（含 multipart
+// 链路与 save-as）→ PUT 动作；DELETE 不可 token 化。
+func tokenActionOK(t MagicToken, r *http.Request) *s3Error {
+	has := func(a string) bool {
+		for _, x := range strings.Split(t.Actions, ",") {
+			if strings.TrimSpace(x) == a {
+				return true
+			}
+		}
+		return false
+	}
+	img := false
+	for k := range r.URL.Query() {
+		if strings.HasPrefix(strings.ToLower(k), "x-gimg-") || strings.EqualFold(k, "x-gimg") {
+			img = true
+			break
+		}
+	}
+	switch r.Method {
+	case http.MethodGet, http.MethodHead:
+		if img && !has("GIMG") {
+			return &s3Error{Code: "AccessDenied", Status: 403,
+				Msg: "Access Denied: token does not include the GIMG action"}
+		}
+		if !img && !has("GET") {
+			return &s3Error{Code: "AccessDenied", Status: 403,
+				Msg: "Access Denied: token does not include the GET action"}
+		}
+		return nil
+	case http.MethodPut, http.MethodPost:
+		if !has("PUT") {
+			return &s3Error{Code: "AccessDenied", Status: 403,
+				Msg: "Access Denied: token does not include the PUT action"}
+		}
+		return nil
+	}
+	return &s3Error{Code: "AccessDenied", Status: 403,
+		Msg: "Access Denied: token does not allow method " + r.Method}
+}
+
+// tokenOwnerFor token → 签发者（ServeHTTP 身份归因；LookupMagicToken 已验证存在与未过期）。
+func (s *Store) tokenOwnerFor(token string) (string, bool) {
+	var by string
+	if err := s.db.QueryRow(`SELECT created_by FROM s3_magic_tokens WHERE token=?`, token).Scan(&by); err != nil || by == "" {
+		return "", false
+	}
+	return by, true
 }
 
 // ---------------------------------------------------------------------------
@@ -424,7 +580,7 @@ func splitPathStyle(path string) (bucket, key string) {
 	return path, ""
 }
 
-// canAccess 命名空间隔离判定。
+// canAccess 命名空间隔离判定（保留：无桶行上下文的旧语义）。
 func (s *Server) canAccess(user, owner string) bool {
 	if user == owner {
 		return true
@@ -435,8 +591,29 @@ func (s *Server) canAccess(user, owner string) bool {
 	return false
 }
 
+// canAccessBucket 桶级访问判定（v1.3.14 §1：属主/super/共享授权三源）。
+// write = 写动词（isWriteRequestMethod 预判）；返回 nil = 放行。
+func (s *Server) canAccessBucket(user string, b Bucket, write bool) *s3Error {
+	if user == b.Owner {
+		return nil
+	}
+	if s.auths != nil && s.auths.UserType(user) == auth.TypeSuper {
+		return nil
+	}
+	if perm, ok := s.store.GrantPerm(b.Name, user); ok {
+		if write && perm == "ro" {
+			return &s3Error{Code: "AccessDenied", Status: 403,
+				Msg: "Access Denied: bucket '" + b.Name + "' is shared read-only to user '" + user + "' (grant perm=ro)"}
+		}
+		return nil // rw：全放行（WORM/对象锁在对象层照旧约束）
+	}
+	return &s3Error{Code: "AccessDenied", Status: 403,
+		Msg: "Access Denied: bucket " + b.Name + " belongs to another owner"}
+}
+
 // checkCopySourceACL 校验 x-amz-copy-source 源桶（v1.3.11）：
 // 与请求桶同等的属主隔离 + 源桶策略条件。src 形如 [/]bucket/key[?versionId=..]。
+// v1.3.14 §1：读语义接受 ro/rw 共享授权（copy/move 源桶只需可读）。
 func (h *endpointHandler) checkCopySourceACL(owner, keyPolicy, src string, r *http.Request, ip string) *s3Error {
 	src = strings.TrimPrefix(src, "/")
 	srcBucket, _ := splitPathStyle(src)
@@ -447,9 +624,9 @@ func (h *endpointHandler) checkCopySourceACL(owner, keyPolicy, src string, r *ht
 	if err != nil {
 		return toS3Err(err)
 	}
-	if !h.srv.canAccess(owner, sb.Owner) {
+	if e := h.srv.canAccessBucket(owner, sb, false); e != nil {
 		return &s3Error{Code: "AccessDenied", Status: 403,
-			Msg: "Access Denied: copy source bucket " + srcBucket + " belongs to another owner"}
+			Msg: "Access Denied: copy source bucket " + srcBucket + " is not readable by user '" + owner + "'"}
 	}
 	if err := checkPolicies(keyPolicy, h.srv.store.BucketPolicy(srcBucket), r, ip); err != nil {
 		return toS3Err(err)
@@ -485,8 +662,9 @@ func clientIP(r *http.Request) string {
 // 服务级 / 桶级 / 对象级操作
 // ---------------------------------------------------------------------------
 
-// handleService GET / → 列桶。
-func (h *endpointHandler) handleService(w http.ResponseWriter, r *http.Request, owner, reqID string) {
+// handleService GET / → 列桶（v1.3.14 §1：含被共享桶，带 shared 标注；
+// AK scope 限定桶集合时按 scope 过滤——scope 是钥匙的边界）。
+func (h *endpointHandler) handleService(w http.ResponseWriter, r *http.Request, owner string, ks KeyScope, reqID string) {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 		all := h.srv.store.ListBuckets("")
@@ -494,6 +672,7 @@ func (h *endpointHandler) handleService(w http.ResponseWriter, r *http.Request, 
 		type xmlBucket struct {
 			Name         string `xml:"Name"`
 			CreationDate string `xml:"CreationDate"`
+			SharedPerm   string `xml:"SharedPerm,omitempty"` // 共享桶标注（ro/rw；自有桶缺省）
 		}
 		var out struct {
 			XMLName xml.Name `xml:"ListAllMyBucketsResult"`
@@ -510,8 +689,17 @@ func (h *endpointHandler) handleService(w http.ResponseWriter, r *http.Request, 
 		out.Owner.ID = owner
 		out.Owner.DisplayName = owner
 		for _, b := range all {
+			if len(ks.Buckets) > 0 && !ks.bucketMatch(b.Name) {
+				continue // AK scope 桶集合过滤（自有与共享桶统一）
+			}
 			if b.Owner != owner && !super {
-				continue
+				if perm, ok := h.srv.store.GrantPerm(b.Name, owner); !ok {
+					continue // 非属主且无共享授权：不可见
+				} else {
+					out.Buckets.Bucket = append(out.Buckets.Bucket,
+						xmlBucket{Name: b.Name, CreationDate: isoTime(b.CreatedTS), SharedPerm: perm})
+					continue
+				}
 			}
 			out.Buckets.Bucket = append(out.Buckets.Bucket,
 				xmlBucket{Name: b.Name, CreationDate: isoTime(b.CreatedTS)})
@@ -1287,7 +1475,8 @@ func usageOwner(s *Server, bucket, fallback string) string {
 	return fallback
 }
 
-// copyObject x-amz-copy-source 复制。
+// copyObject x-amz-copy-source 复制；带 x-glacier-move: true 时为原子移动
+//（v1.3.14 §3：同事务建新 + 删源，外部观察不到中间态；move 触发上传回调）。
 func (h *endpointHandler) copyObject(w http.ResponseWriter, r *http.Request, bucket, key, src, reqID string) {
 	src = strings.TrimPrefix(src, "/")
 	srcBucket, srcKey := splitPathStyle(src)
@@ -1301,6 +1490,7 @@ func (h *endpointHandler) copyObject(w http.ResponseWriter, r *http.Request, buc
 			}
 		}
 	}
+	isMove := strings.EqualFold(r.Header.Get("X-Glacier-Move"), "true")
 	attrs := ObjectAttrs{
 		ContentType:        r.Header.Get("Content-Type"),
 		ContentEncoding:    r.Header.Get("Content-Encoding"),
@@ -1310,6 +1500,26 @@ func (h *endpointHandler) copyObject(w http.ResponseWriter, r *http.Request, buc
 	}
 	if strings.EqualFold(r.Header.Get("X-Amz-Metadata-Directive"), "COPY") {
 		attrs = ObjectAttrs{Metadata: map[string]string{}}
+	}
+	if isMove {
+		m, err := h.srv.store.MoveObject(srcBucket, srcKey, bucket, key, attrs)
+		if err != nil {
+			writeErr(w, r, reqID, toS3Err(err))
+			return
+		}
+		// move 触发上传回调与同步链路（对业务是「新对象出现」）；copy 维持不触发
+		if b, err := h.srv.store.Bucket(bucket); err == nil {
+			h.srv.notifyPut(b, m, false, reqCallbackOverride(r))
+			if h.srv.sync != nil {
+				h.srv.sync.objectPut(b, m)
+			}
+		}
+		writeXML(w, http.StatusOK, struct {
+			XMLName      xml.Name `xml:"CopyObjectResult"`
+			ETag         string   `xml:"ETag"`
+			LastModified string   `xml:"LastModified"`
+		}{ETag: "\"" + m.ETag + "\"", LastModified: isoTime(m.CreatedTS)}, reqID, false)
+		return
 	}
 	m, err := h.srv.store.CopyObject(srcBucket, srcKey, srcVersion, bucket, key, attrs)
 	if err != nil {

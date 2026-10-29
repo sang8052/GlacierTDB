@@ -99,6 +99,7 @@ type Store struct {
 	usageMu  sync.Mutex
 	usageBuf map[string]*usageDelta // 读写操作计数内存缓冲（v1.3.11）
 	usageOps int
+	opUsageBuf map[string]*usageDelta // 操作者维度计数缓冲（v1.3.14 §1：分摊/审计）
 
 	// 热路径读缓存（v1.3.12 并行上传优化）：每请求原本要对 s3_buckets /
 	// s3_policies 做 3-5 次元数据 SELECT；短 TTL 缓存后并行上传命中内存。
@@ -106,6 +107,7 @@ type Store struct {
 	cacheMu      sync.Mutex
 	bucketCache  map[string]bucketCacheEntry
 	policyCache  map[string]policyCacheEntry
+	grantsCache  map[string]grantsCacheEntry // 桶共享授权缓存（v1.3.14 §1；GRANT/REVOKE 主动失效）
 
 	touchMu  sync.Mutex
 	touchBuf map[string]struct{} // 密钥 last_used 脏标记（定时批量落库，v1.3.12）
@@ -335,12 +337,42 @@ CREATE TABLE IF NOT EXISTS s3_flash (
   etag       TEXT NOT NULL DEFAULT '',
   chunks     TEXT NOT NULL DEFAULT '[]',
   created_ts TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS s3_bucket_grants (
+  bucket     TEXT NOT NULL,
+  username   TEXT NOT NULL,
+  perm       TEXT NOT NULL,
+  granted_by TEXT NOT NULL DEFAULT '',
+  created_ts TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (bucket, username)
+);
+CREATE TABLE IF NOT EXISTS s3_magic_tokens (
+  token       TEXT PRIMARY KEY,
+  bucket      TEXT NOT NULL,
+  key         TEXT NOT NULL,
+  actions     TEXT NOT NULL DEFAULT 'GET',
+  gimg_params TEXT NOT NULL DEFAULT '',
+  expires_ts  TEXT NOT NULL DEFAULT '',
+  created_by  TEXT NOT NULL DEFAULT '',
+  created_ts  TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_s3_magic_tokens_obj ON s3_magic_tokens(bucket, key);
+CREATE TABLE IF NOT EXISTS s3_usage_op (
+  operator      TEXT NOT NULL,
+  bucket        TEXT NOT NULL,
+  get_count     INTEGER NOT NULL DEFAULT 0,
+  put_count     INTEGER NOT NULL DEFAULT 0,
+  list_count    INTEGER NOT NULL DEFAULT 0,
+  delete_count  INTEGER NOT NULL DEFAULT 0,
+  updated_ts    TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (operator, bucket)
 );`)
 	if err != nil {
 		return fmt.Errorf("init s3 schema: %w", err)
 	}
 	// 存量库补列（幂等：重复列报错忽略）
 	_, _ = s.db.Exec(`ALTER TABLE s3_parts ADD COLUMN chunks INTEGER NOT NULL DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE s3_keys ADD COLUMN scope TEXT NOT NULL DEFAULT ''`)
 	return nil
 }
 
@@ -518,6 +550,7 @@ func (s *Store) DropBucket(name string, force bool) error {
 	_, _ = s.db.Exec(`DELETE FROM s3_domains WHERE bucket=?`, name)
 	_, _ = s.db.Exec(`DELETE FROM s3_lifecycle WHERE bucket=?`, name)
 	_, _ = s.db.Exec(`UPDATE s3_usage SET storage_bytes=0, object_count=0 WHERE bucket=?`, name)
+	s.dropBucketGrantsLocked(name) // 共享授权与魔法 token 级联失效（v1.3.14 §1/§4）
 	s.invalidateBucket(name)
 	logx.Infof("s3: bucket %s dropped (force=%v)", name, force)
 	return nil
@@ -898,7 +931,6 @@ func (s *Store) flushUsage() {
 	s.usageMu.Unlock()
 
 	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
 	for k, d := range buf {
 		owner, bucket, _ := strings.Cut(k, "\x00")
 		_, _ = s.db.Exec(`INSERT INTO s3_usage(owner,bucket,get_count,put_count,list_count,delete_count,
@@ -910,6 +942,8 @@ func (s *Store) flushUsage() {
 			updated_ts=excluded.updated_ts`,
 			owner, bucket, d.get, d.put, d.list, d.del, d.bytesIn, d.bytesOut, nowTS())
 	}
+	s.writeMu.Unlock()
+	s.flushOpUsage() // 操作者维度缓冲顺带落库（v1.3.14；自管锁，writeMu 外调用）
 }
 
 // usageSnapshot 缓冲增量快照（Usage 合并视图用）。

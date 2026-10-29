@@ -20,10 +20,12 @@ const textScanMaxBytes = 64 << 20
 
 // SearchTask SUBMIT S3 任务载荷。
 type SearchTask struct {
-	Action string `json:"action"` // text | file | delete
+	Action string `json:"action"` // text | file | delete | copy（v1.3.14 §3）
 	Bucket string `json:"bucket"`
 	Match  string `json:"match,omitempty"`  // text：大小写不敏感包含匹配
-	DryRun bool   `json:"dry_run,omitempty"` // delete：只报告不删
+	DryRun bool   `json:"dry_run,omitempty"` // delete/copy：只报告不执行
+	DstBucket  string `json:"dst_bucket,omitempty"`  // copy：目标桶
+	DstPrefix  string `json:"dst_prefix,omitempty"`  // copy：目标前缀（空 = 保持原 key）
 	SearchFilter
 }
 
@@ -55,8 +57,10 @@ func (s *Store) RunSearchTask(payload string) ([]string, [][]any, error) {
 		return s.runTextSearch(t, cands)
 	case "delete":
 		return s.runDelete(t, cands)
+	case "copy":
+		return s.runCopy(t, cands)
 	}
-	return nil, nil, fmt.Errorf("unknown s3 task action %q (text|file|delete)", t.Action)
+	return nil, nil, fmt.Errorf("unknown s3 task action %q (text|file|delete|copy)", t.Action)
 }
 
 // runTextSearch 文本搜索：候选对象逐个判定文本性后按行做大小写不敏感包含匹配。
@@ -110,6 +114,37 @@ func (s *Store) runDelete(t SearchTask, cands []SearchCandidate) ([]string, [][]
 			}
 		}
 		rows = append(rows, []any{t.Bucket, c.Key, c.Size, st})
+	}
+	return cols, rows, nil
+}
+
+// runCopy 异步批量复制（SUBMIT S3 COPY，v1.3.14 §3）：逐对象走 CopyObject
+//（chunk 池零拷贝——大数据量批量迁移 = 元数据级操作）；目标 key = DstPrefix +
+// 剥离源前缀后的相对路径（源未给前缀则原 key 拼接）。DRY RUN 只列不拷。
+func (s *Store) runCopy(t SearchTask, cands []SearchCandidate) ([]string, [][]any, error) {
+	if t.DstBucket == "" {
+		return nil, nil, fmt.Errorf("copy task requires TO <dst-bucket>")
+	}
+	cols := []string{"src_bucket", "key", "dst_bucket", "dst_key", "size", "result"}
+	var rows [][]any
+	for _, c := range cands {
+		dstKey := c.Key
+		if t.Prefix != "" {
+			dstKey = strings.TrimPrefix(c.Key, t.Prefix)
+		}
+		if t.DstPrefix != "" {
+			dstKey = t.DstPrefix + dstKey
+		}
+		if t.DryRun {
+			rows = append(rows, []any{t.Bucket, c.Key, t.DstBucket, dstKey, c.Size, "dry-run"})
+			continue
+		}
+		_, err := s.CopyObject(t.Bucket, c.Key, "", t.DstBucket, dstKey, ObjectAttrs{Metadata: map[string]string{}})
+		st := "copied"
+		if err != nil {
+			st = "error: " + err.Error()
+		}
+		rows = append(rows, []any{t.Bucket, c.Key, t.DstBucket, dstKey, c.Size, st})
 	}
 	return cols, rows, nil
 }

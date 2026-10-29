@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +39,14 @@ import (
 //	S3 VACUUM [FULL]（空间回收：默认增量免长锁；FULL 排他重建并切换增量模式，v1.3.11）
 //	S3 RETAIN <bucket>/<key> UNTIL '<date>' (COMPLIANCE|GOVERNANCE) [VERSION '<v>']
 //	S3 LEGAL_HOLD <bucket>/<key> (ON|OFF) [VERSION '<v>']
+//	GRANT S3 <bucket> TO <user> [READONLY|READWRITE]   REVOKE S3 <bucket> FROM <user>
+//	SHOW S3 GRANTS [FOR <user> | FOR BUCKET <b>]（桶共享，v1.3.14 §1）
+//	CREATE S3 KEY [FOR <u>] [BUCKETS (...)] [PREFIXES (...)] [READONLY]
+//	ALTER S3 KEY <ak> SET SCOPE [BUCKETS (...)] [PREFIXES (...)] [READONLY|READWRITE|CLEAR]
+//	SHOW S3 KEYS（含 scope 摘要列，v1.3.14 §2）
+//	CREATE S3 TOKEN ON <bucket>/<key> [PUT|GET|GIMG('<params>')] [EXPIRE <s≤3600>]
+//	REVOKE S3 TOKEN '<t>'   SHOW S3 TOKENS [FOR <u> | ON <b>]（魔法 Token，v1.3.14 §4）
+//	SHOW S3 USAGE OPERATORS（操作者维度分摊，v1.3.14 §1）
 func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
 	toks := lexSQL(q)
 	if len(toks) == 0 {
@@ -64,6 +73,20 @@ func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
 		if up(1) == "S3" && up(2) == "KEY" {
 			return h.s3CreateKey(toks)
 		}
+		if up(1) == "S3" && up(2) == "TOKEN" {
+			return h.s3CreateToken(toks)
+		}
+	case "GRANT":
+		if up(1) == "S3" {
+			return h.s3GrantBucket(toks)
+		}
+	case "REVOKE":
+		if up(1) == "S3" && up(2) == "TOKEN" {
+			return h.s3RevokeToken(toks)
+		}
+		if up(1) == "S3" {
+			return h.s3RevokeBucket(toks)
+		}
 	case "DROP":
 		if up(1) == "BUCKET" {
 			return h.s3DropBucket(toks)
@@ -79,6 +102,10 @@ func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
 			return h.s3ShowKeys(toks)
 		case up(1) == "S3" && up(2) == "USAGE":
 			return h.s3ShowUsage(toks)
+		case up(1) == "S3" && up(2) == "GRANTS":
+			return h.s3ShowGrants(toks)
+		case up(1) == "S3" && up(2) == "TOKENS":
+			return h.s3ShowTokens(toks)
 		case up(1) == "S3" && up(2) == "LIFECYCLE":
 			return h.s3ShowLifecycle(toks)
 		case up(1) == "S3" && up(2) == "DOMAINS":
@@ -97,6 +124,9 @@ func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
 	case "ALTER":
 		if up(1) == "BUCKET" {
 			return h.s3AlterBucket(toks)
+		}
+		if up(1) == "S3" && up(2) == "KEY" {
+			return h.s3AlterKeyScope(toks)
 		}
 	case "SET":
 		if up(1) == "S3" && up(2) == "CALLBACK" {
@@ -152,13 +182,26 @@ func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
 func isS3Command(up func(int) string) bool {
 	switch up(0) {
 	case "CREATE", "DROP":
-		return up(1) == "BUCKET" || (up(1) == "S3" && up(2) == "KEY")
+		if up(1) == "BUCKET" {
+			return true
+		}
+		if up(1) == "S3" {
+			return up(2) == "KEY" || up(2) == "TOKEN" // TOKEN（v1.3.14 §4）
+		}
+		return false
+	case "GRANT", "REVOKE":
+		// 桶共享授权 / token 吊销（v1.3.14 §1/§4）；DB 授权 GRANT 不带 S3 前缀不冲突
+		if up(1) == "S3" {
+			return true
+		}
+		return false
 	case "SHOW":
 		return up(1) == "BUCKETS" || (up(1) == "S3" && (up(2) == "KEYS" || up(2) == "USAGE" ||
 			up(2) == "LIFECYCLE" || up(2) == "DOMAINS" || up(2) == "POLICIES" || up(2) == "OBJECTS" ||
-			up(2) == "UPLOADS" || up(2) == "SPACE" || up(2) == "SYNC"))
+			up(2) == "UPLOADS" || up(2) == "SPACE" || up(2) == "SYNC" ||
+			up(2) == "GRANTS" || up(2) == "TOKENS")) // v1.3.14 §1/§4
 	case "ALTER":
-		return up(1) == "BUCKET"
+		return up(1) == "BUCKET" || (up(1) == "S3" && up(2) == "KEY") // SET SCOPE（v1.3.14 §2）
 	case "SET", "CLEAR":
 		return up(1) == "S3" && (up(2) == "CALLBACK" || up(2) == "LIFECYCLE" || up(2) == "POLICY")
 	case "RENEW":
@@ -432,10 +475,22 @@ func (h *Handler) s3CreateKey(toks []string) (*mysql.Result, bool, error) {
 		return nil, true, err
 	}
 	owner := h.cfg.S3.DefaultOwner
+	var ks s3.KeyScope
 	for i := 3; i < len(toks); i++ {
-		if strings.EqualFold(toks[i], "FOR") {
+		switch strings.ToUpper(toks[i]) {
+		case "FOR":
 			i++
 			owner = argVal(toks, i)
+		case "BUCKETS": // v1.3.14 §2：资源限定（('a','b*') 或 'a'）
+			var vals []string
+			vals, i = takeSQLList(toks, i+1)
+			ks.Buckets = vals
+		case "PREFIXES":
+			var vals []string
+			vals, i = takeSQLList(toks, i+1)
+			ks.Prefixes = vals
+		case "READONLY":
+			ks.Perm = "ro"
 		}
 	}
 	if h.auths != nil {
@@ -443,14 +498,51 @@ func (h *Handler) s3CreateKey(toks []string) (*mysql.Result, bool, error) {
 			return nil, true, mysql.NewError(1105, fmt.Sprintf("no such account %q", owner))
 		}
 	}
-	ak, sk, err := h.s3store.CreateKey(owner)
+	ak, sk, err := h.s3store.CreateKeyScoped(owner, ks.MarshalScope())
 	if err != nil {
 		return nil, true, mysql.NewError(1105, err.Error())
 	}
-	logx.Infof("s3: access key %s issued for %s by conn %d", ak, owner, h.connID)
-	res, err := meta.SimpleRS([]string{"access_key", "secret_key", "owner", "note"},
-		[][]any{{ak, sk, owner, "SK 仅此一次可见，请立即保存；落表仅存哈希与密文"}})
+	logx.Infof("s3: access key %s issued for %s (scope=%s) by conn %d", ak, owner, ks.String(), h.connID)
+	res, err := meta.SimpleRS([]string{"access_key", "secret_key", "owner", "scope", "note"},
+		[][]any{{ak, sk, owner, ks.String(), "SK 仅此一次可见，请立即保存；落表仅存哈希与密文"}})
 	return res, true, err
+}
+
+// takeSQLList 收集括号列表参数（容忍 ('a', 'b') 内空格：从 i 起拼到闭括号），
+// 返回 (值列表, 消费到的末 token 下标)。
+func takeSQLList(toks []string, i int) ([]string, int) {
+	if i >= len(toks) {
+		return nil, i
+	}
+	joined := toks[i]
+	end := i
+	if strings.HasPrefix(toks[i], "(") && !strings.HasSuffix(toks[i], ")") {
+		for end+1 < len(toks) {
+			end++
+			joined += "," + toks[end]
+			if strings.HasSuffix(toks[end], ")") {
+				break
+			}
+		}
+	}
+	return parseSQLList(joined), end
+}
+
+// parseSQLList ('a','b*') / 'a' / a → []string。
+func parseSQLList(v string) []string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimSuffix(strings.TrimPrefix(v, "("), ")")
+	if v == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		p = strings.Trim(strings.TrimSpace(p), "'\"`")
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func (h *Handler) s3RenewKey(toks []string) (*mysql.Result, bool, error) {
@@ -497,11 +589,17 @@ func (h *Handler) s3ShowKeys(toks []string) (*mysql.Result, bool, error) {
 	}
 	var rows [][]any
 	for _, k := range h.s3store.Keys(owner) {
+		scope := s3.KeyScope{}
+		if k.Scope != "" {
+			if ks, err := s3.ParseKeyScope(k.Scope); err == nil {
+				scope = ks
+			}
+		}
 		rows = append(rows, []any{k.AK, k.Owner, k.Status, s3.KeyFingerprint(k.SKHash),
-			truncate(k.Policy, 60), k.CreatedTS, k.LastUsedTS})
+			scope.String(), truncate(k.Policy, 60), k.CreatedTS, k.LastUsedTS})
 	}
-	res, err := meta.SimpleRS([]string{"access_key", "owner", "status", "sk_fingerprint", "policy",
-		"created", "last_used"}, rows)
+	res, err := meta.SimpleRS([]string{"access_key", "owner", "status", "sk_fingerprint", "scope",
+		"policy", "created", "last_used"}, rows)
 	return res, true, err
 }
 
@@ -677,6 +775,17 @@ func (h *Handler) s3ShowUsage(toks []string) (*mysql.Result, bool, error) {
 			i++
 			owner = argVal(toks, i)
 		}
+	}
+	// SHOW S3 USAGE OPERATORS：操作者维度分摊（v1.3.14 §1——共享桶场景下
+	// 各操作者的请求计数；存储字节仍记桶属主，见主视图）
+	if len(toks) > 3 && strings.EqualFold(toks[3], "OPERATORS") {
+		var rows [][]any
+		for _, u := range h.s3store.OpUsage(owner) {
+			rows = append(rows, []any{u.Operator, u.Bucket, u.Get, u.Put, u.List, u.Del, u.UpdatedTS})
+		}
+		res, err := meta.SimpleRS([]string{"operator", "bucket", "get_count", "put_count",
+			"list_count", "delete_count", "updated"}, rows)
+		return res, true, err
 	}
 	var rows [][]any
 	for _, u := range h.s3store.Usage(owner) {
@@ -981,4 +1090,231 @@ func s3ErrToMySQL(err error) error {
 // timeNowFile 导出文件名时间戳（安全格式）。
 func timeNowFile() string {
 	return time.Now().Format("20060102_150405")
+}
+
+// ---------------------------------------------------------------------------
+// 桶共享授权 / AK scope / 魔法 Token（v1.3.14 §1/§2/§4）
+// ---------------------------------------------------------------------------
+
+// s3GrantBucket GRANT S3 <bucket> TO <user> [READONLY | READWRITE]
+//（默认 READWRITE；仅管理面 super——授权变更挂桶缓存失效体系即时生效）。
+func (h *Handler) s3GrantBucket(toks []string) (*mysql.Result, bool, error) {
+	if err := h.adminMutateGate(); err != nil {
+		return nil, true, err
+	}
+	// toks: GRANT S3 <bucket> TO <user> [READONLY|READWRITE]
+	bucket := argVal(toks, 2)
+	user := argVal(toks, 4)
+	perm := "rw"
+	for i := 5; i < len(toks); i++ {
+		switch strings.ToUpper(toks[i]) {
+		case "READONLY", "RO":
+			perm = "ro"
+		case "READWRITE", "RW":
+			perm = "rw"
+		}
+	}
+	if bucket == "" || !strings.EqualFold(argVal(toks, 3), "TO") || user == "" {
+		return nil, true, mysql.NewError(1064,
+			"GRANT S3 <bucket> TO <user> [READONLY | READWRITE]  (不支持转授：被共享方不能再授权第三人)")
+	}
+	if h.auths != nil {
+		if _, ok, _ := h.auths.Lookup(user); !ok {
+			return nil, true, mysql.NewError(1105, fmt.Sprintf("no such account %q", user))
+		}
+	}
+	if err := h.s3store.GrantBucket(bucket, user, perm, h.user); err != nil {
+		return nil, true, s3ErrToMySQL(err)
+	}
+	logx.Infof("s3: bucket %s granted %s to %s by %s (conn %d)", bucket, perm, user, h.user, h.connID)
+	return meta.OKResultPub(), true, nil
+}
+
+// s3RevokeBucket REVOKE S3 <bucket> FROM <user>（级联失效该用户在该桶的魔法 token）。
+func (h *Handler) s3RevokeBucket(toks []string) (*mysql.Result, bool, error) {
+	if err := h.adminMutateGate(); err != nil {
+		return nil, true, err
+	}
+	// toks: REVOKE S3 <bucket> FROM <user>
+	bucket := argVal(toks, 2)
+	user := argVal(toks, 4)
+	if bucket == "" || !strings.EqualFold(argVal(toks, 3), "FROM") || user == "" {
+		return nil, true, mysql.NewError(1064, "REVOKE S3 <bucket> FROM <user>")
+	}
+	if err := h.s3store.RevokeBucketGrant(bucket, user); err != nil {
+		return nil, true, s3ErrToMySQL(err)
+	}
+	logx.Infof("s3: bucket %s grant revoked from %s by %s (conn %d)", bucket, user, h.user, h.connID)
+	return meta.OKResultPub(), true, nil
+}
+
+// s3ShowGrants SHOW S3 GRANTS [FOR <user> | FOR BUCKET <bucket>]
+func (h *Handler) s3ShowGrants(toks []string) (*mysql.Result, bool, error) {
+	user, bucket := "", ""
+	for i := 3; i < len(toks); i++ {
+		switch strings.ToUpper(toks[i]) {
+		case "FOR":
+			if strings.EqualFold(argVal(toks, i+1), "BUCKET") {
+				bucket = argVal(toks, i+2)
+				i += 2
+			} else {
+				user = argVal(toks, i+1)
+				i++
+			}
+		case "ON":
+			bucket = argVal(toks, i+1)
+			i++
+		}
+	}
+	var rows [][]any
+	for _, g := range h.s3store.BucketGrants(bucket, user) {
+		rows = append(rows, []any{g.Bucket, g.User, g.Perm, g.GrantedBy, g.CreatedTS})
+	}
+	res, err := meta.SimpleRS([]string{"bucket", "username", "perm", "granted_by", "created"}, rows)
+	return res, true, err
+}
+
+// s3AlterKeyScope ALTER S3 KEY <ak> SET SCOPE [BUCKETS (...)] [PREFIXES (...)] [READONLY|READWRITE|CLEAR]
+//（全量替换式；CLEAR = 恢复全量）。
+func (h *Handler) s3AlterKeyScope(toks []string) (*mysql.Result, bool, error) {
+	if err := h.adminMutateGate(); err != nil {
+		return nil, true, err
+	}
+	// toks: ALTER S3 KEY <ak> SET SCOPE ...
+	ak := argVal(toks, 3)
+	if ak == "" || !strings.EqualFold(argVal(toks, 4), "SET") || !strings.EqualFold(argVal(toks, 5), "SCOPE") {
+		return nil, true, mysql.NewError(1064,
+			"ALTER S3 KEY <ak> SET SCOPE [BUCKETS (...)] [PREFIXES (...)] [READONLY|READWRITE|CLEAR]")
+	}
+	var ks s3.KeyScope
+	cleared := false
+	for i := 6; i < len(toks); i++ {
+		switch strings.ToUpper(toks[i]) {
+		case "BUCKETS":
+			var vals []string
+			vals, i = takeSQLList(toks, i+1)
+			ks.Buckets = vals
+		case "PREFIXES":
+			var vals []string
+			vals, i = takeSQLList(toks, i+1)
+			ks.Prefixes = vals
+		case "READONLY":
+			ks.Perm = "ro"
+		case "READWRITE":
+			ks.Perm = ""
+		case "CLEAR":
+			ks = s3.KeyScope{}
+			cleared = true
+		}
+	}
+	scopeJSON := ks.MarshalScope()
+	if cleared {
+		scopeJSON = ""
+	}
+	if err := h.s3store.SetKeyScope(ak, scopeJSON); err != nil {
+		return nil, true, s3ErrToMySQL(err)
+	}
+	note := ks.String()
+	if cleared {
+		note = "full (cleared)"
+	}
+	res, err := meta.SimpleRS([]string{"access_key", "scope"},
+		[][]any{{ak, note}})
+	return res, true, err
+}
+
+// s3CreateToken CREATE S3 TOKEN ON <bucket>/<key> [PUT|GET|GIMG('<params>')]... [EXPIRE <s≤3600>]
+// 返回 uuid token（前端 ?token=<uuid> 直访；动作与 gimg 参数签发即钉死）。
+func (h *Handler) s3CreateToken(toks []string) (*mysql.Result, bool, error) {
+	if err := h.adminMutateGate(); err != nil {
+		return nil, true, err
+	}
+	// toks: CREATE S3 TOKEN ON <bucket>/<key> ...
+	target := argVal(toks, 4)
+	if target == "" || !strings.EqualFold(argVal(toks, 3), "ON") {
+		return nil, true, mysql.NewError(1064,
+			`CREATE S3 TOKEN ON <bucket>/<key> [PUT|GET|GIMG('resize=100,0&quality=80')] [EXPIRE <s<=3600>]`)
+	}
+	bucket, key, ok := strings.Cut(target, "/")
+	if !ok || bucket == "" || key == "" {
+		return nil, true, mysql.NewError(1064, "token target must be <bucket>/<key>")
+	}
+	var actions []string
+	gimg := ""
+	expire := 0
+	for i := 5; i < len(toks); i++ {
+		t := toks[i]
+		up := strings.ToUpper(t)
+		switch {
+		case up == "EXPIRE" || up == "EXPIRES":
+			i++
+			if n, err := strconv.Atoi(argVal(toks, i)); err == nil {
+				expire = n
+			}
+		case strings.HasPrefix(up, "GIMG(") && strings.HasSuffix(t, ")"):
+			gimg = strings.TrimSuffix(strings.TrimPrefix(t, "GIMG("), ")")
+			if gimg == "" {
+				gimg = strings.TrimSuffix(strings.TrimPrefix(t, "gimg("), ")")
+			}
+			actions = append(actions, "GIMG")
+		case up == "PUT", up == "GET":
+			actions = append(actions, up)
+		default:
+			return nil, true, mysql.NewError(1064, "unknown token action "+strconv.Quote(t)+" (PUT|GET|GIMG('<params>'))")
+		}
+	}
+	mt, err := h.s3store.CreateMagicToken(bucket, key, strings.Join(actions, ","), gimg, expire, h.user)
+	if err != nil {
+		return nil, true, s3ErrToMySQL(err)
+	}
+	logx.Infof("s3: magic token %s created on %s/%s (actions=%s expire=%s) by %s conn %d",
+		mt.Token, bucket, key, mt.Actions, mt.ExpiresTS, h.user, h.connID)
+	res, err := meta.SimpleRS([]string{"token", "bucket", "key", "actions", "gimg_params", "expires", "note"},
+		[][]any{{mt.Token, mt.Bucket, mt.Key, mt.Actions, mt.GimgParams, mt.ExpiresTS,
+			"GET/PUT /<bucket>/<key>?token=<token>；≤1h 强制过期，REVOKE S3 TOKEN 可吊销"}})
+	return res, true, err
+}
+
+// s3RevokeToken REVOKE S3 TOKEN '<t>'（主动吊销）。
+func (h *Handler) s3RevokeToken(toks []string) (*mysql.Result, bool, error) {
+	if err := h.adminMutateGate(); err != nil {
+		return nil, true, err
+	}
+	// toks: REVOKE S3 TOKEN <t>
+	t := argVal(toks, 3)
+	if t == "" {
+		return nil, true, mysql.NewError(1064, "REVOKE S3 TOKEN '<token>'")
+	}
+	if err := h.s3store.RevokeMagicToken(t); err != nil {
+		return nil, true, s3ErrToMySQL(err)
+	}
+	logx.Infof("s3: magic token %s revoked by %s (conn %d)", t, h.user, h.connID)
+	return meta.OKResultPub(), true, nil
+}
+
+// s3ShowTokens SHOW S3 TOKENS [FOR <user> | ON <bucket>]。
+func (h *Handler) s3ShowTokens(toks []string) (*mysql.Result, bool, error) {
+	user, bucket := "", ""
+	for i := 3; i < len(toks); i++ {
+		switch strings.ToUpper(toks[i]) {
+		case "FOR":
+			user = argVal(toks, i+1)
+			i++
+		case "ON":
+			bucket = argVal(toks, i+1)
+			i++
+		}
+	}
+	var rows [][]any
+	for _, t := range h.s3store.MagicTokens(user, bucket) {
+		expired := ""
+		if t.ExpiresTS != "" && time.Now().Format("2006-01-02 15:04:05") > t.ExpiresTS {
+			expired = "expired"
+		}
+		rows = append(rows, []any{t.Token, t.Bucket, t.Key, t.Actions, t.GimgParams,
+			t.ExpiresTS, t.CreatedBy, t.CreatedTS, expired})
+	}
+	res, err := meta.SimpleRS([]string{"token", "bucket", "key", "actions", "gimg_params",
+		"expires", "created_by", "created", "state"}, rows)
+	return res, true, err
 }

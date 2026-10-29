@@ -2,6 +2,87 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.14.beta] - 2026-10-29
+
+> 版本主题「**权限体系与 S3 能力补全**」：S3 桶共享模型（§1）+ AK 细粒度资源
+> 范围（§2）+ 原子移动与异步批量复制（§3）+ 前端魔法 Token 直访凭证（§4）+
+> 资源受限对比测试文档（§5）。需求终版见 `bugs/1.3.14.beta 需求.md`。
+> **测试环境：构建机 docker（8 核 / 15GB，被测容器统一 2CPU/4GB cgroup 限额）**
+> ——现场低配工控机性能请参考《性能损失与比较》与 README 环境要求表口径。
+
+### 新增（S3 权限）
+- **桶共享（多用户共享 bucket，读 / 写两权）**：新表 `s3_bucket_grants`（perm ∈
+  {ro, rw}）+ 管理面 `GRANT S3 <bucket> TO <user> [READONLY|READWRITE]` /
+  `REVOKE S3 <bucket> FROM <user>` / `SHOW S3 GRANTS [FOR <user> | FOR BUCKET <b>]`；
+  判定链 `canAccessBucket` 三源：属主 / super / grant 命中——`ro` 放行 GET/HEAD/LIST/
+  预签名读、写动词 403（细分原因）；`rw` 全放行（DELETE 仍受 WORM/对象锁约束，
+  权限模型不越过保留策略）；**不支持转授**（无 grant_option，grantee 不能把共享桶
+  再授第三人，`granted_by` 留作扩展缝）；授权查询挂 v1.3.12 桶行 2s TTL 缓存体系
+  （GRANT/REVOKE 主动失效）；ListBuckets 增补被共享桶（XML 带 `SharedPerm` 标注）；
+  copy-source 源桶读权限接受 ro/rw 共享授权；已签发预签名 URL 在 REVOKE 后有效期内
+  仍可用（签名不可吊销，S3 通行语义），新请求立即拒绝。
+- **AK/SK 资源范围（scope）**：`s3_keys.scope` JSON（空 = 现状全量，存量零迁移）：
+  `{"buckets":["imgs","logs*"], "prefixes":["report/"], "perm":"ro"}`——桶集合支持
+  尾部 `*` 通配；key 前缀收窄（对象 PUT/GET 落前缀内；**LIST 的 prefix/marker 必须
+  落在 scope 前缀内否则 403**——比结果过滤简单且无泄漏面）；`perm ro` 拦截全部写
+  动词；管理面 `CREATE S3 KEY [FOR <u>] [BUCKETS (...)] [PREFIXES (...)] [READONLY]`、
+  `ALTER S3 KEY <ak> SET SCOPE ... [READWRITE|CLEAR]`、`SHOW S3 KEYS` 新增 scope
+  摘要列；scope 校验在 SigV4 验签后同链二次判定（scope 随 KeyFor 行带回，热路径
+  零额外查询），403 细分三类原因（桶越权 / 前缀越权 / 方法越权）；**预签名 URL
+  天然继承 AK scope**（ro AK 签不出可写 URL，服务端拒写）；与桶共享叠加取交集。
+- **usage 操作者维度记账**：新表 `s3_usage_op`（operator × bucket 计数）；共享桶
+  场景 operator ≠ 桶属主 时操作计数分摊记录（super 管理动作不计），存储字节仍记
+  桶属主；`SHOW S3 USAGE OPERATORS [FOR <user>]` 查询（读视图合并内存缓冲）。
+- **写动词单一判定点**：`isWriteRequestMethod`（GET/HEAD = 读，其余 = 写）作为
+  §1 桶 grant 与 §2 AK scope 共用 choke point——S3 写路径分散（PUT/DELETE/POST/
+  multipart 全链/x-gimg save-as），逐路由补判必漏（v1.3.11 WITH-DML 同类教训）。
+
+### 新增（S3 能力）
+- **原子移动（move）**：`PUT /<dst> + x-amz-copy-source: /<src> + x-glacier-move: true`
+  （自定义头不参与签名，预签名可用）——**同一事务内「建新 + 删源」**，外部观察不到
+  中间态；同桶改名 = 对象/分块引用行整体 UPDATE key（数据零触碰）；跨桶 = 版本行 +
+  引用行平移（chunk 池引用使然零数据拷贝，refcnt 天然平衡）；语义定稿：versioning 桶
+  **全部版本行随迁、不产生 delete marker**（move = 改名，非删除）；WORM/legal_hold
+  对象**桶内 move 允许**（retention 元数据随行迁移）、**跨桶 move 拒绝**；覆盖目标
+  语义与 CopyObject 一致；**move 触发上传回调与数据同步链路**（对业务是「新对象
+  出现」），copy 维持不触发；跨属主 move/copy 沿用 v1.3.11 源桶校验不放宽；源 key
+  的魔法 token 随迁移级联失效。
+- **异步批量复制**：`SUBMIT S3 COPY <src-bucket> [PREFIX '<p>' | 过滤族] TO <dst-bucket>
+  [PREFIX '<dp>'] [DRY RUN] [LIMIT n] [通用选项]`——沿用 SUBMIT S3 任务框架（super/
+  FETCH/回调/EVERY 周期链）；逐对象零拷贝（10MB 拷贝毫秒级），批量迁移 = 元数据
+  操作；目标 key = 目标前缀 + 剥离源前缀的相对路径。
+- **魔法 Token（前端对象级直访凭证）**：`CREATE S3 TOKEN ON <bucket>/<key>
+  [PUT|GET|GIMG('<params>')] [EXPIRE <s≤3600>]` → 返回 128bit uuid；前端
+  `GET/PUT /<bucket>/<key>?token=<uuid>` 免 AK/SK 免签名直访。token 绑定
+  bucket+key+动作集（+gimg 处理参数）**签发即钉死**——GIMG token 使用时自动注入
+  钉死参数并剥离 URL 自带 x-gimg-*（前端 URL 不出现处理参数明文，且不可剥离绕过）；
+  不允许持 token 跨对象/跨动作使用（杜绝万能钥匙）；过期上限 1h 强制 + 惰性清理
+  （挂生命周期扫描）；`REVOKE S3 TOKEN '<t>'` 主动吊销、`SHOW S3 TOKENS [FOR <u> |
+  ON <b>]`；对象硬删 / 删桶 / 撤销桶共享级联失效 token；token 使用计入 usage 操作者
+  维度（created_by 归因）；与预签名 URL 互补不替代（token 可吊销、URL 极短）。
+
+### 新增（对比测试）
+- **资源受限对比测试**：`tests/bench/bench_all.py`（五组对位统一压测客户端：MySQL
+  QPS/批量插入/并发连接、Redis GET/SET 与队列 ops、AMQP 持久化 publish/consume-ack、
+  S3 PUT/GET ops、TSDB 批写+范围聚合）+ `tests/bench/bench_2h4g.sh`（编排：被测容器
+  统一 2CPU/4GB cgroup 限额 + IO 两档限速（SD 卡级 / HDD 级），对照镜像固定 tag，
+  3 轮取中位数）；交付 `docs/性能损失与比较.md`（环境口径 / 逐项结果 / 结论边界）。
+
+### 修复
+- **[BUG] flushUsage 双重 Unlock 崩溃**：v1.3.14 开发期引入（defer + 显式 Unlock
+  并存 → `sync: unlock of unlocked mutex` fatal），已修（单次显式 Unlock）。
+- **[BUG] CreateKeyScoped INSERT 参数错位**：v1.3.14 开发期引入（VALUES 占位符
+  与参数个数不匹配导致 status 列写入密文、scope 列写入 'active'，新签钥匙全部
+  InvalidAccessKeyId），已修并回归。
+
+### 变更
+- `SHOW S3 KEYS` 列变化：新增 `scope` 列（8 列）。
+- `ListBuckets` XML 桶元素可选携带 `SharedPerm`（共享桶标注；标准客户端忽略未知
+  字段不受影响）。
+- 需求附录 A 顺延项（SCRIPT 安全边界恢复 / ffmpeg 能力集 / GPU-NPU 加速）本版
+  **不做**，方案留档于 `bugs/1.3.14.beta 需求.md` 附录A；SCRIPT 维持 v1.3.13
+  屏蔽语义不变（提交显式报错）。
+
 ## [1.3.13.beta] - 2026-10-29
 
 > 版本主题「**存储效率与可观测性**」：S3 存储底层重构（chunk 池内容寻址 + link 引用 +
