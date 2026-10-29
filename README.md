@@ -9,7 +9,12 @@
 
 > 🤖 **本项目全程由 GLM5.3 驱动。**
 
-**当前版本：v1.3.12.beta**
+**当前版本：v1.3.13.beta**
+
+> 🛑 **安全公告**：v1.3.10 及更早版本存在重大安全缺陷（租户隔离越权，4 个
+> CRITICAL，详见 [CHANGELOG](CHANGELOG.md) v1.3.11 安全节），**v1.3.10 已紧急撤版**。
+> 请勿使用任何 ≤ v1.3.10 的版本，立即升级至最新版；旧版本资产已从 Releases 撤下，
+> **仅从 [Releases](https://github.com/sang8052/GlacierTDB/releases) 获取最新版**。
 
 > **版本基调（v1.3.10 起）**：FEATURE 整合已收官（MySQL 网关 / 时序冷库 / S3 / Redis / RabbitMQ / MQTT / 多租户 / 静态加密全量交付）；
 > **自 1.3.10 版本开始，项目转向稳定性更新**——以性能优化、BUG 修复与运维体验为主，不再新增大特性。
@@ -27,32 +32,34 @@ GlacierTDB 的所有设计取舍基于以下共识：
 3. **"大而全"是特性**：一个二进制替代 MySQL + Redis + RabbitMQ + MinIO 的组合部署，降低边缘环境的运维负担；
 4. **无人值守是常态**：没有 DBA、没有运维、出问题需要现场出差。因此弱硬件上每个模块的资源纪律比服务器环境更严格，不是更宽松。
 
-### ❌ 明确不做清单
 
-以下事项已评估并**明确不做**，避免重复讨论（详见 [bugs/分析建议.md](bugs/分析建议.md)）：
+## 🖥 环境要求与推荐配置（分 x86 / ARM）
 
-| 事项 | 不做的理由 |
-| --- | --- |
-| 工业协议接入 | 职责归数据采集系统。GlacierTDB 是中间件，不做 PLC 侧的活 |
-| armv7 支持 | 算力无法支撑全套服务，32 位生态正在消亡 |
-| 高可用 / 副本 / 分片 | 与单机定位冲突。容灾由部署架构（数据北上传中心）解决 |
-| 环境变量配置 | 非必需。目标用户具备写自动化脚本的能力，YAML 已足够 |
-| 启动日志打印兼容清单 | 启动日志职责是版本 / 环境 / 依赖 / 核心配置，使用说明属于手册 |
+> 数字为综合拟定口径，供选型建立正确预期；目标硬件规格实测表（路线图阶段三）发布后
+> 以实测表为准并互相引用。一切性能数字的测量环境以 CHANGELOG 标注为准——
+> **开发/构建机（高配主机）数字仅作开发参考，不作为现场性能预期。**
 
-> 由此推导的硬边界：**单实例单写者**；传输加密走 v1.3.12 起的内置 TLS（3309 复用端口 +
-> MySQL 协议内升级 + S3 端点独立证书），未启用 TLS 时仅限内网可信环境（详见文末「已知限制」）。
+**x86-64**
 
-| 📄 文档 | 说明 |
-| --- | --- |
-| [docs/配置说明.md](docs/配置说明.md) | 配置手册：全部配置项、默认值、热改关系、命令行参数、FAQ |
-| [docs/系统SQL.md](docs/系统SQL.md) | 系统 SQL 手册：管理面私有 SQL、系统库兼容层、SHOW 兜底 |
-| [docs/时序数据库.md](docs/时序数据库.md) | 时序冷库：存储模型、查询改写、rollup 预聚合、压缩路线 |
-| [docs/异步任务.md](docs/异步任务.md) | 异步任务：SUBMIT 全量语法、调度、回调协议、SCRIPT 后处理 |
-| [docs/S3对象存储.md](docs/S3对象存储.md) | S3 对象存储：SigV4 鉴权、桶/对象/版本/对象锁、限速、策略、证书、计费 |
-| [docs/键值队列.md](docs/键值队列.md) | 键值/队列：mode:redis、RESP 命令集、TTL、命名空间、内存治理 |
-| [docs/消息队列.md](docs/消息队列.md) | 消息队列：mode:rabbitmq、AMQP 0-9-1、路由语义、持久化、观测 |
-| [docs/部署运维.md](docs/部署运维.md) | 部署（Docker/裸机/systemd）、升级、备份恢复、监控、故障排查 |
-| [CHANGELOG.md](CHANGELOG.md) | 更新日志（各版本完整变更明细） |
+| 档位 | CPU | 内存 | 存储 | 预期形态 |
+| --- | --- | --- | --- | --- |
+| 最低 | 2 核（J1900 级低频亦可） | 2 GB | 16 GB SATA SSD / DOM（SD 卡可用但不推荐做主存储） | 五组件全开可跑：MySQL 网关 + 时序 + KV + MQ + S3 常规读写流畅；图片管道限小图、S3 并行上传低并发；建议 `GOMEMLIMIT≈1.5GiB` |
+| 推荐 | 4 核（N5105 / J4125 及以上） | 4~8 GB | 64 GB SSD | 全能力流畅：图片管道大图、S3 并行上传、时序 rollup 均可用 |
+| 最低中的最低 | 1~2 核 | 1 GB | 8 GB | **裁剪形态**：建议仅 MySQL 网关 + 时序（或 KV），关闭 S3/图片管道与 MQ（`s3.enable`/`mysql.enable` 等开关组合）；必须配 `GOMEMLIMIT=700MiB` |
+
+**ARM64**（**仅 arm64**；armv7 / 32 位 ARM 已明确不支持——算力无法支撑全套服务）
+
+| 档位 | CPU | 内存 | 存储 | 预期形态 |
+| --- | --- | --- | --- | --- |
+| 最低 | 4×Cortex-A72（树莓派 4B）或 RK3566 级 | 4 GB | 16 GB A1/A2 级 SD 卡或 eMMC | 五组件全开可跑，图片管道明显慢于 x86 最低档 |
+| 推荐 | RK3588 / 树莓派 5 | 8 GB | 64 GB NVMe / SSD | 接近 x86 推荐档 |
+
+**配套口径**
+
+- 存储余量原则：`db_dir` 预估数据量 ×2（WAL + `-backup` 备份轮转 `.old`）+ ≥20% 余量；
+  SD 卡场景必须配 v1.3.12 调优项（`sqlite.wal_autocheckpoint` / `sqlite.journal_size_limit_kb`）；
+- 现场选型一句话总结：**「按最低档选型、按推荐档选存储」**——存储介质（SSD vs SD）
+  对写入吞吐与寿命的影响大于 CPU 档位。
 
 ---
 
@@ -169,7 +176,7 @@ PRAGMA cache_size   = -256;     -- 每连接 256 KB
 - `SUBMIT QUERY '<sql>'` 秒回 job_id，结果 JSONL 落盘分页拉取（`FETCH QUERY RESULT` / `query_result()`）；
 - **调度**：`AT 'HH:MM'` 定时、`WINDOW '周五 17:00-20:00'` 每日/周几窗口、`WHEN CPU<70` 资源门槛（CPU/MEM/DISK_MBPS/连接数等）、`EVERY DAY|WEEK|MONTH|YEAR|n SECONDS…` 周期任务（含每周/每 N 周、每月/每年，月尾日自动 clamp 如 1/31→2/28）；`SHOW QUERY SCHEDULE`、`PAUSE/RESUME` 链启停；
 - **回调**：HTTP POST（HMAC 签名 + 退避重试）/ TCP 流 / RabbitMQ / Kafka 四通道；`PARTITION BY ROWS|BYTES` 分片回调；
-- **SCRIPT 后处理管道**：`SCRIPT 'x.js' OUTPUT out`——结果 JSONL 流入 nodejs/python/php 子进程，产物落 `jobs/<id>.<out>`（`script_dir` 白名单）；
+- **SCRIPT 后处理管道**：`SCRIPT 'x.js' OUTPUT out`——结果 JSONL 流入 nodejs/python/php 子进程，产物落 `jobs/<id>.<out>`（`script_dir` 白名单）。**⚠ v1.3.13 起临时停用**（安全边界整改，带 SCRIPT 子句的提交显式报错；恢复与增强排在 v1.3.14）；
 - 详见 [docs/异步任务.md](docs/异步任务.md)。
 
 ### 4. 运维与安全
@@ -177,7 +184,19 @@ PRAGMA cache_size   = -256;     -- 每连接 256 KB
 - **用户权限系统**：账号入库（`glacier_auth.db`），`CREATE USER/GRANT/REVOKE/SHOW GRANTS/SET PASSWORD`，库级 + 表级 + IP（CIDR）授权，账号类型 SUPER/READONLY/USER 热切换；默认超级用户 `glacier` + 只读 `glacier_ro`；
 - **防爆破**：登录失败窗口计数自动锁 IP/账号（三模式、指数升级、持久化重启不解除）；**本机回环地址（127.x / ::1 / localhost）永不锁定**——本机客户端密码配错不会把自己锁死在管理面之外；可选 ufw/iptables/firewall-cmd 系统层封锁（同样豁免回环）；登录失败 HTTP 告警；`SHOW LOGIN ATTEMPTS/SHOW LOCKED/UNLOCK`，以及**命令行解锁** `glaciertdb -unlock-user <账号>` / `-unlock-ip <IP>` / `-show-locks`（服务运行中旁路可用，无需停机）；
 - **查询 QoS**：全系统 + 单库两级配额（qps/concurrency/rows_per_sec，wait/reject）；`SET QOS` 热改、`SHOW QOS` 实时统计；
-- **SQL 审计日志**：`log.sql_log_file` JSON 行（语句/状态/耗时/行数/连接），100MB 轮转；慢查询日志标注 QoS 排队。
+- **SQL 审计日志**：`log.sql_log_file` JSON 行（语句/状态/耗时/行数/连接），100MB 轮转；慢查询日志标注 QoS 排队；
+- **实例唯一 ID（v1.3.13）**：UUID 首启生成存系统库（重启不变），四面可查——MySQL
+  `SELECT @@glaciertdb_instance_id`、Redis `INFO glaciertdb_instance_id`、S3 全部响应头
+  `x-glacier-instance-id`、AMQP 能力串；异步任务回调与心跳 payload 附带，多盒子机群区分实例；
+- **主动心跳上报（v1.3.13，默认关）**：`heartbeat:` 配置定时 POST 规模/健康 JSON 到
+  用户自建 HTTP 中心（实例 ID + 版本 + uptime + 桶/KV/MQ/异步积压 + 错误计数，HMAC 签名）；
+- **版本号隐藏（v1.3.13，默认关）**：`security.hide_version: true` 后 S3 响应头 /
+  Redis INFO·HELLO / 管理面不再携带真实版本号（MySQL 握手恒回 8.0.0；启动日志不隐藏）；
+- **防爆破扩面（v1.3.13）**：AMQP / RESP / MQTT 认证失败与 MySQL 侧同一锁定器收口
+  （per-IP + per-username，回环永不锁定，`-unlock-user/-unlock-ip/-show-locks` 旁路通用）；
+- **UDS 本地连接加速（v1.3.13，仅 Linux）**：`listen_unix:` 把 3309 协议多路复用整体架在
+  Unix domain socket 上（`s3.endpoints[].listen_unix` 同款），本地连接免 TCP 层开销，
+  **鉴权照旧**（纯传输加速，不做任何免鉴权）。
 
 ### 5. S3 对象存储（`s3.enable` 开启）
 
@@ -192,6 +211,28 @@ AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked` 流式—�
 - **图片处理**：裁剪 / 缩放 / 格式转换 / base64 输出与直传；**OpenCV 风格 ops 管道多核提速**（可分离滑窗模糊、逐像素直写，大图管道从秒级降到亚秒级）+ **处理结果磁盘缓存**（`<db_dir>/sys/gimg_cache/`，键含对象 etag/version，覆盖自动失效，LRU 容量回收 `s3.image_cache_mb`）；响应观测头 `X-Using-Time` / `X-Gimg-Ops-Time` / `X-Gimg-Cache`；ops 裸名合法（`grayscale` ≡ `grayscale()`），非法管道显式 400 不再静默透传；
 - **网络**：region 通配（`'*'`）、virtual-host + path-style、多 endpoint、每 endpoint 泛域名证书 + bucket 自定义域名独立证书（SNI 分发、替换热加载）；
 - **计费**：`s3_usage` 按 用户 × 桶记账（请求数/字节/存储/对象数），SQL 直查 + `EXPORT S3 USAGE` + HTTP `/_glacier/s3/usage` 导出。
+- **chunk 池去重存储（v1.3.13）**：分块数据内容寻址入池、跨对象/版本/桶引用共享——
+  CopyObject 零拷贝（纯元数据操作）、同名覆盖与 multipart 重传自动共享未变化分块、
+  删除走 refcnt 归零墓碑 + 定期 GC；去重范围 `s3.dedup_scope`：`bucket`（桶内）/
+  `user`（同属主跨桶，默认）/ `system`（全实例，⚠ 存在闪传探测侧信道风险）；
+- **文件闪传秒传（v1.3.13）**：PUT 带 `x-glacier-flash: sha256:<hex>`（可选
+  `x-glacier-flash-size`）命中直接建对象返回 etag（请求体可省略），未命中幂等降级；
+  或两段式 `POST /{bucket}/{key}?quick_transfer=<sha256>`，未命中 404 后再全量 PUT；
+- **gzip 传输压缩（v1.3.13）**：GET 响应压缩（`s3.gzip_level`，默认 5），反代场景
+  请求头 `x-glaciertdb-gzip: 0` 关闭（非签名头，代理层可注入）；Range / 图片 / 已压缩
+  内容自动跳过；
+- **打包下载（v1.3.13）**：`GET /{bucket}?x-glacier-archive=<prefix>&format=tar|tar.gz|zip&mode=stream|done`
+  ——流式边打包边发（tar）；完成后下载先落包再整包发（总大小上限
+  `s3.archive_sync_max_mb` 默认 512MB，临时包弹性驱逐）；
+- **数据主动同步「数据北上」（v1.3.13）**：`s3.sync` 规则把桶数据事件驱动推送到远端
+  S3 端点（备份 / 业务伴随同步），失败退避重试、每对象结果回调、前缀匹配多规则；
+  防自旋三层：`x-glacier-instance-id` 头直环拒绝 + `sync-origin` 元数据断多跳环 +
+  删除传播默认关闭；
+- **排障套件（v1.3.13）**：全部响应恒带 `x-glacier-request-id` / `x-glacier-instance-id`
+  / `x-glacier-error-code` 头；`s3.error_log` 开启后所有错误落结构化 JSON 行日志；
+  `SHOW S3 SPACE` 暴露 chunk 池规模、`SHOW S3 SYNC` 暴露同步引擎观测。
+
+
 
 ### 6. Redis 键值/队列（`kv.enable`）
 
@@ -202,6 +243,15 @@ AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked` 流式—�
 - **HELLO / RESP3 空值兼容**：`HELLO` 最小应答（server map + `proto:2`，**redis-py ≥ 8 默认 RESP3 握手直连可用**）；`HELLO 3` 连接的空值应答发 RESP3 null 帧 `_`（redis-py ≥8 的 GET miss/MGET/BLPOP 超时不再挂死），RESP2 连接维持 `$-1`/`*-1`；
 - **TTL**：惰性过期 + 定期扫描；**变更实时写 SQLite（`glacier_kv.db`）重启无损**；
 - **命名空间 = 登录账号**（跨用户不可见）；**内存治理**：`kv.max_memory_mb` + `allkeys-lru/volatile-lru/noeviction`；`SHOW KV STATS` / `kv_stats` 占用与命中率。
+- **驱逐优先级（v1.3.13）**：`KEYPRIO key <n>`（-1 = 未设置走 LRU，0-255 显式，0 最先
+  驱逐 / 255 最受保护）+ `GETPRIO key`；内存超限先按显式优先级升序淘汰、再纯 LRU，
+  INFO 暴露 `evicted_prio` / `evicted_lru` 分层计数；
+- **SQL 读穿透（v1.3.13）**：`KV SOURCE ADD <key前缀> <db> '<SQL 模板>' [TTL <ms>]`
+  注册回源规则（仅 super，模板占位 `{key}` / `{N}` 按 `:` 分段）——GET miss 时按规则
+  回源业务库（权限边界：仅同用户名下 db）并 NX 回填缓存，single-flight 防击穿，
+  命中/未命中/耗时计数进 INFO 与 SHOW KV STATS。
+
+
 
 ### 7. RabbitMQ 队列（`mq.enable`）
 
@@ -386,6 +436,7 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 | MySQL 8 兼容 / 列类型 / MQTT | 运算符/函数/DDL/维护语句/用户变量、列类型映射（TEXT 落盘/查出还原/类型回放）、时序冷压缩固化（自动解冻）、MQTT ws+tcp 桥接 |
 | 多租户 / 加密 | 库可见性过滤/DEFAULT_DB/USE 1044/账号级配额；底层文件加密（adiantum）+ 存量自动迁移 + 加密重启持久化 |
 | v1.3.10 专项 | **本机回环防爆破豁免（40 次错误密码后本机仍可登录）、CLI -unlock-user/-show-locks（服务运行中）、mysql.enable=false 不监听 3309 冒烟** |
+| v1.3.13 专项 | **chunk 池去重 + 闪传（A/B 两形态 + 并发秒传不重复 + user 范围跨桶共享 + CopyObject 零拷贝 + 删引用保护）、gzip（压缩往返/头开关/Range identity/图片跳过）、打包下载（stream tar / done zip·tar.gz）、KV 驱逐优先级（KEYPRIO/GETPRIO/边界/INFO）、KV SQL 读穿透（回源回填/显式写优先/空结果 miss/规则管理）、SCRIPT 显式报错、实例 ID 四面一致、排障头；场景拓扑：版本号隐藏 + 心跳上报 + 数据北上同步（远端实例 + 回调接收器 + sync-origin 元数据 + 防自旋 409）+ 实例 ID 重启不变 + S3 结构化错误日志** |
 
 ---
 
@@ -393,11 +444,14 @@ log: { level: info, slow_query_ms: 200, sql_log_file: "" }
 
 | 版本 | 主题 | 状态 |
 | --- | --- | --- |
-| v1.3.10 | **稳定性更新首个版本**：图片管道多核提速 + 结果磁盘缓存；防爆破本机回环豁免 + CLI 解锁；`mysql.enable` 开关；默认配置路径 `config.yaml`；boto3 CRC32 trailer 兼容 | ✅ |
+| v1.3.10 | **稳定性更新首个版本**：图片管道多核提速 + 结果磁盘缓存；防爆破本机回环豁免 + CLI 解锁；`mysql.enable` 开关；默认配置路径 `config.yaml`；boto3 CRC32 trailer 兼容 | ⛔ 已撤版（重大安全缺陷，v1.3.11 修复） |
 | v1.3.11 | **S3 存储层重写（8MB 分片直写 + 零拷贝合并 + manifest Range 206）· 图片裁剪融合 blend · SUBMIT S3 文本/文件检索与异步删除 · SHOW S3 SPACE / S3 VACUUM 空间回收 · 时序大表谓词（TS_UNIT 秒/毫秒/微秒自动换算，冷/rollup 不再固定 points）· **租户隔离安全大修**（copy-source 越权 / DROP DATABASE / SUBMIT 绕权 / WITH-DML 误判 / 管理面禁入 / 任务属主）· S3 读记账内存化 + LIST 索引区间化** | ✅ |
 | v1.3.12 | **S3 并行上传性能重构（写路径单事务化 + 请求热路径元数据缓存 + 暂存内存化 + 连接池 4→16）· TLS 全面上线（3309 双模式共存 + MySQL 协议内升级 + mqtts/wss）· 在线备份 CLI `-backup`（VACUUM INTO 快照不阻塞业务）· SQLite 调优暴露（wal_autocheckpoint / journal_size_limit）· S3 region 统一 + 回调三级配置 + virtual-host 域名兜底解析修复 · systemd 看门狗样例** | ✅ |
 
-历史版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)。
+| v1.3.13 | **存储效率与可观测性**：S3 chunk 池内容寻址去重（link 引用 + is-delete 墓碑 GC + CopyObject 零拷贝 + `dedup_scope` 三档）· 文件闪传秒传（`x-glacier-flash` 头 + `quick_transfer` 两段式）· gzip 传输压缩（反代友好 `x-glaciertdb-gzip` 头）· 打包下载（流式 tar / 完成后 tar.gz·zip）· 数据主动同步引擎（防自旋 + sync-origin 断环 + 失败退避重试 + 每对象回调）· KV 驱逐优先级（KEYPRIO/GETPRIO）+ SQL 读穿透回源（KV SOURCE 规则 + single-flight）· 实例唯一 ID 全组件暴露 · S3 排障头 + 结构化错误日志 · 版本号隐藏 · 心跳上报 · 防爆破扩面收口 · UDS 本地连接加速 · SCRIPT 能力临时屏蔽（v1.3.14 安全重构后恢复） | ✅ |
+
+历史版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)
+（**旧版本资产已撤下，仅从 Releases 获取最新版**）。
 
 ---
 

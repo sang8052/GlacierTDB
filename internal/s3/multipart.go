@@ -156,7 +156,7 @@ func (s *Store) spoolPart(r io.Reader) (*spool, error) {
 	return sp, nil
 }
 
-// writePartFromSpool 暂存内容 → 分块表暂存区 + s3_parts 元数据（调用方持 writeMu 前置检查后）。
+// writePartFromSpool 暂存内容 → 分块池 + 引用表暂存区 + s3_parts 元数据（调用方持 writeMu 前置检查后）。
 func (s *Store) writePartFromSpool(bucket, key, uploadID string, partNumber int, sp *spool, etag string) (string, error) {
 	defer sp.close()
 	s.writeMu.Lock()
@@ -177,6 +177,14 @@ func (s *Store) writePartFromSpool(bucket, key, uploadID string, partNumber int,
 		return "", err
 	}
 	defer tx.Rollback()
+	// 重传覆盖：先释放旧暂存段的池引用（v1.3.13）
+	oldHashes, err := s.collectChunkHashesInTx(tx, tbl, key, uploadID, base, base+mpuSeqStride)
+	if err != nil {
+		return "", err
+	}
+	if err := releaseChunkRefs(tx, oldHashes); err != nil {
+		return "", err
+	}
 	if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=? AND seq>=? AND seq<?`, tbl),
 		key, uploadID, base, base+mpuSeqStride); err != nil {
 		return "", err
@@ -187,23 +195,11 @@ func (s *Store) writePartFromSpool(bucket, key, uploadID string, partNumber int,
 		if rerr != nil {
 			return "", rerr
 		}
-		buf := make([]byte, s.chunkSize)
-		for {
-			n, rerr := io.ReadFull(rc, buf)
-			if n > 0 {
-				if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,seq,data) VALUES(?,?,?,?)`, tbl),
-					key, uploadID, base+chunks, buf[:n]); err != nil {
-					return "", err
-				}
-				chunks++
-			}
-			if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
-				break
-			}
-			if rerr != nil {
-				return "", rerr
-			}
+		hashes, _, werr := s.writeChunkRefsFromReader(tx, tbl, key, uploadID, s.scopeFor(b), base, rc)
+		if werr != nil {
+			return "", werr
 		}
+		chunks = int64(len(hashes))
 	}
 	if _, err := tx.Exec(`INSERT INTO s3_parts(upload_id,part_number,size,etag,created_ts,chunks) VALUES(?,?,?,?,?,?)
 		ON CONFLICT(upload_id,part_number) DO UPDATE SET size=excluded.size, etag=excluded.etag,
@@ -216,6 +212,29 @@ func (s *Store) writePartFromSpool(bucket, key, uploadID string, partNumber int,
 	}
 	s.AddUsage(b.Owner, bucket, "PUT", size, 0)
 	return etag, nil
+}
+
+// collectChunkHashesInTx 取引用行池键（事务内；seq 区间可选，both<0 = 不限）。
+func (s *Store) collectChunkHashesInTx(tx *sql.Tx, tbl, key, ver string, seqLo, seqHi int64) ([]string, error) {
+	q := fmt.Sprintf(`SELECT hash FROM %s WHERE key=? AND version_id=?`, tbl)
+	var args []any = []any{key, ver}
+	if seqLo >= 0 && seqHi > seqLo {
+		q += ` AND seq>=? AND seq<?`
+		args = append(args, seqLo, seqHi)
+	}
+	rows, err := tx.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err == nil {
+			out = append(out, h)
+		}
+	}
+	return out, rows.Err()
 }
 
 // UploadPartCopy 拷贝分片（v1.3.5；v1.3.11 改区间流式）：从源对象读取指定字节
@@ -378,15 +397,6 @@ func (s *Store) CompleteMultipart(bucket, key, uploadID string, parts []PartSpec
 	if len(attrs.Metadata) > 0 {
 		metaJSON = MarshalPolicy(attrs.Metadata)
 	}
-	manifest := ""
-	if storage == "chunk" {
-		mf := chunkManifest{CS: s.chunkSize}
-		for _, sp := range parts {
-			n := stored[sp.PartNumber].Size
-			mf.Parts = append(mf.Parts, [4]int64{int64(sp.PartNumber) * mpuSeqStride, chunksFor(n, s.chunkSize), n, s.chunkSize})
-		}
-		manifest = MarshalPolicy(mf)
-	}
 
 	// v1.3.12：删旧 + 转正 + 聚合 UPSERT 合并为单事务（此前聚合与记账是
 	// 提交后的独立写事务，Complete 全程持锁 6 次 commit）
@@ -402,15 +412,50 @@ func (s *Store) CompleteMultipart(bucket, key, uploadID string, parts []PartSpec
 			return out, false, err
 		}
 	} else {
-		// 清理旧正式行（只清 version_id=''，不碰其他会话的暂存行）
-		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, chunkTbl), key); err != nil {
-			return out, false, err
-		}
-		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, b.TableName), key); err != nil {
+		// 清理旧正式行（只清 version_id=''，不碰其他会话的暂存行；池引用同事务释放）
+		if err := s.deleteObjectRowsTx(tx, b, key, ""); err != nil {
 			return out, false, err
 		}
 		replaced = oldCount > 0
 	}
+
+	// v2 清单（v1.3.13）：暂存段引用按最终 seq 顺序取池键序列 + 各块实际字节数
+	//（multipart 各 part 末块不满块，Range 定位按累计字节数）
+	manifest := ""
+	var chunkHashes []string
+	if storage == "chunk" {
+		rows, qerr := tx.Query(fmt.Sprintf(`SELECT hash FROM %s WHERE key=? AND version_id=? ORDER BY seq`, chunkTbl),
+			key, uploadID)
+		if qerr != nil {
+			return out, false, qerr
+		}
+		for rows.Next() {
+			var h string
+			if err := rows.Scan(&h); err != nil {
+				rows.Close()
+				return out, false, err
+			}
+			chunkHashes = append(chunkHashes, h)
+		}
+		rows.Close()
+		// 校验引用数 = 各 part 自身分块数之和（part 末块可不满块；
+		// 不能用 chunksFor(total)——每片独立分块，3 片各 <8MB 时引用数是 3）
+		var expectChunks int64
+		for _, sp := range parts {
+			expectChunks += chunksFor(stored[sp.PartNumber].Size, s.chunkSize)
+		}
+		if int64(len(chunkHashes)) != expectChunks {
+			return out, false, &s3Error{Code: "InvalidPart", Status: 400,
+				Msg: "staged chunk refs mismatch (part data missing)"}
+		}
+		chunkSizes := make([]int64, 0, len(chunkHashes))
+		for _, sp := range parts {
+			chunkSizes = append(chunkSizes, chunkSizeSeq(stored[sp.PartNumber].Size, s.chunkSize,
+				int(chunksFor(stored[sp.PartNumber].Size, s.chunkSize)))...)
+		}
+		manifest = MarshalPolicy(chunkManifestV2{V: 2, CS: s.chunkSize, HS: chunkHashes, SS: chunkSizes})
+	}
+
 	_, err = tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,is_latest,delete_marker,size,etag,
 		content_type,content_encoding,cache_control,content_disposition,metadata,content,storage,manifest,
 		legal_hold,retention_mode,retain_until,created_ts)
@@ -430,21 +475,28 @@ func (s *Store) CompleteMultipart(bucket, key, uploadID string, parts []PartSpec
 			}
 		}
 	} else {
-		// 小对象：按 part 顺序装配 content 列后清理分块行
+		// 小对象：按 part 顺序装配 content 列后清理分块行（池引用随删除释放）
 		var content []byte
 		for _, sp := range parts {
 			base := int64(sp.PartNumber) * mpuSeqStride
 			prows, qerr := tx.Query(fmt.Sprintf(
-				`SELECT data FROM %s WHERE key=? AND version_id=? AND seq>=? AND seq<? ORDER BY seq`, chunkTbl),
+				`SELECT data, hash FROM %s WHERE key=? AND version_id=? AND seq>=? AND seq<? ORDER BY seq`, chunkTbl),
 				key, uploadID, base, base+mpuSeqStride)
 			if qerr != nil {
 				return out, false, qerr
 			}
 			for prows.Next() {
 				var data []byte
-				if err := prows.Scan(&data); err != nil {
+				var h string
+				if err := prows.Scan(&data, &h); err != nil {
 					prows.Close()
 					return out, false, err
+				}
+				if len(data) == 0 && h != "" { // 池引用行：回池取数据
+					if err := tx.QueryRow(`SELECT data FROM s3_chunks WHERE hash=?`, h).Scan(&data); err != nil {
+						prows.Close()
+						return out, false, err
+					}
 				}
 				content = append(content, data...)
 			}
@@ -456,6 +508,13 @@ func (s *Store) CompleteMultipart(bucket, key, uploadID string, parts []PartSpec
 		}
 		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET content=? WHERE key=? AND version_id=?`, b.TableName),
 			content, key, versionID); err != nil {
+			return out, false, err
+		}
+		stagingHashes, herr := s.collectChunkHashesInTx(tx, chunkTbl, key, uploadID, -1, -1)
+		if herr != nil {
+			return out, false, herr
+		}
+		if err := releaseChunkRefs(tx, stagingHashes); err != nil {
 			return out, false, err
 		}
 		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=?`, chunkTbl), key, uploadID); err != nil {
@@ -503,7 +562,8 @@ func chunksFor(size, chunkSize int64) int64 {
 	return (size + chunkSize - 1) / chunkSize
 }
 
-// AbortMultipart 中止分片上传：清理暂存分块行、元数据与会话（幂等；含旧版布局兼容）。
+// AbortMultipart 中止分片上传：清理暂存分块引用（池计数回退）、元数据与会话
+//（幂等；含旧版布局兼容——旧数据行无 hash 引用，直接删行）。
 func (s *Store) AbortMultipart(bucket, key, uploadID string) error {
 	if _, err := s.uploadLocked(bucket, key, uploadID); err != nil {
 		return err
@@ -515,16 +575,31 @@ func (s *Store) AbortMultipart(bucket, key, uploadID string) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	tbl := chunkTableFor(b.TableName)
-	if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=?`, tbl), key, uploadID); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=?`, tbl), legacyMPUKey+uploadID); err != nil {
+	defer tx.Rollback()
+	hashes, err := s.collectChunkHashesInTx(tx, tbl, key, uploadID, -1, -1)
+	if err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`DELETE FROM s3_parts WHERE upload_id=?`, uploadID); err != nil {
+	if err := releaseChunkRefs(tx, hashes); err != nil {
 		return err
 	}
-	if _, err := s.db.Exec(`DELETE FROM s3_uploads WHERE upload_id=?`, uploadID); err != nil {
+	if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=?`, tbl), key, uploadID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=?`, tbl), legacyMPUKey+uploadID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM s3_parts WHERE upload_id=?`, uploadID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM s3_uploads WHERE upload_id=?`, uploadID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	s.AddUsage(b.Owner, bucket, "DELETE", 0, 0)

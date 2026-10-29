@@ -32,6 +32,9 @@ var (
 	reJobsTable  = regexp.MustCompile(`(?is)^SELECT\s+(.+?)\s+FROM\s+query_jobs(?:\s+WHERE\s+(.+?))?(?:\s+ORDER\s+BY\s+.+?)?(?:\s+LIMIT\s+\d+(?:\s*,\s*\d+)?)?\s*$`)
 )
 
+// errScriptDisabled SCRIPT 子句显式报错（v1.3.13 临时屏蔽；不静默忽略）。
+var errScriptDisabled = fmt.Errorf("SCRIPT temporarily disabled (security rework, see v1.3.14)")
+
 // parseSubmitOpts 解析 SUBMIT 之后的选项段。
 func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time.Time, win [2]string, weekWd int, when, part, partBytes, script, scriptOut string, retainSec, everySec int, everyAt string, everyWd, everyWeeks, everyMonths, everyMonthDay int, everyYears int, everyYearDay string, err error) {
 	s := strings.TrimSpace(rest)
@@ -296,8 +299,19 @@ func parseSubmitOpts(rest string) (cb, cbOpt, sign string, timeout int, at *time
 			retainSec = n
 			i++
 		case "SCRIPT":
-			script = strings.Trim(next(), "'")
+			// SCRIPT 能力 v1.3.13 起临时屏蔽（安全边界整改，恢复与增强排在
+			// v1.3.14：S3 脚本源、运行日志随其后）。语法入口保留但显式报错，
+			// 不静默忽略子句；执行链路（asyncq.runScript）同步注释封存。
+			// —— 恢复方法：解开本处报错与 asyncq.go 中 runScript 调用的注释。
+			next() // 消费脚本路径参数（保持 token 流一致性）
 			i++
+			if i+1 < len(toks) && strings.EqualFold(toks[i+1], "OUTPUT") {
+				next()
+				next()
+				i += 2
+			}
+			err = errScriptDisabled
+			return
 		case "OUTPUT":
 			scriptOut = strings.ToLower(next())
 			i++

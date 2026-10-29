@@ -25,9 +25,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"glaciertdb/internal/config"
+	"glaciertdb/internal/instance"
 	"glaciertdb/internal/logx"
 	"glaciertdb/internal/meta"
 	"glaciertdb/internal/sqlite"
@@ -355,15 +357,19 @@ func (e *Engine) execute(j *Job) {
 	f.Close()
 
 	// SCRIPT 后处理管道（v1.1.1）：结果 JSONL → 脚本 stdin → 产物落 jobs/<id>.<output>
-	if j.Script != "" {
-		e.mu.Lock()
-		j.State = StateScript
-		e.mu.Unlock()
-		if err := e.runScript(j); err != nil {
-			e.finish(j, StateError, err.Error())
-			return
-		}
-	}
+	// v1.3.13 临时屏蔽（安全边界整改，恢复排 v1.3.14）：提交入口已在
+	// handler/async_cmds.go 显式报错；此处执行链路注释封存（runScript 代码保留）。
+	// —— 恢复方法：解开下方注释块。
+	// if j.Script != "" {
+	// 	e.mu.Lock()
+	// 	j.State = StateScript
+	// 	e.mu.Unlock()
+	// 	if err := e.runScript(j); err != nil {
+	// 		e.finish(j, StateError, err.Error())
+	// 		return
+	// 	}
+	// }
+	_ = j.Script // 屏蔽期保持引用（提交入口已拒绝 SCRIPT 子句，此处恒空）
 
 	e.finish(j, StateDone, "")
 }
@@ -430,12 +436,13 @@ func (e *Engine) finish(j *Job, st State, errMsg string) {
 	}
 	if j.CallbackURL != "" {
 		payload := map[string]any{
-			"job_id":     j.ID,
-			"state":      string(j.State),
-			"rows":       j.Rows,
-			"bytes":      j.Bytes,
-			"elapsed_ms": j.ElapsedMs,
-			"expires_ts": j.ExpiresTS.Format("2006-01-02 15:04:05"),
+			"job_id":      j.ID,
+			"instance_id": instance.UUID(), // 中心侧区分来源盒子（v1.3.13 §7.3）
+			"state":       string(j.State),
+			"rows":        j.Rows,
+			"bytes":       j.Bytes,
+			"elapsed_ms":  j.ElapsedMs,
+			"expires_ts":  j.ExpiresTS.Format("2006-01-02 15:04:05"),
 		}
 		if j.Error != "" {
 			payload["error"] = j.Error
@@ -1001,3 +1008,34 @@ func wdCN(wd int) string {
 
 // ScheduleExpr 人类可读周期表达（query_jobs.schedule 列）。
 func (j *Job) ScheduleExpr() string { return scheduleExpr(j) }
+
+// ---------------------------------------------------------------------------
+// 主引擎注册（v1.3.13）：心跳上报等跨组件观测面读取异步任务积压用。
+// 实践中仅一个 Engine 实例（proxy.Run 创建）；未注册时 PendingGauge 返回 0。
+// ---------------------------------------------------------------------------
+
+var primary atomic.Pointer[Engine]
+
+// SetPrimary 注册主引擎实例。
+func SetPrimary(e *Engine) { primary.Store(e) }
+
+// PendingJobs 当前积压（PENDING + RUNNING + SCRIPT）作业数。
+func (e *Engine) PendingJobs() int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var n int64
+	for _, j := range e.jobs {
+		if j.State == StatePending || j.State == StateRunning || j.State == StateScript {
+			n++
+		}
+	}
+	return n
+}
+
+// PrimaryPending 主引擎积压作业数（未注册 = 0）。
+func PrimaryPending() int64 {
+	if e := primary.Load(); e != nil {
+		return e.PendingJobs()
+	}
+	return 0
+}

@@ -14,6 +14,7 @@ import (
 
 	"glaciertdb/internal/auth"
 	"glaciertdb/internal/config"
+	"glaciertdb/internal/instance"
 	"glaciertdb/internal/logx"
 )
 
@@ -309,11 +310,23 @@ func (s *session) dispatch(cmd string, rest []string) bool {
 		}
 
 	case "INFO":
+		// v1.3.13：glaciertdb_instance_id 字段（§6.2）+ 驱逐优先级分层计数 +
+		// SQL 回源观测（§3.2）；hide_version 开启时 version 字段隐藏
+		ver := config.DisplayVersion()
+		if ver == "" {
+			ver = "hidden"
+		}
+		srcH, srcM, srcE, srcUs := store.SourceCounters()
 		reply(func() {
-			w.BulkStr(fmt.Sprintf("# Server\r\nredis_version:glaciertdb-kv\r\nuptime_in_seconds:%d\r\n"+
+			w.BulkStr(fmt.Sprintf("# Server\r\nredis_version:glaciertdb-kv\r\nglaciertdb_version:%s\r\n"+
+				"glaciertdb_instance_id:%s\r\nuptime_in_seconds:%d\r\n"+
 				"# Memory\r\nused_memory:%d\r\nmaxmemory:%d\r\nmaxmemory_policy:%s\r\n"+
-				"# Stats\r\nops:%d\r\n", store.UptimeSec(), store.MemBytes(),
-				int64(store.MaxMemoryMB())<<20, store.Eviction(), store.OpsTotal()))
+				"evicted_prio:%d\r\nevicted_lru:%d\r\n"+
+				"# ReadThrough\r\nsource_hits:%d\r\nsource_misses:%d\r\nsource_errors:%d\r\nsource_exec_us_total:%d\r\n"+
+				"# Stats\r\nops:%d\r\n", ver, instance.UUID(), store.UptimeSec(), store.MemBytes(),
+				int64(store.MaxMemoryMB())<<20, store.Eviction(),
+				store.EvictedPrioCount(), store.EvictedLRUCount(),
+				srcH, srcM, srcE, srcUs, store.OpsTotal()))
 		})
 
 	case "HELLO":
@@ -348,10 +361,15 @@ func (s *session) dispatch(cmd string, rest []string) bool {
 			}
 		}
 		id := atomic.AddUint64(&helloConnSeq, 1)
+		hver := config.DisplayVersion()
+		if hver == "" {
+			hver = "0.0.0" // hide_version：保持合法版本号格式（v1.3.13 §6.4）
+		}
 		reply(func() {
 			w.BulkArray([][]byte{
 				[]byte("server"), []byte("redis"),
-				[]byte("version"), []byte(config.GlacierVersion),
+				[]byte("version"), []byte(hver),
+				[]byte("glaciertdb_instance_id"), []byte(instance.UUID()),
 				[]byte("proto"), []byte("2"),
 				[]byte("id"), []byte(fmt.Sprintf("%d", id)),
 				[]byte("mode"), []byte("standalone"),
@@ -453,6 +471,12 @@ func (s *session) dispatch(cmd string, rest []string) bool {
 			return false
 		}
 		v, ok, gerr := store.Get(ns, rest[0])
+		if gerr == nil && !ok && ns != "" {
+			// SQL 读穿透回源（v1.3.13 §3.2）：规则命中 → 回源查询 + NX 回填
+			if bv, ok2 := store.sourceLookup(ns, rest[0]); ok2 {
+				v, ok = bv, true
+			}
+		}
 		reply(func() {
 			if gerr != nil {
 				w.Error(gerr.Error())
@@ -462,6 +486,36 @@ func (s *session) dispatch(cmd string, rest []string) bool {
 				w.Bulk(v)
 			}
 		})
+
+	case "KEYPRIO":
+		// 驱逐优先级设置（v1.3.13 §3.1）：KEYPRIO key <n>（n = -1 清除回归 LRU）
+		if len(rest) != 2 {
+			reply(func() { w.Error("ERR wrong number of arguments for 'keyprio' command") })
+			return false
+		}
+		n, perr := strconvParseInt(rest[1])
+		if perr != nil || n < -1 || n > 255 {
+			reply(func() { w.Error("ERR priority out of range (expect -1..255)") })
+			return false
+		}
+		applied, serr := store.SetPrio(ns, rest[0], int(n))
+		reply(func() {
+			if serr != nil {
+				w.Error(serr.Error())
+			} else if !applied {
+				w.Int(0)
+			} else {
+				w.Simple("OK")
+			}
+		})
+
+	case "GETPRIO":
+		// 驱逐优先级查询：-2 键不存在 / -1 未设置 / 0-255 显式
+		if len(rest) != 1 {
+			reply(func() { w.Error("ERR wrong number of arguments for 'getprio' command") })
+			return false
+		}
+		reply(func() { w.Int(int64(store.GetPrio(ns, rest[0]))) })
 
 	case "SET":
 		if len(rest) < 2 {
@@ -958,15 +1012,21 @@ func doAuth(rest []string, ip, remote string, auths *auth.Store) (string, bool) 
 	if auths == nil {
 		return "", false
 	}
+	// 防爆破锁定检查前置（v1.3.13 §6.1 扩面对齐 MySQL 侧语义）：锁定期内连
+	// 正确密码也拒绝，失败照记审计（保持计数窗口活跃）
+	if locked, _ := auths.IPLocked(ip); locked {
+		auths.RecordLogin(ip, remote, user, false, "kv: ip locked")
+		return "", false
+	}
+	if user != "" {
+		if locked, _ := auths.AccountLocked(user); locked {
+			auths.RecordLogin(ip, remote, user, false, "kv: account locked")
+			return "", false
+		}
+	}
 	u, ok, err := auths.Lookup(user)
 	if err != nil || !ok || u.Password != pass {
 		auths.RecordLogin(ip, remote, user, false, "kv: wrong password")
-		return "", false
-	}
-	if locked, _ := auths.IPLocked(ip); locked {
-		return "", false
-	}
-	if locked, _ := auths.AccountLocked(user); locked {
 		return "", false
 	}
 	if ok, _ := auths.HostOK(user, ip); !ok {

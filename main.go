@@ -13,8 +13,11 @@ import (
 	"strings"
 
 	"glaciertdb/internal/auth"
+	"glaciertdb/internal/asyncq"
 	"glaciertdb/internal/colmeta"
 	"glaciertdb/internal/dirlock"
+	"glaciertdb/internal/heartbeat"
+	"glaciertdb/internal/instance"
 	"glaciertdb/internal/kv"
 	"glaciertdb/internal/mq"
 	"glaciertdb/internal/s3"
@@ -73,6 +76,7 @@ func main() {
 		cfg.Listen = *listen
 	}
 	logx.SetLevel(logx.ParseLevel(cfg.Log.Level))
+	config.SetHideVersion(cfg.Security.HideVersion)
 
 	// CLI 在线备份模式（v1.3.12 P0-1）：不抢目录锁（WAL 多进程读安全），
 	// 全部库 VACUUM INTO 快照单文件；全部成功后原子落位目标目录
@@ -161,6 +165,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 实例唯一 ID（v1.3.13 §6.2）：UUID 存系统库（glacier_auth.db），首启生成重启不变；
+	// 全组件经 instance.UUID() 读取（MySQL @@glaciertdb_instance_id / Redis INFO /
+	// S3 响应头 / AMQP 能力串 / 启动日志 / 异步回调 payload）
+	if _, err := instance.Load(authDB); err != nil {
+		logx.Errorf("init instance id: %v", err)
+		os.Exit(1)
+	}
+	logx.Infof("instance id: %s (version=%s hide_version=%v)", instance.UUID(), config.GlacierVersion, cfg.Security.HideVersion)
+
 	// 对象存储（v1.1.0，可选模块）：s3.enable 开启时启动独立 HTTP(S) 监听器
 	//（默认 0.0.0.0:9000，AWS Signature V4；管理面 SQL 同步可用）
 	var s3store *s3.Store
@@ -237,6 +250,14 @@ func main() {
 		sdNotify("STOPPING=1")
 		os.Exit(0)
 	}()
+
+	// 主动心跳上报（v1.3.13 §6.5，默认关）：定时 POST 规模/健康 JSON 到用户自建
+	// HTTP 中心，失败仅记日志
+	if cfg.Heartbeat.URL != "" {
+		registerHeartbeatCollectors(s3store, kvstore, mqstore)
+		go heartbeat.Run(cfg.Heartbeat, time.Now())
+		logx.Infof("heartbeat: reporting to %s every %ds", cfg.Heartbeat.URL, cfg.Heartbeat.IntervalSec)
+	}
 
 	if err := proxy.Run(cfg, backend, authStore, s3store, s3srv, kvstore, mqstore, cmeta); err != nil {
 		logx.Errorf("listen %s: %v", cfg.Listen, err)
@@ -334,6 +355,40 @@ func watchdogLoop(backend *sqlite.Backend) {
 		}
 		sdNotify("WATCHDOG=1")
 	}
+}
+
+// registerHeartbeatCollectors 心跳规模采集（各组件关闭则不注册对应采集器）。
+func registerHeartbeatCollectors(s3store *s3.Store, kvstore *kv.Store, mqstore *mq.Store) {
+	if s3store != nil {
+		heartbeat.RegisterS3(func() map[string]any {
+			var objects, bytes int64
+			bs := s3store.ListBuckets("")
+			for _, b := range bs {
+				objects += b.ObjectCount
+				bytes += b.StorageBytes
+			}
+			return map[string]any{"buckets": len(bs), "objects": objects, "bytes": bytes}
+		})
+	}
+	if kvstore != nil {
+		heartbeat.RegisterKV(func() map[string]any {
+			var keys int64
+			for _, r := range kvstore.Stats() {
+				if r.NS != "*" {
+					keys += r.Keys
+				}
+			}
+			return map[string]any{"keys": keys, "memory_bytes": kvstore.MemBytes()}
+		})
+	}
+	if mqstore != nil {
+		heartbeat.RegisterMQ(func() map[string]any {
+			return map[string]any{"queues": mqstore.QueueCount(), "messages": mqstore.MessageCount()}
+		})
+	}
+	heartbeat.RegisterAsync(func() map[string]any {
+		return map[string]any{"pending": asyncq.PrimaryPending()}
+	})
 }
 
 // backendVacuum CLI 真空（独立于服务进程的轻量后端：仅做 VACUUM）。

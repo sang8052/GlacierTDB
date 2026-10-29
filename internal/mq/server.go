@@ -11,6 +11,7 @@ import (
 
 	"glaciertdb/internal/auth"
 	"glaciertdb/internal/config"
+	"glaciertdb/internal/instance"
 	"glaciertdb/internal/logx"
 )
 
@@ -90,7 +91,7 @@ func (cs *connState) serve(_ []byte) {
 		"version":    srvVer,
 		"platform":   "Go",
 		"copyright":  "",
-		"information": "GlacierTDB AMQP 0-9-1 basic queue",
+		"information": "GlacierTDB AMQP 0-9-1 basic queue (instance " + instance.UUID() + ")", // 实例 ID 能力串带出（v1.3.13 §6.2）
 		"capabilities": map[string]any{
 			"basic.nack":             true,
 			"consumer_cancel_notify": true,

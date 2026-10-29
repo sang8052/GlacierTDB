@@ -11,6 +11,7 @@ import (
 	"glaciertdb/internal/admin"
 	"glaciertdb/internal/auth"
 	"glaciertdb/internal/config"
+	"glaciertdb/internal/instance"
 	"glaciertdb/internal/logx"
 	"glaciertdb/internal/meta"
 )
@@ -590,7 +591,16 @@ func (h *Handler) serverConfigRows() [][]any {
 	kv := [][2]string{
 		{"server", "GlacierTDB"},
 		{"glacier_version", config.GlacierVersion},
+		{"glacier_instance_id", instance.UUID()}, // 实例唯一 ID（v1.3.13 §6.2）
 		{"listen", cfg.Listen},
+		{"listen_unix", cfg.ListenUnix},
+		{"s3.dedup_scope", cfg.S3.DedupScope},
+		{"s3.gzip_level", fmt.Sprintf("%d", cfg.S3.GzipLevel)},
+		{"s3.error_log", b2s(cfg.S3.ErrorLog)},
+		{"s3.archive_sync_max_mb", fmt.Sprintf("%d", cfg.S3.ArchiveSyncMaxMB)},
+		{"s3.archive_tmp_max_mb", fmt.Sprintf("%d", cfg.S3.ArchiveTmpMaxMB)},
+		{"security.hide_version", b2s(cfg.Security.HideVersion)},
+		{"heartbeat.url", cfg.Heartbeat.URL},
 		{"server_version", cfg.ServerVersion},
 		{"db_dir", cfg.DBDir},
 		{"default_db", cfg.DefaultDB},

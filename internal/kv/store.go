@@ -22,6 +22,7 @@ type entry struct {
 	items     []listItem
 	expiresAt int64 // epoch ms，0 = 永不过期
 	lastUsed  uint64
+	prio      int   // 驱逐优先级（v1.3.13）：-1 = 未设置（纯 LRU），0-255 显式（0 最先驱逐，255 最受保护）
 }
 
 type listItem struct {
@@ -37,6 +38,8 @@ type namespace struct {
 	misses  int64
 	expired int64
 	evicted int64
+	evPrio  int64 // 显式优先级（≠-1）键的淘汰计数（v1.3.13）
+	evLRU   int64 // 未设优先级键的纯 LRU 淘汰计数（v1.3.13）
 }
 
 // Store 键值存储：内存缓存 + SQLite 实时落盘（glacier_kv.db）。
@@ -52,21 +55,54 @@ type Store struct {
 
 	blockCh chan struct{} // 阻塞弹出广播唤醒（Push 后轮换，v1.3.2）
 
-	expiredTotal atomic.Int64
-	evictedTotal atomic.Int64
-	ops          atomic.Int64
-	startTS      time.Time
+	expiredTotal   atomic.Int64
+	evictedTotal   atomic.Int64
+	evictedPrio    atomic.Int64 // 显式优先级键淘汰计数（v1.3.13）
+	evictedLRU     atomic.Int64 // 未设优先级键 LRU 淘汰计数（v1.3.13）
+	ops            atomic.Int64
+	startTS        time.Time
+
+	// SQL 读穿透（v1.3.13 §3.2）：规则表 + 执行器钩子（proxy 注入，权限边界在执行侧）
+	srcMu     sync.Mutex
+	srcRules  []SourceRule
+	srcFlight map[string]*srcCall
+	srcExec   SourceExecutor
+
+	srcHits    atomic.Int64
+	srcMisses  atomic.Int64
+	srcErrors  atomic.Int64
+	srcExecUs  atomic.Int64
 }
+
+// SourceRule KV SQL 读穿透规则（kv_sources 表；管理面 KV SOURCE ADD 注册，仅 super）。
+type SourceRule struct {
+	Prefix    string `json:"prefix"`    // key 前缀（最长前缀优先命中）
+	DB        string `json:"db"`        // 回源业务库
+	SQLTpl    string `json:"sql_tpl"`   // SQL 模板：{key} 整键代入；{N} 按 ':' 分段取第 N 段
+	TTLms     int64  `json:"ttl_ms"`    // 回填缓存 TTL（默认 300000；≤0 = 不回填，仅直返）
+	CreatedTS string `json:"created_ts"`
+}
+
+// SourceExecutor 回源 SQL 执行器：以发起请求的用户身份做库授权校验（仅同用户
+// 名下 db）后执行只读 SELECT。返回 (列名, 行集字符串化, 错误)。由 proxy 注入。
+type SourceExecutor func(user, dbName, sql string) ([]string, [][]string, error)
+
+
 
 // StatRow kv_stats 行。
 type StatRow struct {
-	NS      string
-	Keys    int64
-	Bytes   int64
-	Hits    int64
-	Misses  int64
-	Expired int64
-	Evicted int64
+	NS        string
+	Keys      int64
+	Bytes     int64
+	Hits      int64
+	Misses    int64
+	Expired   int64
+	Evicted   int64
+	EvPrio    int64 // 显式优先级键淘汰（v1.3.13）
+	EvLRU     int64 // 未设优先级键 LRU 淘汰（v1.3.13）
+	SrcHits   int64 // SQL 回源命中（v1.3.13）
+	SrcMisses int64 // SQL 回源未命中（v1.3.13）
+	SrcErrors int64 // SQL 回源执行错误（v1.3.13）
 }
 
 // Open 打开系统库并恢复内存状态，启动 TTL 扫描。
@@ -83,6 +119,10 @@ CREATE TABLE IF NOT EXISTS kv_meta (
   created_ts INTEGER NOT NULL DEFAULT 0, updated_ts INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (ns, key)
 );
+CREATE TABLE IF NOT EXISTS kv_sources (
+  prefix TEXT PRIMARY KEY, db TEXT NOT NULL, sql_tpl TEXT NOT NULL,
+  ttl_ms INTEGER NOT NULL DEFAULT 300000, created_ts TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS kv_str (
   ns TEXT NOT NULL, key TEXT NOT NULL, value BLOB,
   PRIMARY KEY (ns, key)
@@ -94,14 +134,18 @@ CREATE TABLE IF NOT EXISTS kv_list (
 		return nil, fmt.Errorf("init kv schema: %w", err)
 	}
 	s := &Store{
-		db:       db,
-		dir:      cfg.DBDir,
-		ns:       map[string]*namespace{},
-		maxB:     int64(cfg.KV.MaxMemoryMB) << 20,
-		evic:     cfg.KV.Eviction,
-		blockCh:  make(chan struct{}),
-		startTS:  time.Now(),
+		db:        db,
+		dir:       cfg.DBDir,
+		ns:        map[string]*namespace{},
+		maxB:      int64(cfg.KV.MaxMemoryMB) << 20,
+		evic:      cfg.KV.Eviction,
+		blockCh:   make(chan struct{}),
+		startTS:   time.Now(),
+		srcFlight: map[string]*srcCall{},
 	}
+	// 存量库补列（幂等）：驱动逐驱逐优先级（v1.3.13）
+	_, _ = db.Exec(`ALTER TABLE kv_meta ADD COLUMN prio INTEGER NOT NULL DEFAULT -1`)
+	s.loadSources()
 	if s.evic == "" {
 		s.evic = "allkeys-lru"
 	}
@@ -128,6 +172,18 @@ func (s *Store) load() error {
 		}
 	}
 	rows.Close()
+	// 优先级列（v1.3.13；存量库无列时静默跳过）
+	prios := map[string]int{}
+	if prows, err := s.db.Query(`SELECT ns,key,prio FROM kv_meta`); err == nil {
+		for prows.Next() {
+			var ns, key string
+			var prio int
+			if prows.Scan(&ns, &key, &prio) == nil {
+				prios[ns+"\x00"+key] = prio
+			}
+		}
+		prows.Close()
+	}
 	now := time.Now().UnixMilli()
 	for _, m := range metas {
 		if m.exp > 0 && m.exp <= now {
@@ -136,7 +192,7 @@ func (s *Store) load() error {
 			_, _ = s.db.Exec(`DELETE FROM kv_list WHERE ns=? AND key=?`, m.ns, m.key)
 			continue
 		}
-		e := &entry{expiresAt: m.exp}
+		e := &entry{expiresAt: m.exp, prio: prios[m.ns+"\x00"+m.key]}
 		if m.typ == "l" || m.typ == "list" {
 			e.typ = 'l'
 			lr, err := s.db.Query(`SELECT seq,value FROM kv_list WHERE ns=? AND key=? ORDER BY seq`, m.ns, m.key)
@@ -169,8 +225,12 @@ func (s *Store) nsGet(ns string) *namespace {
 }
 
 // putMem 挂入内存并计账（调用方持锁；旧值需先 unMem）。
+// 驱逐优先级是 key 的属性：值被覆盖时保持原优先级（KEYPRIO 独立于 SET，v1.3.13）。
 func (s *Store) putMem(ns, key string, e *entry) {
 	n := s.nsGet(ns)
+	if old := n.entries[key]; old != nil {
+		e.prio = old.prio
+	}
 	n.entries[key] = e
 	sz := estEntry(key, e)
 	n.bytes += sz
@@ -830,39 +890,109 @@ func (s *Store) recalcMem() {
 // ---------------------------------------------------------------------------
 
 // evictLocked 写后按策略淘汰（noeviction 由调用方前置检查）。
+// 驱逐优先级（v1.3.13）：内存超限时先在「显式设置了优先级（≠-1）」的键中按
+// prio 升序、同 prio 内 LRU 淘汰；仍未降到水位线以下，剩余全部键（含未设
+// 优先级的）走纯 LRU。volatile-* 策略下 prio 同样生效（无 TTL 的显式优先级键
+// 不参与 volatile 策略）。
 func (s *Store) evictLocked(protectNs, protectKey string) {
 	if s.maxB <= 0 || s.evic == "noeviction" {
 		return
 	}
+	volatileOnly := s.evic == "volatile-lru"
+	eligible := func(e *entry) bool {
+		if volatileOnly && e.expiresAt == 0 {
+			return false
+		}
+		return true
+	}
 	for s.mem > s.maxB {
+		// 第一轮：显式优先级键（prio 升序 → 同级 LRU）
 		var pickNs, pickKey string
-		var best uint64
+		bestPrio, bestUsed := 1<<30, uint64(0)
 		found := false
 		for ns, n := range s.ns {
 			for k, e := range n.entries {
-				if ns == protectNs && k == protectKey {
+				if ns == protectNs && k == protectKey || e.prio < 0 || !eligible(e) {
 					continue
 				}
-				if s.evic == "volatile-lru" && e.expiresAt == 0 {
-					continue
-				}
-				if !found || e.lastUsed < best {
-					pickNs, pickKey, best, found = ns, k, e.lastUsed, true
+				if !found || e.prio < bestPrio || (e.prio == bestPrio && e.lastUsed < bestUsed) {
+					pickNs, pickKey, bestPrio, bestUsed, found = ns, k, e.prio, e.lastUsed, true
 				}
 			}
 		}
+		prioEvict := found
 		if !found {
-			return
+			// 第二轮：全部键纯 LRU
+			for ns, n := range s.ns {
+				for k, e := range n.entries {
+					if ns == protectNs && k == protectKey || !eligible(e) {
+						continue
+					}
+					if !found || e.lastUsed < bestUsed {
+						pickNs, pickKey, bestUsed, found = ns, k, e.lastUsed, true
+					}
+				}
+			}
+			if !found {
+				return
+			}
 		}
 		s.unMem(pickNs, pickKey)
 		_, _ = s.db.Exec(`DELETE FROM kv_meta WHERE ns=? AND key=?`, pickNs, pickKey)
 		_, _ = s.db.Exec(`DELETE FROM kv_str WHERE ns=? AND key=?`, pickNs, pickKey)
 		_, _ = s.db.Exec(`DELETE FROM kv_list WHERE ns=? AND key=?`, pickNs, pickKey)
 		s.evictedTotal.Add(1)
+		if prioEvict {
+			s.evictedPrio.Add(1)
+		} else {
+			s.evictedLRU.Add(1)
+		}
 		if n := s.ns[pickNs]; n != nil {
 			n.evicted++
+			if prioEvict {
+				n.evPrio++
+			} else {
+				n.evLRU++
+			}
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 驱逐优先级命令（v1.3.13 §3.1）：KEYPRIO key <n>（n = -1 清除）/ GETPRIO key
+// ---------------------------------------------------------------------------
+
+// SetPrio 设置键驱逐优先级（-1 清除 = 回归纯 LRU；0-255 显式，0 最先驱逐 255
+// 最受保护）。键不存在返回 false。
+func (s *Store) SetPrio(ns, key string, prio int) (bool, error) {
+	if prio < -1 || prio > 255 {
+		return false, fmt.Errorf("ERR priority out of range (expect -1..255)")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ops.Add(1)
+	nd := s.nsGet(ns)
+	e := nd.entries[key]
+	if e == nil || !s.expireLocked(ns, key, e) {
+		return false, nil
+	}
+	e.prio = prio
+	_, _ = s.db.Exec(`UPDATE kv_meta SET prio=?, updated_ts=? WHERE ns=? AND key=?`,
+		prio, time.Now().UnixMilli(), ns, key)
+	s.evictLocked("", "") // 降保护级（调大 prio）可能立刻需要腾地方
+	return true, nil
+}
+
+// GetPrio 查询键驱逐优先级（-2 = 键不存在；-1 = 未设置）。
+func (s *Store) GetPrio(ns, key string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nd := s.nsGet(ns)
+	e := nd.entries[key]
+	if e == nil || !s.expireLocked(ns, key, e) {
+		return -2
+	}
+	return e.prio
 }
 
 // SetMaxMemory 热改内存上限（MB，0=不限）。
@@ -904,21 +1034,25 @@ func (s *Store) Eviction() string {
 	return s.evic
 }
 
-// Stats kv_stats 行（每命名空间 + '*' 合计）。
+// Stats kv_stats 行（每命名空间 + '*' 合计；回源计数为全局值，v1.3.13）。
 func (s *Store) Stats() []StatRow {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	srcH, srcM, srcE := s.srcHits.Load(), s.srcMisses.Load(), s.srcErrors.Load()
 	var out []StatRow
-	total := StatRow{NS: "*"}
+	total := StatRow{NS: "*", SrcHits: srcH, SrcMisses: srcM, SrcErrors: srcE}
 	for ns, n := range s.ns {
 		r := StatRow{NS: ns, Keys: int64(len(n.entries)), Bytes: n.bytes,
-			Hits: n.hits, Misses: n.misses, Expired: n.expired, Evicted: n.evicted}
+			Hits: n.hits, Misses: n.misses, Expired: n.expired, Evicted: n.evicted,
+			EvPrio: n.evPrio, EvLRU: n.evLRU}
 		total.Keys += r.Keys
 		total.Bytes += r.Bytes
 		total.Hits += r.Hits
 		total.Misses += r.Misses
 		total.Expired += r.Expired
 		total.Evicted += r.Evicted
+		total.EvPrio += r.EvPrio
+		total.EvLRU += r.EvLRU
 		out = append(out, r)
 	}
 	out = append(out, total)
@@ -1004,3 +1138,9 @@ func globMatch(pattern, s string) bool {
 
 // KvDBPath 系统库路径（运维可见）。
 func KvDBPath(dir string) string { return filepath.Join(dir, sqlite.SystemKVDB+".db") }
+
+// EvictedPrioCount 显式优先级键累计淘汰数（INFO 观测，v1.3.13）。
+func (s *Store) EvictedPrioCount() int64 { return s.evictedPrio.Load() }
+
+// EvictedLRUCount 未设优先级键累计 LRU 淘汰数（INFO 观测，v1.3.13）。
+func (s *Store) EvictedLRUCount() int64 { return s.evictedLRU.Load() }

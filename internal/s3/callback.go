@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	"glaciertdb/internal/instance"
 	"glaciertdb/internal/logx"
 )
 
@@ -39,6 +40,7 @@ func (s *Server) notifyPut(b Bucket, m ObjectMeta, replaced bool, ov *callbackOv
 	}
 	payload := map[string]any{
 		"event":        "object_created",
+		"instance_id":  instance.UUID(), // 中心侧区分来源盒子（v1.3.13 §7.3）
 		"bucket":       b.Name,
 		"key":          m.Key,
 		"version_id":   m.VersionID,

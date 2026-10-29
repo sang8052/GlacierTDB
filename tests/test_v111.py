@@ -329,42 +329,20 @@ def main() -> int:
     row = cur.fetchone()
     check("detail shard scan" in str(row[4]), "EXPLAIN PARALLEL 显示 detail shard scan 计划")
 
-    # ---------- 6. SCRIPT 后处理管道 ----------
-    cur.execute("USE GlacierTDB")
-    cur.execute("SUBMIT QUERY 'SELECT 1 AS a' SCRIPT 'pipe.js' OUTPUT done")
-    row = cur.fetchone()
-    job_id = row[0]
-    state = ""
-    for _ in range(60):
-        cur.execute("SELECT state, error FROM query_jobs WHERE job_id = %s" % quote(job_id))
-        r = cur.fetchone()
-        if r:
-            state = r[0]
-            if state in ("DONE", "ERROR"):
-                err_msg = r[1] or ""
-                break
-        time.sleep(0.3)
-    check(state == "DONE", "SUBMIT ... SCRIPT 'pipe.js' 执行完成（state=%s err=%s）" % (state, err_msg if state != "DONE" else "-"))
-    if state == "DONE":
-        cur.execute("SHOW QUERY JOBS")
-        # 产物计入 Bytes（> 仅结果 JSONL 时可判定产物已生成）
-        check(True, "SCRIPT 产物落 jobs/<id>.done")
-
-    cur.execute("SUBMIT QUERY 'SELECT 1 AS a' SCRIPT 'no_such_script.js'")
-    row = cur.fetchone()
-    job2 = row[0]
-    state2, err2 = "", ""
-    for _ in range(60):
-        cur.execute("SELECT state, error FROM query_jobs WHERE job_id = %s" % quote(job2))
-        r = cur.fetchone()
-        if r:
-            state2 = r[0]
-            err2 = r[1] or ""
-            if state2 in ("DONE", "ERROR"):
-                break
-        time.sleep(0.3)
-    check(state2 == "ERROR" and "script" in err2.lower(),
-          "SCRIPT 不存在 → ERROR（%s）" % err2[:60])
+    # ---------- 6. SCRIPT 临时屏蔽（v1.3.13）----------
+    # SCRIPT 能力自 v1.3.13 起临时停用（安全边界整改，v1.3.14 恢复）：
+    # 提交入口显式报错，不再建任务；原「执行完成 / 不存在脚本 ERROR」用例随语义退役
+    cur.execute("USE GlacierTDB")  # 回管理面（前面用例切在 rollupdb；DROP 前必须切回，否则当前库被删后语句落入透传）
+    for stmt in ("SUBMIT QUERY 'SELECT 1 AS a' SCRIPT 'pipe.js' OUTPUT done",
+                 "SUBMIT QUERY 'SELECT 1 AS a' SCRIPT 'no_such_script.js'"):
+        err_msg = ""
+        try:
+            cur.execute(stmt)
+            err_msg = "(no error raised)"
+        except Exception as e:
+            err_msg = str(e)
+        check("temporarily disabled" in err_msg,
+              "SCRIPT 临时停用显式报错（%s → %s）" % (stmt[22:44], err_msg[:60]))
 
     cur.execute("DROP DATABASE rollupdb")
     cur.execute("DROP USER 'sha2u'")

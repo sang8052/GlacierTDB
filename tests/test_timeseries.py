@@ -84,8 +84,10 @@ def main() -> int:
           AND ts >= NOW() - INTERVAL 6 HOUR AND ts < NOW() - INTERVAL 1 HOUR
         GROUP BY time(3600000) ORDER BY 1""")
     rows = cur.fetchall()
-    # 5 小时窗口起止非整点 → 跨 6 个整点桶（首尾为部分桶，中间满桶 60 点/桶）
-    check(len(rows) == 6, "time(3600000) 桶数正确（6h-1h 非整点窗口 → 6 个整点桶，实际 %d）" % len(rows))
+    # 5 小时窗口（起止非整点）→ 跨 6 个整点桶；NOW() 秒级抖动可能吞掉首/尾部分桶
+    #（数据按分钟对齐生成，窗口起点恰逢整点分界时为 5 个满桶）——桶数放宽为 5..6，
+    # 桶对齐 / 满桶 60 点 / 窗口合计 300 点为不变量（下方两条严格校验）
+    check(5 <= len(rows) <= 6, "time(3600000) 桶数正确（5 小时窗口 → 5-6 个整点桶，实际 %d）" % len(rows))
     ok_bucket = all(int(r[0]) % 3600000 == 0 for r in rows)
     ok_count = max((r[1] for r in rows), default=0) == 60 and sum(r[1] for r in rows) == 300
     check(ok_bucket, "桶起始值对齐小时整点（% 3600000 == 0）")

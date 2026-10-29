@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -100,7 +101,7 @@ func (m *ObjectMeta) lockViolation(bypassGovernance bool) error {
 
 // spool 上传内容暂存（v1.3.12）：小对象全部驻留内存（省去临时文件一写一读
 // 两次磁盘 I/O），超过阈值溢出 <db_dir>/.s3tmp 临时文件（内存占用与对象大小
-// 解耦）。全程同步计算 MD5。
+// 解耦）。全程同步计算 MD5 + SHA-256（SHA-256 供 chunk 池寻址与闪传索引，v1.3.13）。
 type spool struct {
 	buf    bytes.Buffer
 	tmp    *os.File
@@ -108,6 +109,7 @@ type spool struct {
 	memMax int
 	sz     int64
 	md5h   hash.Hash
+	sha256h hash.Hash
 }
 
 // spoolMemMax 内存暂存阈值（字节）：内联阈值与 1MB 取大——小对象（延迟敏感、
@@ -123,7 +125,7 @@ func (s *Store) spoolMemMax() int {
 }
 
 func newSpool(tmpDir string, memMax int) *spool {
-	return &spool{tmpDir: tmpDir, memMax: memMax, md5h: md5.New()}
+	return &spool{tmpDir: tmpDir, memMax: memMax, md5h: md5.New(), sha256h: sha256.New()}
 }
 
 // copyFrom 流式暂存并计算 MD5，返回总字节数。
@@ -154,6 +156,7 @@ func (p *spool) copyFrom(r io.Reader) (int64, error) {
 				p.buf.Write(chunk[:n])
 			}
 			_, _ = p.md5h.Write(chunk[:n])
+			_, _ = p.sha256h.Write(chunk[:n])
 			p.sz += int64(n)
 		}
 		if rerr == io.EOF {
@@ -167,6 +170,9 @@ func (p *spool) copyFrom(r io.Reader) (int64, error) {
 
 // md5Hex 暂存内容的 MD5（hex）。
 func (p *spool) md5Hex() string { return hex.EncodeToString(p.md5h.Sum(nil)) }
+
+// sha256Hex 暂存内容的 SHA-256（hex；chunk 池寻址 + 闪传索引，v1.3.13）。
+func (p *spool) sha256Hex() string { return hex.EncodeToString(p.sha256h.Sum(nil)) }
 
 // size 暂存字节数。
 func (p *spool) size() int64 { return p.sz }
@@ -261,10 +267,6 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 	if len(attrs.Metadata) > 0 {
 		metaJSON = MarshalPolicy(attrs.Metadata)
 	}
-	manifest := ""
-	if storage == "chunk" {
-		manifest = MarshalPolicy(chunkManifest{CS: s.chunkSize, Parts: [][4]int64{{0, (size + s.chunkSize - 1) / s.chunkSize, size, s.chunkSize}}})
-	}
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -283,15 +285,29 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 			return out, false, err
 		}
 	} else {
-		// 清理旧版本（含分块；只清正式行 version_id=''——不碰进行中分片上传的
+		// 清理旧版本（含分块引用；只清正式行 version_id=''——不碰进行中分片上传的
 		// 暂存行 (key, uploadId)，v1.3.11）
-		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, chunkTableFor(b.TableName)), key); err != nil {
-			return out, false, err
-		}
-		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, b.TableName), key); err != nil {
+		if err := s.deleteObjectRowsTx(tx, b, key, ""); err != nil {
 			return out, false, err
 		}
 		replaced = oldCount > 0
+	}
+
+	// 分块内容入池（v1.3.13：内容寻址 + 引用计数；重复内容跨对象/版本共享）
+	manifest := ""
+	var chunkHashes []string
+	var chunkSizes []int64
+	if storage == "chunk" {
+		rc, rerr := sp.reader()
+		if rerr != nil {
+			return out, false, rerr
+		}
+		chunkHashes, _, err = s.writeChunkRefsFromReader(tx, chunkTableFor(b.TableName), key, versionID, s.scopeFor(b), 0, rc)
+		if err != nil {
+			return out, false, err
+		}
+		chunkSizes = chunkSizeSeq(size, s.chunkSize, len(chunkHashes))
+		manifest = MarshalPolicy(chunkManifestV2{V: 2, CS: s.chunkSize, HS: chunkHashes, SS: chunkSizes})
 	}
 
 	_, err = tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,is_latest,delete_marker,size,etag,
@@ -305,29 +321,6 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 		return out, false, err
 	}
 
-	if storage == "chunk" {
-		rc, rerr := sp.reader()
-		if rerr != nil {
-			return out, false, rerr
-		}
-		chunk := make([]byte, s.chunkSize)
-		for seq := int64(0); ; seq++ {
-			n, err := io.ReadFull(rc, chunk)
-			if n > 0 {
-				if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,seq,data) VALUES(?,?,?,?)`,
-					chunkTableFor(b.TableName)), key, versionID, seq, chunk[:n]); err != nil {
-					return out, false, err
-				}
-			}
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
-			}
-			if err != nil {
-				return out, false, err
-			}
-		}
-	}
-
 	// 桶聚合按算术增量随本事务提交（省去提交后的第二次聚合 SELECT）：
 	// versioning = (+size, +1)；非 versioning 覆盖后 = (size-旧, 1-旧)
 	if b.Versioning {
@@ -339,6 +332,12 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 		return out, false, err
 	}
 
+	// 闪传索引登记（v1.3.13）：仅分块对象（≤内联阈值小对象无共享收益，不登记；
+	// multipart 合并对象不在写路径流式，亦不登记——见 docs/S3对象存储.md）
+	if storage == "chunk" {
+		s.registerFlashIndex(s.scopeFor(b), sp.sha256Hex(), size, etag, chunkHashes)
+	}
+
 	s.AddUsage(b.Owner, bucket, "PUT", size, 0)
 
 	out = ObjectMeta{
@@ -348,6 +347,32 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 		Metadata: attrs.Metadata, Storage: storage, CreatedTS: nowTS(),
 	}
 	return out, replaced, nil
+}
+
+// deleteObjectRowsTx 删除对象行 + 分块引用行，并释放池引用（单事务内；
+// versionID 空 = 该 key 的全部正式行 version_id=''）。调用方持 writeMu。
+func (s *Store) deleteObjectRowsTx(tx *sql.Tx, b Bucket, key, versionID string) error {
+	tbl := chunkTableFor(b.TableName)
+	hashes, err := s.collectChunkHashes(tbl, key, versionID)
+	if err != nil {
+		return err
+	}
+	if versionID != "" {
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=?`, tbl), key, versionID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=?`, b.TableName), key, versionID); err != nil {
+			return err
+		}
+	} else {
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, tbl), key); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, b.TableName), key); err != nil {
+			return err
+		}
+	}
+	return releaseChunkRefs(tx, hashes)
 }
 
 // scanObject 扫描一行对象元数据（不含 content 列，内容单独取）。
@@ -414,6 +439,9 @@ type chunkSpan struct {
 
 // contentReader 对象内容读取器（内联字节 / 分块惰性拉取；支持 manifest 直定位与
 // Range 裁剪：skip = 起点前跳过字节，remain = 剩余输出字节，-1 = 不限）。
+// 三种布局（v1.3.13）：hashes != nil = v2 清单（池键序列，逐 seq 查池）；
+// spans != nil = v1.3.11 清单（seq 区间直定位）；两者皆空 = 旧版稠密 seq 布局。
+// 存量行 data 非空直用（迁移前），空则回退 hash 列查池（迁移后）。
 type contentReader struct {
 	store *Store
 	tbl   string
@@ -423,6 +451,10 @@ type contentReader struct {
 	spanIdx   int
 	idxInSpan int64
 	legacySeq int64
+	hashes []string // v2 池键序列（v1.3.13）
+	hsizes []int64  // v2 各块实际字节数（与 hashes 等长；multipart 末块不满块，seek 按累计定位）
+	hidx   int
+	hcs    int64
 	buf   []byte
 	off   int
 	done  bool
@@ -431,8 +463,56 @@ type contentReader struct {
 	remain int64
 }
 
-// fetchNext 拉取下一分块到 buf（manifest 布局按 seq 直取；旧布局按 seq 升序）。
+// fetchChunkRef 取一个引用行的数据：data 列非空直用（存量未迁移行），否则按
+// hash 列查池（v1.3.13 迁移后形态）。
+func (c *contentReader) fetchChunkRef(key, ver string, seq int64) ([]byte, error) {
+	var data []byte
+	var h string
+	err := c.store.db.QueryRow(fmt.Sprintf(
+		`SELECT data, hash FROM %s WHERE key=? AND version_id=? AND seq=?`, c.tbl),
+		key, ver, seq).Scan(&data, &h)
+	if err == sql.ErrNoRows {
+		return nil, io.EOF
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > 0 {
+		return data, nil
+	}
+	if h == "" {
+		return nil, io.EOF
+	}
+	if err := c.store.db.QueryRow(`SELECT data FROM s3_chunks WHERE hash=?`, h).Scan(&data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// fetchNext 拉取下一分块到 buf（v2 池键序列 / manifest seq 直取 / 旧布局 seq 升序）。
 func (c *contentReader) fetchNext() error {
+	if c.hashes != nil {
+		for {
+			if c.hidx >= len(c.hashes) {
+				return io.EOF
+			}
+			var data []byte
+			err := c.store.db.QueryRow(`SELECT data FROM s3_chunks WHERE hash=?`, c.hashes[c.hidx]).Scan(&data)
+			if err == sql.ErrNoRows {
+				return io.EOF
+			}
+			if err != nil {
+				return err
+			}
+			c.hidx++
+			if len(data) == 0 { // 池行空数据（理论不该出现）：跳过
+				continue
+			}
+			c.buf = data
+			c.off = 0
+			return nil
+		}
+	}
 	if c.spans != nil {
 		for {
 			if c.spanIdx >= len(c.spans) {
@@ -444,13 +524,7 @@ func (c *contentReader) fetchNext() error {
 				c.idxInSpan = 0
 				continue
 			}
-			var data []byte
-			err := c.store.db.QueryRow(fmt.Sprintf(
-				`SELECT data FROM %s WHERE key=? AND version_id=? AND seq=?`, c.tbl),
-				c.key, c.ver, sp.startSeq+c.idxInSpan).Scan(&data)
-			if err == sql.ErrNoRows {
-				return io.EOF
-			}
+			data, err := c.fetchChunkRef(c.key, c.ver, sp.startSeq+c.idxInSpan)
 			if err != nil {
 				return err
 			}
@@ -472,15 +546,36 @@ func (c *contentReader) fetchNext() error {
 		return err
 	}
 	c.legacySeq = seq
+	if len(data) == 0 { // 存量布局但 data 已迁空：按 hash 列回退
+		data, err = c.fetchChunkRef(c.key, c.ver, seq)
+		if err != nil {
+			return err
+		}
+	}
 	c.buf = data
 	c.off = 0
 	return nil
 }
 
-// seekTo Range 定位：把读取位置推进到对象第 start 字节（manifest 布局直接算出
-// 所在段与块；旧稠密布局退化为逐块跳过）。调用前提：尚未读出任何字节。
+// seekTo Range 定位：把读取位置推进到对象第 start 字节（v2 清单按块大小整除
+// 直算；manifest 布局直接算出所在段与块；旧稠密布局退化为逐块跳过）。
+// 调用前提：尚未读出任何字节。
 func (c *contentReader) seekTo(start int64) {
 	if start <= 0 {
+		return
+	}
+	if c.hashes != nil {
+		// 按各块实际字节数累计定位（multipart 各 part 末块不满块，不能均匀除法）
+		var cum int64
+		for i, sz := range c.hsizes {
+			if start < cum+sz {
+				c.hidx = i
+				c.skip = start - cum
+				return
+			}
+			cum += sz
+		}
+		c.hidx = len(c.hashes) // 越界：直接置完
 		return
 	}
 	if c.spans != nil {
@@ -617,6 +712,11 @@ func (s *Store) getObjectRange(bucket, key, versionID string, start, length int6
 		// remain=-1：inline 缓冲即最终字节（已按需切片），不限长输出
 		return m, &contentReader{inline: true, buf: content, remain: -1}, nil
 	}
+	if hs, ss, hcs := parseChunkManifestV2(m.Manifest); hs != nil { // v2 池键清单（v1.3.13）
+		cr := &contentReader{store: s, key: key, hashes: hs, hsizes: ss, hcs: hcs, remain: length}
+		cr.seekTo(start)
+		return m, cr, nil
+	}
 	cr := &contentReader{store: s, tbl: chunkTableFor(b.TableName), key: key, ver: m.VersionID,
 		spans: parseChunkManifest(m.Manifest), legacySeq: -1, remain: length}
 	cr.seekTo(start)
@@ -649,9 +749,16 @@ func (s *Store) DeleteObject(bucket, key, versionID string, bypassGovernance boo
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	oldStorage, oldCount := s.keyAggLocked(s.db, b, key)
-
+	// 池引用释放与对象删除同事务（v1.3.13）：删引用行 + refcnt 回退一步到位
 	del := ObjectMeta{Key: key, VersionID: versionID}
+	delTx, err := s.db.Begin()
+	if err != nil {
+		return del, err
+	}
+	defer delTx.Rollback()
+
+	oldStorage, oldCount := s.keyAggLocked(delTx, b, key)
+
 	switch {
 	case versionID != "":
 		var rows *sql.Rows
@@ -671,17 +778,14 @@ func (s *Store) DeleteObject(bucket, key, versionID string, bypassGovernance boo
 		if err := m.lockViolation(bypassGovernance); err != nil {
 			return del, err
 		}
-		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=?`, chunkTableFor(b.TableName)), key, versionID); err != nil {
-			return del, err
-		}
-		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=?`, b.TableName), key, versionID); err != nil {
+		if err := s.deleteObjectRowsTx(delTx, b, key, versionID); err != nil {
 			return del, err
 		}
 		// 若删的是最新版本，版本链里补最新标记
 		var n int
-		_ = s.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE key=? AND is_latest=1`, b.TableName), key).Scan(&n)
+		_ = delTx.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE key=? AND is_latest=1`, b.TableName), key).Scan(&n)
 		if n == 0 {
-			_, _ = s.db.Exec(fmt.Sprintf(`UPDATE %s SET is_latest=1 WHERE key=? AND version_id=
+			_, _ = delTx.Exec(fmt.Sprintf(`UPDATE %s SET is_latest=1 WHERE key=? AND version_id=
 				(SELECT version_id FROM %s WHERE key=? ORDER BY created_ts DESC, version_id DESC LIMIT 1)`,
 				b.TableName, b.TableName), key, key)
 		}
@@ -698,10 +802,10 @@ func (s *Store) DeleteObject(bucket, key, versionID string, bypassGovernance boo
 			return del, err
 		}
 		vid := genVersionID()
-		if _, err := s.db.Exec(fmt.Sprintf(`UPDATE %s SET is_latest=0 WHERE key=? AND is_latest=1`, b.TableName), key); err != nil {
+		if _, err := delTx.Exec(fmt.Sprintf(`UPDATE %s SET is_latest=0 WHERE key=? AND is_latest=1`, b.TableName), key); err != nil {
 			return del, err
 		}
-		if _, err := s.db.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,is_latest,delete_marker,size,etag,
+		if _, err := delTx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,is_latest,delete_marker,size,etag,
 			content_type,content_encoding,cache_control,content_disposition,metadata,content,storage,
 			legal_hold,retention_mode,retain_until,created_ts)
 			VALUES(?,?,1,1,0,'','','','','','{}',NULL,'inline',0,'','',?)`, b.TableName),
@@ -721,17 +825,20 @@ func (s *Store) DeleteObject(bucket, key, versionID string, bypassGovernance boo
 			return del, err
 		}
 		// 只删正式行（version_id=''），不碰进行中分片上传的暂存行（v1.3.11）
-		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, chunkTableFor(b.TableName)), key); err != nil {
-			return del, err
-		}
-		if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=? AND version_id=''`, b.TableName), key); err != nil {
+		if err := s.deleteObjectRowsTx(delTx, b, key, ""); err != nil {
 			return del, err
 		}
 	}
 
-	newStorage, newCount := s.keyAggLocked(s.db, b, key)
-	s.adjustAggLocked(s.db, b, key, newStorage-oldStorage, newCount-oldCount)
+	newStorage, newCount := s.keyAggLocked(delTx, b, key)
+	s.adjustAggLocked(delTx, b, key, newStorage-oldStorage, newCount-oldCount)
+	if err := delTx.Commit(); err != nil {
+		return del, err
+	}
 	s.AddUsage(b.Owner, bucket, "DELETE", 0, 0)
+	if s.syncHook != nil {
+		s.syncHook.objectDeleted(bucket, key) // 删除传播（规则开启时；v1.3.13）
+	}
 	return del, nil
 }
 
@@ -1011,10 +1118,18 @@ func (s *Store) SetLegalHold(bucket, key, versionID string, on bool) error {
 }
 
 // CopyObject 桶内 / 跨桶复制对象（x-amz-copy-source）。
+// v1.3.13 零拷贝：分块对象直接复制池引用（引用计数 +1，无数据搬运）；
+// 内联小对象维持原字节复制路径（单行无共享收益）。
 func (s *Store) CopyObject(srcBucket, srcKey, srcVersion, dstBucket, dstKey string, attrs ObjectAttrs) (ObjectMeta, error) {
-	m, data, err := s.GetObjectBytes(srcBucket, srcKey, srcVersion)
+	if dstKey == "" || len(dstKey) > 1024 {
+		return ObjectMeta{}, &s3Error{Code: "InvalidArgument", Status: 400, Msg: "Invalid object key"}
+	}
+	m, err := s.HeadObject(srcBucket, srcKey, srcVersion)
 	if err != nil {
 		return ObjectMeta{}, err
+	}
+	if m.DeleteMarker {
+		return ObjectMeta{}, &s3Error{Code: "NoSuchKey", Status: 404, Msg: "The specified key does not exist"}
 	}
 	if attrs.ContentType == "" {
 		attrs.ContentType = m.ContentType
@@ -1031,8 +1146,165 @@ func (s *Store) CopyObject(srcBucket, srcKey, srcVersion, dstBucket, dstKey stri
 	if len(attrs.Metadata) == 0 {
 		attrs.Metadata = m.Metadata
 	}
+	if attrs.Metadata == nil {
+		attrs.Metadata = map[string]string{}
+	}
+
+	if m.Storage == "chunk" {
+		return s.copyObjectRefs(srcBucket, srcKey, m, dstBucket, dstKey, attrs)
+	}
+	_, data, err := s.GetObjectBytes(srcBucket, srcKey, srcVersion)
+	if err != nil {
+		return ObjectMeta{}, err
+	}
 	out, _, err := s.PutObject(dstBucket, dstKey, bytes.NewReader(data), int64(len(data)), attrs)
 	return out, err
+}
+
+// copyObjectRefs 零拷贝复制：目标对象行引用源对象同一批池 chunk（seq 布局对齐，
+// manifest v2 重建）。跨桶时目标桶 scope 不同但引用行记录的是池键本身，读取与
+// 释放均按引用行进行——范围语义只影响「新内容入池时的键前缀」。
+func (s *Store) copyObjectRefs(srcBucket, srcKey string, m ObjectMeta, dstBucket, dstKey string, attrs ObjectAttrs) (ObjectMeta, error) {
+	var out ObjectMeta
+	sb, err := s.Bucket(srcBucket)
+	if err != nil {
+		return out, err
+	}
+	db, err := s.Bucket(dstBucket)
+	if err != nil {
+		return out, err
+	}
+	// 收集源引用（v2 清单直接给池键序列；旧 span 布局取引用行——块大小须全段一致
+	// 才能重建 v2 清单，混合块大小 / 无清单的稠密旧行退回字节复制，保证 Range 正确）
+	var hashes []string
+	var srcSizes []int64
+	srcCS := s.chunkSize
+	if hs, ss, cs := parseChunkManifestV2(m.Manifest); hs != nil {
+		hashes = hs
+		srcSizes = ss
+		srcCS = cs
+	} else if spans := parseChunkManifest(m.Manifest); spans != nil {
+		uniform := true
+		for _, sp := range spans {
+			if sp.cs != spans[0].cs {
+				uniform = false
+				break
+			}
+		}
+		if !uniform {
+			_, data, err := s.GetObjectBytes(srcBucket, srcKey, m.VersionID)
+			if err != nil {
+				return ObjectMeta{}, err
+			}
+			out, _, err := s.PutObject(dstBucket, dstKey, bytes.NewReader(data), int64(len(data)), attrs)
+			return out, err
+		}
+		srcCS = spans[0].cs
+		hashes, err = s.collectChunkHashes(chunkTableFor(sb.TableName), srcKey, m.VersionID)
+		if err != nil {
+			return out, err
+		}
+		if len(hashes) == 0 {
+			return out, &s3Error{Code: "InternalError", Status: 500,
+				Msg: "source object chunk refs missing (migration in progress, retry)"}
+		}
+		// 旧 span 布局合成各块尺寸（每段段内均匀 cs、段末块为余数）
+		srcSizes = make([]int64, 0, len(hashes))
+		remaining := m.Size
+		for _, sp := range spans {
+			seqSizes := chunkSizeSeq(sp.size, sp.cs, int(sp.chunks))
+			srcSizes = append(srcSizes, seqSizes...)
+			remaining -= sp.size
+		}
+		_ = remaining
+	} else {
+		// 稠密旧布局（≤ v1.3.10）：分块大小未知，退回字节复制
+		_, data, err := s.GetObjectBytes(srcBucket, srcKey, m.VersionID)
+		if err != nil {
+			return ObjectMeta{}, err
+		}
+		out, _, err := s.PutObject(dstBucket, dstKey, bytes.NewReader(data), int64(len(data)), attrs)
+		return out, err
+	}
+	// 覆盖保护（与 PutObject 一致）：非 versioning 覆盖须过对象锁
+	if !db.Versioning {
+		if cur, err := s.HeadObject(dstBucket, dstKey, ""); err == nil {
+			if err := cur.lockViolation(false); err != nil {
+				return out, err
+			}
+		}
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return out, err
+	}
+	defer tx.Rollback()
+
+	oldStorage, oldCount := s.keyAggLocked(tx, db, dstKey)
+	dstVersion := ""
+	if db.Versioning {
+		dstVersion = genVersionID()
+		if _, err := tx.Exec(fmt.Sprintf(`UPDATE %s SET is_latest=0 WHERE key=? AND is_latest=1`, db.TableName), dstKey); err != nil {
+			return out, err
+		}
+	} else {
+		if err := s.deleteObjectRowsTx(tx, db, dstKey, ""); err != nil {
+			return out, err
+		}
+	}
+	// 引用目标 chunk（已 GC 掉 → 整体回退报错，客户端按普通 Copy 重试）
+	tbl := chunkTableFor(db.TableName)
+	for seq, pk := range hashes {
+		ok, err := poolRefExisting(tx, pk)
+		if err != nil {
+			return out, err
+		}
+		if !ok {
+			return out, &s3Error{Code: "InternalError", Status: 500,
+				Msg: "source chunk evicted during copy (retry)"}
+		}
+		if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,seq,hash,data) VALUES(?,?,?,?,x'')`, tbl),
+			dstKey, dstVersion, seq, pk); err != nil {
+			return out, err
+		}
+	}
+	if srcSizes == nil { // 兜底（不应发生）：按均匀 cs 合成
+		srcSizes = chunkSizeSeq(m.Size, srcCS, len(hashes))
+	}
+	manifest := MarshalPolicy(chunkManifestV2{V: 2, CS: srcCS, HS: hashes, SS: srcSizes})
+	metaJSON := "{}"
+	if len(attrs.Metadata) > 0 {
+		metaJSON = MarshalPolicy(attrs.Metadata)
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`INSERT INTO %s(key,version_id,is_latest,delete_marker,size,etag,
+		content_type,content_encoding,cache_control,content_disposition,metadata,content,storage,manifest,
+		legal_hold,retention_mode,retain_until,created_ts)
+		VALUES(?,?,1,0,?,?,?,?,?,?,?,?,?,?,0,'','',?)`, db.TableName),
+		dstKey, dstVersion, m.Size, m.ETag,
+		attrs.ContentType, attrs.ContentEncoding, attrs.CacheControl, attrs.ContentDisposition,
+		metaJSON, nil, "chunk", manifest, nowTS()); err != nil {
+		return out, err
+	}
+	if db.Versioning {
+		s.adjustAggLocked(tx, db, dstKey, m.Size, 1)
+	} else {
+		s.adjustAggLocked(tx, db, dstKey, m.Size-oldStorage, 1-oldCount)
+	}
+	if err := tx.Commit(); err != nil {
+		return out, err
+	}
+	s.AddUsage(db.Owner, dstBucket, "PUT", 0, 0) // 零拷贝：不计 bytes_in（内容未经过网络/磁盘重写）
+
+	out = ObjectMeta{
+		Key: dstKey, VersionID: dstVersion, IsLatest: true, Size: m.Size, ETag: m.ETag,
+		ContentType: attrs.ContentType, ContentEncoding: attrs.ContentEncoding,
+		CacheControl: attrs.CacheControl, ContentDisposition: attrs.ContentDisposition,
+		Metadata: attrs.Metadata, Storage: "chunk", CreatedTS: nowTS(),
+	}
+	return out, nil
 }
 
 // ---------------------------------------------------------------------------

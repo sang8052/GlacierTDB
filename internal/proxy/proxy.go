@@ -8,6 +8,7 @@ import (
 	"net"
 	"regexp"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -235,6 +236,42 @@ func serveMySQL(srv *server.Server, raw net.Conn, cfg *config.Config, backend *s
 // localAddrSeen 已观察到的服务端本地地址（caching_sha2 缓存 key 的 host 部分）。
 var localAddrSeen sync.Map
 
+// unixAddrConn UDS 连接地址包装（v1.3.13 §5.1）：unix socket 的 RemoteAddr 不是
+// IP（"@" / 空路径），统一映射为 127.0.0.1——主机授权（HostOK）、防爆破回环豁免、
+// 审计展示与 TCP 本机连接语义完全一致。
+type unixAddrConn struct {
+	net.Conn
+}
+
+func (c unixAddrConn) RemoteAddr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+func (c unixAddrConn) LocalAddr() net.Addr  { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+// anyToString KV 回源结果字符串化（nil → 空串；[]byte → 原文；数值 → 十进制）。
+func anyToString(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case []byte:
+		return string(t)
+	case string:
+		return t
+	case time.Time:
+		return t.Format("2006-01-02 15:04:05")
+	case float64:
+		return strconv.FormatFloat(t, 'g', -1, 64)
+	default:
+		return fmt.Sprint(t)
+	}
+}
+
+// truncateForLog 日志截断。
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
 // newMySQLServer 构造 go-mysql 服务端：握手默认登录算法取配置（v1.1.1 支持
 // caching_sha2_password / sha256_password），并加载 RSA 密钥供非 TLS 密码交换。
 // tlsCfg 非空时握手报 CLIENT_SSL 能力位（标准 --ssl-mode 客户端协议内升级，v1.3.12）。
@@ -271,6 +308,7 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 	var aq *asyncq.Engine
 	if cfg.AsyncQuery.Enable {
 		aq = asyncq.NewEngine(backend, cfg)
+		asyncq.SetPrimary(aq) // 心跳上报读取异步积压（v1.3.13）
 		if s3store != nil { // S3 管理面异步任务执行器（SUBMIT S3 ...，v1.3.11）
 			aq.RegisterRunner("s3", func(j *asyncq.Job) ([]string, [][]any, error) {
 				return s3store.RunSearchTask(j.Payload)
@@ -278,6 +316,33 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 		}
 		logx.Infof("async query engine: jobs_dir=%s metrics_interval=%ds ttl=%dh", cfg.DBDir+"/jobs",
 			cfg.AsyncQuery.MetricsIntervalSec, cfg.AsyncQuery.ResultTTLHours)
+	}
+
+	// KV SQL 读穿透执行器（v1.3.13 §3.2）：权限边界在此强制——透传查询只能触达
+	// 同用户名下的 db（super 放行）+ 仅 SELECT；结果字符串化后交 kv 回填
+	if kvs != nil {
+		kvs.SetSourceExecutor(func(user, dbName, sql string) ([]string, [][]string, error) {
+			up := strings.ToUpper(strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(sql), "( \t\n")))
+			if !strings.HasPrefix(up, "SELECT") {
+				return nil, nil, fmt.Errorf("kv source: only SELECT statements are allowed (got %q)", truncateForLog(sql, 80))
+			}
+			if store != nil && store.UserType(user) != auth.TypeSuper && !store.HasDBGrant(user, dbName) {
+				return nil, nil, fmt.Errorf("kv source: no privilege on database %s for user %s", dbName, user)
+			}
+			cols, rawRows, err := backend.QueryDBReadOnly(dbName, sql)
+			if err != nil {
+				return nil, nil, err
+			}
+			rows := make([][]string, 0, len(rawRows))
+			for _, rr := range rawRows {
+				out := make([]string, len(rr))
+				for i, v := range rr {
+					out[i] = anyToString(v)
+				}
+				rows = append(rows, out)
+			}
+			return cols, rows, nil
+		})
 	}
 
 	var msrv *server.Server
@@ -322,6 +387,26 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 	if sniff <= 0 {
 		sniff = time.Millisecond
 	}
+	// UDS 本地连接加速（v1.3.13 §5.1，仅 Linux）：同一协议多路复用器整体架在
+	// Unix domain socket 上，鉴权照旧（各协议认证不变，纯传输加速）
+	if cfg.ListenUnix != "" {
+		if uln, uerr := listenUnix(cfg.ListenUnix); uerr != nil {
+			return fmt.Errorf("listen_unix %s: %w", cfg.ListenUnix, uerr)
+		} else {
+			logx.Infof("listening on unix://%s (multiplex, auth required)", cfg.ListenUnix)
+			go func() {
+				for {
+					c, err := uln.Accept()
+					if err != nil {
+						logx.Errorf("unix accept: %v", err)
+						continue
+					}
+					go sniffConn(msrv, maybeTLSConn(unixAddrConn{Conn: c}, tlsCfg, sniff), cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm)
+				}
+			}()
+		}
+	}
+
 	for {
 		c, err := ln.Accept()
 		if err != nil {

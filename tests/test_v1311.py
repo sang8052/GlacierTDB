@@ -557,9 +557,11 @@ def part_timeseries(cur):
     n_s = cur.fetchone()[0]
     check(n_ms == n_s and n_s > 0, "存秒查毫秒 == 存秒查秒（%d == %d）" % (n_ms, n_s))
 
-    # 日期串自动换算
-    cur.execute("SELECT COUNT(*) FROM m WHERE ts >= '%s'" % time.strftime("%Y-%m-%d", time.gmtime()))
-    check(cur.fetchone()[0] == len(points), "日期串谓词换算（全量命中）")
+    # 日期串自动换算（用数据最早点所在日期做下界——固定用「今天」会在
+    # UTC 午夜后 2 小时内运行时把 now-7200 的点划到界外，属时间敏感假失败）
+    lo_date = time.strftime("%Y-%m-%d", time.gmtime(now_s - 7200))
+    cur.execute("SELECT COUNT(*) FROM m WHERE ts >= '%s'" % lo_date)
+    check(cur.fetchone()[0] == len(points), "日期串谓词换算（全量命中，lo=%s）" % lo_date)
 
     # 桶宽自动换算：GROUP BY ts/60000*60000（ms 惯例）在 s 表 → ts/60*60
     cur.execute("SELECT COUNT(*) FROM (SELECT series_id, COUNT(val) FROM m "

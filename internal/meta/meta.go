@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"glaciertdb/internal/config"
+	"glaciertdb/internal/instance"
 	"sync"
 )
 
@@ -403,6 +404,7 @@ func handleSelectVars(ctx *Ctx, expr string) (*Result, bool, error) {	tokens := 
 		return nil, false, nil
 	}
 	vars := DefaultVars(ctx.Version)
+	vars["glaciertdb_instance_id"] = instance.UUID() // 实例唯一 ID（v1.3.13 §6.2）
 	cols := make([]string, 0, len(tokens))
 	var row []any
 	for _, tok := range tokens {
@@ -437,7 +439,17 @@ func handleSelectVars(ctx *Ctx, expr string) (*Result, bool, error) {	tokens := 
 			row = append(row, ctx.Version)
 		case strings.EqualFold(t, "glacier_version"):
 			cols = append(cols, "glacier_version")
-			row = append(row, config.GlacierVersion)
+			// 版本号隐藏（v1.3.13 §6.4）：security.hide_version 开启时管理面
+			// 同步隐藏（启动日志与 CLI 版本输出不隐藏，本机排障用）
+			if v := config.DisplayVersion(); v != "" {
+				row = append(row, v)
+			} else {
+				row = append(row, "hidden")
+			}
+		case strings.EqualFold(t, "glaciertdb_instance_id"), strings.EqualFold(strings.TrimPrefix(t, "@@"), "glaciertdb_instance_id"):
+			// 实例唯一 ID（v1.3.13 §6.2）：SELECT @@glaciertdb_instance_id
+			cols = append(cols, t)
+			row = append(row, instance.UUID())
 		case reFnFoundRows.MatchString(t):
 			cols = append(cols, t)
 			row = append(row, int64(0))

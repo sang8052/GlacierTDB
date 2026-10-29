@@ -789,3 +789,21 @@ func (s *Store) RetainStats() [][]any {
 	}
 	return out
 }
+
+// QueueCount 队列总数（心跳上报用，v1.3.13）。
+func (s *Store) QueueCount() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM mq_queues`).Scan(&n)
+	return n
+}
+
+// MessageCount 消息总数（ready + unacked，心跳上报用，v1.3.13）。
+func (s *Store) MessageCount() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int64
+	_ = s.db.QueryRow(`SELECT COUNT(*) FROM mq_messages`).Scan(&n)
+	return n
+}

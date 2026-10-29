@@ -91,6 +91,8 @@ func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
 			return h.s3ShowUploads(toks)
 		case up(1) == "S3" && up(2) == "SPACE":
 			return h.s3ShowSpace()
+		case up(1) == "S3" && up(2) == "SYNC":
+			return h.s3ShowSync()
 		}
 	case "ALTER":
 		if up(1) == "BUCKET" {
@@ -154,7 +156,7 @@ func isS3Command(up func(int) string) bool {
 	case "SHOW":
 		return up(1) == "BUCKETS" || (up(1) == "S3" && (up(2) == "KEYS" || up(2) == "USAGE" ||
 			up(2) == "LIFECYCLE" || up(2) == "DOMAINS" || up(2) == "POLICIES" || up(2) == "OBJECTS" ||
-			up(2) == "UPLOADS" || up(2) == "SPACE"))
+			up(2) == "UPLOADS" || up(2) == "SPACE" || up(2) == "SYNC"))
 	case "ALTER":
 		return up(1) == "BUCKET"
 	case "SET", "CLEAR":
@@ -774,9 +776,26 @@ func (h *Handler) s3ShowSpace() (*mysql.Result, bool, error) {
 	if st.AutoVacuum != 2 {
 		note = "增量模式未启用：执行一次 S3 VACUUM FULL 切换（排他，维护窗口执行）"
 	}
+	ps := h.s3store.PoolStats()
 	res, err := meta.SimpleRS([]string{"page_size", "page_count", "freelist_pages", "free_bytes",
-		"file_bytes", "auto_vacuum", "note"},
-		[][]any{{st.PageSize, st.PageCount, st.FreelistCount, st.FreeBytes, st.FileBytes, auto, note}})
+		"file_bytes", "auto_vacuum", "pool_chunks", "pool_live_bytes", "pool_shared",
+		"pool_tombstones", "pool_tomb_bytes", "note"},
+		[][]any{{st.PageSize, st.PageCount, st.FreelistCount, st.FreeBytes, st.FileBytes, auto,
+			ps.Chunks, ps.LiveBytes, ps.SharedRefs, ps.Tombstones, ps.TombBytes, note}})
+	return res, true, err
+}
+
+// s3ShowSync SHOW S3 SYNC：数据主动同步引擎观测（v1.3.13）。
+func (h *Handler) s3ShowSync() (*mysql.Result, bool, error) {
+	if h.s3srv == nil {
+		return nil, true, mysql.NewError(1105, "S3 module is disabled")
+	}
+	st := h.s3srv.SyncStatsView()
+	if st == nil {
+		return nil, true, mysql.NewError(1105, "sync engine not configured (s3.sync rules empty)")
+	}
+	res, err := meta.SimpleRS([]string{"rules", "queued", "synced", "failed", "skipped", "last_sync_ts", "last_error"},
+		[][]any{{st.Rules, st.Queued, st.Synced, st.Failed, st.Skipped, st.LastSyncTS, st.LastErr}})
 	return res, true, err
 }
 
@@ -795,6 +814,9 @@ func (h *Handler) s3Vacuum(toks []string) (*mysql.Result, bool, error) {
 	}
 	before := h.s3store.SpaceStats()
 	if full {
+		if n := h.s3store.GCChunkTombstones(); n > 0 { // 全量重建前先清墓碑（v1.3.13）
+			logx.Infof("s3: VACUUM FULL pre-GC removed %d chunk tombstones", n)
+		}
 		if err := h.s3store.VacuumFull(); err != nil {
 			return nil, true, mysql.NewError(1105, err.Error())
 		}

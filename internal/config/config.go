@@ -6,12 +6,31 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 
 	"gopkg.in/yaml.v3"
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.3.12.beta"
+const GlacierVersion = "1.3.13.beta"
+
+// hideVersion 版本号隐藏开关（security.hide_version，v1.3.13）：开启后 S3 响应头 /
+// Redis INFO·HELLO / 管理面 glacier_version 等对外面不再携带真实版本号；
+// MySQL 握手版本串走 ServerVersion（hide_version 时默认串替换为 8.0.0，保持合法
+// 版本格式）；启动日志与 CLI 输出不隐藏（本机排障用）。
+var hideVersion atomic.Bool
+
+// SetHideVersion 版本隐藏开关（main 启动时按配置注入）。
+func SetHideVersion(v bool) { hideVersion.Store(v) }
+
+// DisplayVersion 对外展示版本：hide_version 开启时返回空串，调用方据此降级
+//（S3 Server 头退化为 "GlacierTDB"、Redis HELLO version 退化为 "0.0.0" 等）。
+func DisplayVersion() string {
+	if hideVersion.Load() {
+		return ""
+	}
+	return GlacierVersion
+}
 
 // ConcurrencyOpts 并发模型：读并发多线程（可按库限流），写单库单线程（多库并行）。
 type ConcurrencyOpts struct {
@@ -91,6 +110,7 @@ type LockOpts struct {
 // S3Endpoint 单个 S3 监听端点（HTTP 或 HTTPS 独立端口，v1.1.0）。
 type S3Endpoint struct {
 	Listen      string   `yaml:"listen"`       // 监听地址，如 0.0.0.0:9000
+	ListenUnix  string   `yaml:"listen_unix"`  // 可选 UDS 监听（v1.3.13；仅 Linux，curl --unix-socket 直连；SigV4 鉴权照旧）
 	TLS         bool     `yaml:"tls"`          // true = HTTPS（独立 TLS 监听器）
 	CertFile    string   `yaml:"cert_file"`    // 端点泛域名证书（PEM，SNI 兜底证书）
 	KeyFile     string   `yaml:"key_file"`     // 端点证书私钥（PEM）
@@ -102,6 +122,26 @@ type S3Limit struct {
 	PerConnBps   int64 `yaml:"per_conn_bps"`   // 单连接下载限速（bytes/s）
 	PerUserBps   int64 `yaml:"per_user_bps"`   // 单用户总带宽（多连接合并聚合限速）
 	PerUserConns int   `yaml:"per_user_conns"` // 单用户并发连接上限
+}
+
+// S3SyncRule 数据主动同步规则（v1.3.13 §1.4「数据北上」）：把本实例桶的对象
+// 事件驱动推送到远端 S3 端点（备份 / 业务伴随同步），每对象结果可回调。
+type S3SyncRule struct {
+	Name          string `yaml:"name"`               // 规则名（日志 / 回调标识）
+	Bucket        string `yaml:"bucket"`             // 源桶
+	MatchPrefix   string `yaml:"match_prefix"`       // 源 key 前缀过滤（空 = 全桶）
+	RemoteURL     string `yaml:"remote_url"`         // 远端端点，如 http://cloud.example.com:9000
+	RemoteRegion  string `yaml:"remote_region"`      // 远端 region（空 = us-east-1）
+	RemoteBucket  string `yaml:"remote_bucket"`      // 远端桶
+	RemotePrefix  string `yaml:"remote_prefix"`      // 远端目标前缀目录（可空）
+	RemoteAK      string `yaml:"remote_ak"`          // 远端 AccessKey
+	RemoteSK      string `yaml:"remote_sk"`          // 远端 SecretKey
+	SyncDeletes   bool   `yaml:"sync_deletes"`       // 删除是否传播（备份语义默认不）
+	SkipSyncOrigin bool  `yaml:"skip_sync_origin"`   // 跳过带 sync-origin 标记的对象（断多跳环；默认 true）
+	CallbackURL   string `yaml:"callback_url"`       // 每对象同步结果回调（可空）
+	CallbackSecret string `yaml:"callback_secret"`   // 回调 HMAC 密钥（可空）
+	FullSyncOnStart bool `yaml:"full_sync_on_start"` // 启动时全量同步
+	ReconcileSec  int    `yaml:"reconcile_sec"`      // 定期对账周期秒（远端 HEAD/List 比对；0 = 关）
 }
 
 // S3Opts 兼容 S3 的对象存储（v1.1.0，可选模块）：AWS Signature V4，
@@ -120,9 +160,16 @@ type S3Opts struct {
 	AbortIncompleteDays  int `yaml:"abort_incomplete_days"`  // 未完成分片上传自动回收天数（v1.3.5；默认 7，0=关闭）
 	CallbackURL      string   `yaml:"callback_url"`           // 上传回调默认 URL（v1.3.12；桶级/请求级可覆盖）
 	CallbackSecret   string   `yaml:"callback_secret"`        // 上传回调默认 HMAC 签名密钥
-	ImageFont       string   `yaml:"image_font"`             // 图片文字渲染 ttf 字体路径（空 = 内置 ASCII）
-	ImageCache      bool     `yaml:"image_cache"`            // 图片预处理结果磁盘缓存（GET 加工链路；默认开）
-	ImageCacheMB    int      `yaml:"image_cache_mb"`         // 缓存目录容量上限 MB（默认 1024；-1 = 不限）
+	ImageFont        string   `yaml:"image_font"`             // 图片文字渲染 ttf 字体路径（空 = 内置 ASCII）
+	ImageCache       bool     `yaml:"image_cache"`            // 图片预处理结果磁盘缓存（GET 加工链路；默认开）
+	ImageCacheMB     int      `yaml:"image_cache_mb"`         // 缓存目录容量上限 MB（默认 1024；-1 = 不限）
+	DedupScope       string   `yaml:"dedup_scope"`            // chunk 去重范围（v1.3.13）：bucket | user（默认）| system
+	GzipLevel        int      `yaml:"gzip_level"`             // GET 传输 gzip 压缩等级 1-9（默认 5；v1.3.13）
+	ErrorLog         bool     `yaml:"error_log"`              // S3 结构化错误日志开关（默认关；v1.3.13）
+	ArchiveSyncMaxMB int      `yaml:"archive_sync_max_mb"`    // 打包「完成后下载」总大小上限 MB（默认 512；v1.3.13）
+	ArchiveTmpMaxMB  int      `yaml:"archive_tmp_max_mb"`     // 临时包目录容量上限 MB（默认 4096；v1.3.13）
+	ChunkGCTTLSec    int      `yaml:"chunk_gc_ttl_sec"`       // 墓碑 chunk（is_delete）保留秒数，到期 GC 清数据（默认 3600；v1.3.13）
+	Sync             []S3SyncRule `yaml:"sync"`               // 数据主动同步规则（v1.3.13 §1.4）
 }
 
 // MySQLOpts MySQL 协议服务开关（3309 复用端口上的 MySQL 面）。
@@ -163,8 +210,18 @@ type TimeseriesOpts struct {
 
 // SecOpts 静态加密（adiantum VFS，4KiB 块加密，防外部程序直接读底层文件）。
 type SecOpts struct {
-	Encrypt    bool   `yaml:"encrypt"`    // 首次启用要求空目录或已有加密库
-	Passphrase string `yaml:"passphrase"` // 启用时必填
+	Encrypt     bool   `yaml:"encrypt"`      // 首次启用要求空目录或已有加密库
+	Passphrase  string `yaml:"passphrase"`   // 启用时必填
+	HideVersion bool   `yaml:"hide_version"` // 版本号隐藏（v1.3.13 §6.4）：对外面不携带真实版本号
+}
+
+// HeartbeatOpts 主动心跳上报（v1.3.13 §6.5）：按配置定时 POST JSON 到用户自建
+// HTTP 中心（body HMAC 签名）；失败仅记日志；默认关闭（url 为空）。
+type HeartbeatOpts struct {
+	URL       string `yaml:"url"`        // 中心端 URL（空 = 关闭）
+	IntervalSec int  `yaml:"interval_s"` // 上报周期（默认 60，最低 10）
+	Secret    string `yaml:"secret"`     // body HMAC-SHA256 签名密钥（X-Glacier-Signature 头）
+	Fields    []string `yaml:"fields"` // payload 字段白名单（空 = 全部）
 }
 
 type Auth struct {
@@ -203,6 +260,7 @@ type LogOpts struct {
 
 type Config struct {
 	Listen   string `yaml:"listen"`
+	ListenUnix string `yaml:"listen_unix"` // 可选 UDS 监听（v1.3.13 §5.1）：3309 首字节协议多路复用整体架在 Unix domain socket 上（仅 Linux；鉴权照旧）
 	DBDir    string `yaml:"db_dir"`     // 库目录：一个库 = 目录下一个 <db>.db 文件
 	DefaultDB string `yaml:"default_db"` // 未指定库时连接的默认库
 	// DBPath 兼容旧配置：.db 文件 → dir=所在目录, 默认库=文件名去扩展名；目录 → 默认库取 DefaultDB
@@ -233,6 +291,7 @@ type Config struct {
 	Auth   Auth       `yaml:"auth"`
 	SQLite SQLiteOpts `yaml:"sqlite"`
 	TLS    TLSOpts    `yaml:"tls"`
+	Heartbeat HeartbeatOpts `yaml:"heartbeat"`
 	Log    LogOpts    `yaml:"log"`
 }
 
@@ -500,6 +559,44 @@ func (c *Config) Fill() {
 		if c.S3.ImageCacheMB == 0 {
 			c.S3.ImageCacheMB = 1024
 		}
+		// v1.3.13：chunk 去重范围 / gzip 等级 / 打包下载上限 / 墓碑 GC
+		switch c.S3.DedupScope {
+		case "bucket", "user", "system":
+		default:
+			c.S3.DedupScope = "user"
+		}
+		if c.S3.GzipLevel <= 0 || c.S3.GzipLevel > 9 {
+			c.S3.GzipLevel = 5
+		}
+		if c.S3.ArchiveSyncMaxMB <= 0 {
+			c.S3.ArchiveSyncMaxMB = 512
+		}
+		if c.S3.ArchiveTmpMaxMB <= 0 {
+			c.S3.ArchiveTmpMaxMB = 4096
+		}
+		if c.S3.ChunkGCTTLSec <= 0 {
+			c.S3.ChunkGCTTLSec = 3600
+		}
+		for i := range c.S3.Sync {
+			if c.S3.Sync[i].RemoteRegion == "" {
+				c.S3.Sync[i].RemoteRegion = "us-east-1"
+			}
+			if c.S3.Sync[i].ReconcileSec > 0 && c.S3.Sync[i].ReconcileSec < 60 {
+				c.S3.Sync[i].ReconcileSec = 60
+			}
+		}
+	}
+	// 版本号隐藏（v1.3.13 §6.4）：MySQL 握手版本串需保持合法版本号格式；
+	// 用户自定义串（非默认 8.99.999）视为刻意伪装，原样保留
+	if c.Security.HideVersion && c.ServerVersion == "8.99.999" {
+		c.ServerVersion = "8.0.0"
+	}
+	// 心跳上报（v1.3.13 §6.5）
+	if c.Heartbeat.IntervalSec <= 0 {
+		c.Heartbeat.IntervalSec = 60
+	}
+	if c.Heartbeat.IntervalSec < 10 {
+		c.Heartbeat.IntervalSec = 10
 	}
 	// KV 键值/队列（v1.2.0）
 	switch c.KV.Eviction {

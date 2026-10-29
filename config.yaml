@@ -8,6 +8,9 @@
 #   [::1]:3309                      仅本机 IPv6
 #   [240e:3a6:e15:e451::d24]:3309   绑定指定全球单播 IPv6
 listen: 0.0.0.0:3309
+# listen_unix: /run/glaciertdb/gt.sock   # UDS 本地连接加速（v1.3.13，仅 Linux）：
+#                                         # 3309 协议多路复用整体架在 Unix domain socket 上，
+#                                         # mysql/redis/amqp/mqtt 本地连接免 TCP 层开销；鉴权照旧
 db_dir: /data          # 库目录（必须挂载目录，WAL 需可写）
 default_db: backup     # 连接未指定库时的默认库（不存在则自动创建）
 server_version: "8.99.999"   # 对外呈现的 MySQL 版本号
@@ -69,9 +72,12 @@ async_query:
   result_retain_sec: 60      # 结果默认保留秒数（RETAIN 按任务覆盖）
   default_timeout_sec: 1800
   callback_max_inline_kb: 64 # 分片回调单片数据内联上限
-  # nodejs_path: ""          # SCRIPT 后处理 runtime（空=禁用；沙箱边界见 FEATURE.md）
-  # python_path: ""
+  # --- SCRIPT 后处理 runtime（⚠ v1.3.13 起临时停用：带 SCRIPT 子句的提交显式报错，
+  #     恢复与增强排在 v1.3.14；以下配置项保留，恢复后直接生效）---
+  # nodejs_path: ""          # SCRIPT 后处理 runtime（.js；空=禁用该类脚本）
+  # python_path: ""          # SCRIPT 后处理 runtime（.py；空=禁用）
   # php_path: ""             # SCRIPT 后处理 runtime（.php，v1.3.1；空=禁用）
+  # script_dir: ""           # SCRIPT 白名单目录（脚本必须位于其下）
 
 # 维护：VACUUM 会锁该库全部写入；no_hot_vacuum=true 禁止运行中 VACUUM（仅 CLI）
 maintenance:
@@ -106,6 +112,9 @@ lock:
 security:
   encrypt: true
   passphrase: "GlacierTDB"  # 默认固定口令（可改）；所有 .db 落盘即密文，协议层透明读写
+  hide_version: false       # 版本号隐藏（v1.3.13）：开启后 S3 响应头/Redis INFO·HELLO/
+                            # 管理面 glacier_version 不再携带真实版本号（MySQL 握手恒回 8.0.0）；
+                            # 启动日志与 CLI 版本输出不隐藏（本机排障用）
 # 键值/队列（v1.2.0）：mode:redis 在 3309 同端口提供 RESP 服务（声明行/嗅探进入）
 # 详见 docs/键值队列.md
 kv:
@@ -148,6 +157,8 @@ s3:
                             # v1.3.12：region 仅作为全局签名校验维度，桶不再单独存储 region
   endpoints:
     - listen: 0.0.0.0:9000          # HTTP（可配多个端点；HTTPS 独立端口加 tls: true + 证书）
+      # listen_unix: /run/glaciertdb/s3.sock   # S3 端点 UDS 监听（v1.3.13，仅 Linux）：
+      #                                       # curl --unix-socket 直连，SigV4 鉴权照旧
       # listen: "[::]:9000"         # IPv6 / 双栈监听写法（同 3309）
       # tls: true
       # cert_file: /data/certs/wildcard.pem   # 端点泛域名证书（SNI 兜底）
@@ -173,6 +184,42 @@ s3:
   # image_font: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf  # 图片文字 ttf 字体（空=内置 ASCII）
   image_cache: true         # 图片预处理结果磁盘缓存（GET 加工链路；<db_dir>/sys/gimg_cache/）
   image_cache_mb: 1024      # 缓存容量上限（MB；超出按最久未用淘汰；-1 = 不限）
+  # --- 存储效率与可观测性（v1.3.13）---
+  # chunk 去重范围（chunk 池内容寻址共享的键前缀维度）：
+  #   bucket = 桶内去重 | user = 同属主跨桶（默认）| system = 全实例
+  # ⚠ system 档存在侧信道风险：攻击者可通过闪传（x-glacier-flash / quick_transfer）
+  #   是否秒回探测他人是否拥有某文件，仅可信环境使用；范围切换不追溯既有数据
+  dedup_scope: user
+  gzip_level: 5             # GET 传输 gzip 压缩等级 1-9（0/非法回退 5；x-glaciertdb-gzip:0 请求头可按请求关闭）
+  error_log: false          # S3 结构化错误日志（开启后所有错误落 JSON 行日志，凭 request-id 一查到底）
+  archive_sync_max_mb: 512  # 打包下载「完成后下载」模式总大小上限（超限报错改用流式 tar）
+  archive_tmp_max_mb: 4096  # 打包临时包目录 .s3tmp 容量上限（弹性驱逐：先完整下载过的旧包，再最旧）
+  chunk_gc_ttl_sec: 3600    # 墓碑 chunk（删除后 refcnt=0）保留秒数，到期 GC 清数据
+  # 数据主动同步（「数据北上」v1.3.13）：事件驱动推送到远端 S3 端点，规则数组可多条
+  # sync:
+  #   - name: backup-to-cloud
+  #     bucket: edge-bucket          # 源桶
+  #     match_prefix: ""             # 源 key 前缀过滤（空 = 全桶）
+  #     remote_url: http://cloud.example.com:9000
+  #     remote_region: us-east-1
+  #     remote_bucket: my-backup
+  #     remote_prefix: "edge/"       # 远端目标前缀目录（可空）
+  #     remote_ak: AKXXXXXXXXXXXX
+  #     remote_sk: SKXXXXXXXXXXXXXXXXXXXXXXXX
+  #     sync_deletes: false          # 删除是否传播（备份语义默认不）
+  #     skip_sync_origin: true       # 跳过带 sync-origin 标记的对象（断多跳同步环；默认 true）
+  #     callback_url: ""             # 每对象同步结果回调（可空；HMAC 用 callback_secret）
+  #     callback_secret: ""
+  #     full_sync_on_start: false    # 启动时全量同步
+  #     reconcile_sec: 0             # 定期对账周期秒（远端 List 比对缺漏补推；0 = 关）
+
+# 主动心跳上报（v1.3.13，默认关）：定时 POST 规模/健康 JSON 到用户自建 HTTP 中心
+# （实例 ID + 版本 + uptime + 各组件规模 + 错误计数；body HMAC 签名头 X-Glacier-Signature）
+heartbeat:
+  url: ""                  # 中心端 URL（空 = 关闭）
+  interval_s: 60           # 上报周期（默认 60，最低 10）
+  secret: ""               # body HMAC-SHA256 签名密钥（可空）
+  fields: []               # payload 字段白名单（空 = 全部）
 
 log:
   level: info              # debug | info | warn | error

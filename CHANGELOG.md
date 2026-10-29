@@ -2,6 +2,102 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.3.13.beta] - 2026-10-29
+
+> 版本主题「**存储效率与可观测性**」：S3 存储底层重构（chunk 池内容寻址 + link 引用 +
+> is-delete 软删，CopyObject 自动零拷贝）→ 文件闪传秒传 → gzip 传输压缩 → 打包下载 →
+> 数据主动同步引擎；KV 驱逐优先级 + SQL 读穿透回源；安全与可观测套件（实例唯一 ID /
+> S3 排障头 + 结构化错误日志 / 版本号隐藏 / 主动心跳上报 / 防爆破扩面收口）；
+> SCRIPT 能力临时屏蔽（安全边界整改，v1.3.14 恢复）。**测试环境：构建机 docker
+> （8 核 / 15GB）**——现场低配工控机性能请参考 README 环境要求表口径，不作等价预期。
+
+### 新增（S3 存储效率专项）
+- **chunk 池内容寻址存储（核心改造）**：新增全局池表 `s3_chunks`（SHA-256 内容寻址 +
+  引用计数 + is-delete 墓碑），桶分块表 `chk_<bucket>` 退化为引用表（key,version,seq → 池键），
+  对象 manifest 升级 v2（池键序列）——同内容跨对象/版本/桶共享一份物理存储：
+  - **CopyObject 零拷贝**：复制降为纯元数据操作（引用计数 +1，无数据搬运）；
+  - **同名覆盖 / multipart 重传自动共享**未变化 chunk，删除走 refcnt 归零 → 墓碑 →
+    挂现有生命周期扫描的到期 GC（`s3.chunk_gc_ttl_sec` 默认 3600）→ 既有 AutoReclaim 回收空间；
+  - **去重范围** `s3.dedup_scope`：`bucket`（桶内）/ `user`（同属主跨桶，**默认**）/
+    `system`（全实例）。⚠ `system` 档存在**侧信道风险**（可通过闪传是否秒回探测他人
+    是否拥有某文件）；范围切换不追溯既有数据，仅影响新写入；
+  - **存量桶后台逐桶幂等迁移**（hash 回填 + 数据入池，不阻塞启动）；读路径对未迁移行
+    自动回退（data 列直读 → hash 列查池），迁移过程读写两不误；
+  - inline ≤内联阈值小对象维持单行存储（无共享收益，控制迁移面）。
+- **文件闪传（秒传）A + B 双形态**：
+  - A：PUT 带 `x-glacier-flash: sha256:<hex>`（可选 `x-glacier-flash-size` 校验长度）——
+    命中直接建对象返回与普通上传一致的 etag（请求体可省略/忽略）；未命中幂等降级；
+  - B：`POST /{bucket}/{key}?quick_transfer=<sha256hex>`（无请求体）——命中直接建对象；
+    未命中 `404 QuickTransferMiss`，客户端再全量 PUT（两次 RTT，大文件省流量确定性最高）；
+  - 闪传索引仅登记分块单请求 PUT 对象（multipart 与小对象不登记，未命中自动降级）；
+    头/参数不参与 SigV4 签名；命中计请求数不计 bytes_in；并发闪传同一 hash 不产生重复 chunk。
+- **gzip 传输压缩**（非存储侧，存储与计费 storage/bytes_in 口径不变）：GET 响应压缩
+  `s3.gzip_level`（1-9 默认 5）；**反代友好头** `x-glaciertdb-gzip: 0|1`（非签名——
+  代理层可自由注入不破坏 SigV4；缺省/异常值一律按 1）；生效条件：Accept-Encoding 允许
+  gzip && content-type 白名单 && 魔数嗅探非已压缩内容 && 非 Range（206 一律 identity）；
+  图片管道结果与对象自身 Content-Encoding 跳过。
+- **打包下载**：`GET /{bucket}?x-glacier-archive=<prefix>&format=tar|tar.gz|zip&mode=stream|done`
+  ——流式边打包边发（仅 tar，不压缩天然流式）；完成后下载先落包再整包发（tar/tar.gz/zip，
+  压缩等级 1-9 默认 5），打包前统计总大小超 `s3.archive_sync_max_mb`（默认 512MB）拒绝；
+  临时包目录 `.s3tmp` 容量 `s3.archive_tmp_max_mb`（默认 4096MB）弹性驱逐（先完整下载过
+  的旧包，再最旧）；对象锁/WORM 对象照常包含；限速计入 per_conn_bps。
+- **数据主动同步引擎「数据北上」**：`s3.sync` 规则数组（前缀匹配可多条）——把桶数据
+  事件驱动推送到远端 S3 端点（备份 / 业务伴随同步）；PUT/Complete 事件入队（不轮询），
+  失败退避重试（1s/5s/30s/2m/5m ×5 次后放弃），每对象结果 HTTP 回调（HMAC）；
+  `full_sync_on_start` 启动全量、`reconcile_sec` 定期对账（远端 List 比对缺漏补推）、
+  `sync_deletes` 删除传播（备份语义默认不）；**防自旋三层**：出站请求恒带
+  `x-glacier-instance-id`（上游 GlacierTDB 识别比对自己 → 409 拒绝直环）+ 经同步写入的
+  对象打 `sync-origin` 元数据（规则默认跳过，断多跳环 A→B→A）+ S3 全响应头带实例 ID
+  （双保险）。观测面 `SHOW S3 SYNC`。
+
+### 新增（KV）
+- **驱逐优先级**：`KEYPRIO key <n>`（-1 = 未设置完全遵循 LRU，与现状完全兼容存量零迁移；
+  0-255 显式单字节，0 最先驱逐 / 255 最受保护）+ `GETPRIO key`；内存超限先在显式优先级
+  键中按 prio 升序、同级 LRU 淘汰，仍未降到位再全体纯 LRU；volatile-* 策略下 prio 同样
+  生效；INFO 暴露 `evicted_prio` / `evicted_lru` 分层淘汰计数。
+- **SQL 读穿透（read-through 回源）**：管理面 `KV SOURCE ADD <key前缀> <db> '<SQL 模板>'
+  [TTL <ms>]`（**仅 super**）注册回源规则（模板占位 `{key}` 整键 / `{N}` 按 `:` 分段，
+  参数化绑定防注入；`KV SOURCE DEL / SHOW KV SOURCE` 管理）——GET miss 时按规则透传
+  SELECT 到业务库回源，结果回填缓存后返回：单行单列 → 字符串 / 单行多列 → JSON 对象 /
+  多行 → JSON 数组；**权限边界：执行时以发起请求的用户身份做库授权校验（透传查询只能
+  触达同用户名下的 db）+ 仅放行 SELECT**；同 key 并发 miss single-flight 防击穿；空结果
+  不回填负缓存；命中/未命中/执行耗时计数进 INFO 与 `SHOW KV STATS`（新列 source_*）。
+
+### 新增（全局 / 安全与可观测）
+- **实例唯一 ID**：UUID 首启生成写系统库（`instance_meta` 表，随备份与加密体系走），
+  重启不变；暴露面：MySQL `SELECT @@glaciertdb_instance_id`、Redis `INFO server` 字段、
+  **S3 所有响应头 `x-glacier-instance-id`**、AMQP server-properties、启动日志、
+  异步任务回调 payload 与心跳 payload 附带（多盒子机群区分实例 / 日志聚合 / 备份命名）。
+- **S3 报错日志 + 排障响应头**：排障头**恒开**（开销可忽略）——`x-glacier-request-id` +
+  `x-glacier-error-code` + `x-glacier-instance-id`，错误 XML 内同样回 request-id；
+  结构化错误日志 = 配置开关默认关（`s3.error_log: false`）：开启后所有 S3 错误落单行
+  JSON（时间/租户/桶/操作/错误码/耗时/IP/request-id），客户端报障凭 request-id 一查到底。
+- **版本号隐藏**：`security.hide_version: false` 默认关。开启后 S3 响应头（Server 退化为
+  `GlacierTDB`）/ Redis INFO·HELLO / 管理面 glacier_version 不再携带真实版本号；MySQL
+  握手版本串保持合法格式恒回 `8.0.0`；启动日志与 CLI 版本输出不隐藏（本机排障用）。
+- **主动心跳上报**（默认关）：`heartbeat:` 配置段（url / interval_s 默认 60 / secret 对
+  body 做 HMAC 签名 / 字段白名单）——定时 POST 实例 ID + 版本 + uptime + 各组件规模
+  （桶数/对象数/字节、KV 键数、MQ 队列深度、异步任务积压）+ 错误计数到用户自建 HTTP
+  中心；失败仅记日志（避免失败风暴）。
+- **防爆破扩面收口**：AMQP / RESP / MQTT 认证失败与 MySQL 侧同一锁定器（per-IP +
+  per-username、回环永不锁定、`-unlock-user/-unlock-ip/-show-locks` CLI 旁路通用、
+  HTTP 告警复用）——锁定检查前置对齐 MySQL 侧语义（锁定期内正确密码同样拒绝且失败照计）。
+- **Unix domain socket 本地连接加速**：`listen_unix:`（3309 首字节协议多路复用器整体
+  架在 UDS 上——mysql/redis/amqp/mqtt/ws 本地连接免 TCP 层开销）与
+  `s3.endpoints[].listen_unix`（S3 端点，`curl --unix-socket` 直连）；**必须鉴权**
+  （各协议认证照旧），纯传输加速；AF_UNIX 仅 Linux 生效（build-tags 拆分）。
+
+### 变更
+- **SCRIPT 能力临时屏蔽**（安全边界整改）：带 `SCRIPT` 子句的 SUBMIT 显式报错
+  `SCRIPT temporarily disabled (security rework, see v1.3.14)`（不静默忽略）；执行链路
+  注释封存（代码保留）；配置项 `nodejs_path` / `python_path` / `php_path` / `script_dir`
+  保留；恢复与增强（S3 脚本源、运行日志）整体移交 v1.3.14。
+- `SHOW S3 SPACE` 新增 chunk 池观测列（pool_chunks / pool_live_bytes / pool_shared /
+  pool_tombstones / pool_tomb_bytes）；S3 VACUUM FULL 前自动清墓碑。
+- 上传回调 payload 新增 `instance_id` 字段；异步任务回调 payload 同。
+- `SHOW CONFIG` 新增 glacier_instance_id / listen_unix / s3.dedup_scope / s3.gzip_level /
+  s3.error_log / 打包上限 / security.hide_version / heartbeat.url 行。
+
 ## [1.3.12.beta] - 2026-10-28
 
 > 稳定性系列：**S3 并行上传性能重构**（单事务写路径 + 元数据缓存 + 暂存内存化）·
@@ -157,6 +253,8 @@
 - `likeMatch`（information_schema / SHOW 过滤）正则编译结果缓存——此前逐行编译 O(rows) 次。
 
 ## [1.3.10.beta] - 2026-10-27
+
+> ⚠️ **本版本已撤版**（重大安全缺陷：租户隔离越权，4 个 CRITICAL，v1.3.11 修复——详见下节安全部分），请勿使用。
 
 > **版本基调转折**：自 1.3.10 起项目转向**稳定性更新**（性能优化 / BUG 修复 / 运维体验），
 > 不再新增大特性（README 首页已声明）。

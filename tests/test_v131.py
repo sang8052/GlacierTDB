@@ -388,38 +388,26 @@ def main() -> int:
             pass
     check(True, "CANCEL 清理周期链")
 
-    # ---------- 4. SCRIPT PHP ----------
-    # v1.3.12 语义更新：测试容器 async_query.php_path 已配置（/bin/sh + 夹具
-    # pipe.php），任务应正常跑通（DONE）；php_path 未配置的环境才走 ERROR 分支
-    cur.execute("SUBMIT QUERY 'SELECT 1 AS a' SCRIPT 'pipe.php'")
-    row = cur.fetchone()
-    job6 = row[0]
-    state6, err6 = "", ""
-    for _ in range(60):
-        cur.execute("SELECT state, error FROM query_jobs WHERE job_id = '%s'" % job6)
-        r = cur.fetchone()
-        if r:
-            state6, err6 = r[0], r[1] or ""
-            if state6 in ("DONE", "ERROR"):
-                break
-        time.sleep(0.3)
-    check(state6 == "DONE" or (state6 == "ERROR" and "php_path" in err6),
-          "SCRIPT 'pipe.php' 配置 runtime → DONE（state=%s err=%s）" % (state6, err6[:80]))
+    # ---------- 4. SCRIPT 临时屏蔽（v1.3.13）----------
+    # SCRIPT 能力自 v1.3.13 起临时停用（安全边界整改，v1.3.14 恢复）：
+    # 带 SCRIPT 子句的提交在入口处显式报错，不再建任务执行
+    script_err = ""
+    try:
+        cur.execute("SUBMIT QUERY 'SELECT 1 AS a' SCRIPT 'pipe.php'")
+        script_err = "(no error raised)"
+    except Exception as e:
+        script_err = str(e)
+    check("temporarily disabled" in script_err,
+          "SCRIPT 'pipe.php' 临时停用显式报错（%s）" % script_err[:80])
 
-    cur.execute("SUBMIT QUERY 'SELECT 1 AS a' SCRIPT 'pipe.txt'")
-    row = cur.fetchone()
-    job7 = row[0]
-    state7, err7 = "", ""
-    for _ in range(60):
-        cur.execute("SELECT state, error FROM query_jobs WHERE job_id = '%s'" % job7)
-        r = cur.fetchone()
-        if r:
-            state7, err7 = r[0], r[1] or ""
-            if state7 in ("DONE", "ERROR"):
-                break
-        time.sleep(0.3)
-    check(state7 == "ERROR" and "unsupported script type" in err7,
-          "SCRIPT 'pipe.txt' 非法扩展名 → ERROR（%s）" % err7[:80])
+    script_err2 = ""
+    try:
+        cur.execute("SUBMIT QUERY 'SELECT 1 AS a' SCRIPT 'pipe.txt'")
+        script_err2 = "(no error raised)"
+    except Exception as e:
+        script_err2 = str(e)
+    check("temporarily disabled" in script_err2,
+          "SCRIPT 'pipe.txt' 临时停用显式报错（%s）" % script_err2[:80])
 
     # ---------- 5. 清理 ----------
     cur.execute("DROP BUCKET s3mpu FORCE")

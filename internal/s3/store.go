@@ -87,6 +87,10 @@ type Store struct {
 	maxObject             int64
 	abortIncompleteDays   int
 	globalRegion string // 服务端全局 region（v1.3.12：桶不再单独存 region，'/' 统一展示）
+	dedupScope   string // chunk 去重范围（v1.3.13）：bucket | user（默认）| system
+	chunkGCTTL   int    // 墓碑 chunk 保留秒数（v1.3.13，默认 3600）
+	gzipLevel    int    // GET 传输压缩等级（v1.3.13，默认 5）
+	errorLog     bool   // S3 结构化错误日志开关（v1.3.13，默认关）
 
 	limits       config.S3Limit
 	bucketLimits map[string]config.S3Limit
@@ -105,6 +109,16 @@ type Store struct {
 
 	touchMu  sync.Mutex
 	touchBuf map[string]struct{} // 密钥 last_used 脏标记（定时批量落库，v1.3.12）
+
+	// 数据同步引擎钩子（v1.3.13 §1.4，Server 启动时注入；nil = 未启用）：
+	// 对象写入/删除事件驱动入队，不轮询扫描
+	syncHook syncNotifier
+}
+
+// syncNotifier 同步引擎事件回调（Server 侧实现）。
+type syncNotifier interface {
+	objectPut(b Bucket, m ObjectMeta)
+	objectDeleted(bucket, key string)
 }
 
 // bucketCacheEntry 桶行缓存条目（2 秒 TTL：元数据展示级一致性足够）。
@@ -150,6 +164,10 @@ func Open(backend *sqlite.Backend, cfg *config.Config) (*Store, error) {
 		limits:       cfg.S3.Limits,
 		bucketLimits: cfg.S3.BucketLimits,
 		globalRegion: cfg.S3.Region,
+		dedupScope:   cfg.S3.DedupScope,
+		chunkGCTTL:   cfg.S3.ChunkGCTTLSec,
+		gzipLevel:    cfg.S3.GzipLevel,
+		errorLog:     cfg.S3.ErrorLog,
 		bucketCache:  make(map[string]bucketCacheEntry),
 		policyCache:  make(map[string]policyCacheEntry),
 		touchBuf:     make(map[string]struct{}),
@@ -173,6 +191,8 @@ func Open(backend *sqlite.Backend, cfg *config.Config) (*Store, error) {
 			logx.Warnf("s3: migrate bucket table %s: %v", b.TableName, err)
 		}
 	}
+	// 存量分块后台幂等迁移入池（v1.3.13）：不阻塞启动，后台逐桶执行
+	go s.migrateChunkPool()
 	go func() { // 记账缓冲定时落库（v1.3.11）+ 密钥 last_used 批量落库（v1.3.12）
 		t := time.NewTicker(usageFlushEvery)
 		defer t.Stop()
@@ -298,6 +318,23 @@ CREATE TABLE IF NOT EXISTS s3_parts (
   created_ts  TEXT NOT NULL DEFAULT '',
   chunks      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (upload_id, part_number)
+);
+CREATE TABLE IF NOT EXISTS s3_chunks (
+  hash       TEXT PRIMARY KEY,
+  size       INTEGER NOT NULL DEFAULT 0,
+  refcnt     INTEGER NOT NULL DEFAULT 0,
+  is_delete  INTEGER NOT NULL DEFAULT 0,
+  deleted_ts TEXT NOT NULL DEFAULT '',
+  created_ts TEXT NOT NULL DEFAULT '',
+  data       BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_s3_chunks_gc ON s3_chunks(is_delete, deleted_ts);
+CREATE TABLE IF NOT EXISTS s3_flash (
+  fkey       TEXT PRIMARY KEY,
+  size       INTEGER NOT NULL DEFAULT 0,
+  etag       TEXT NOT NULL DEFAULT '',
+  chunks     TEXT NOT NULL DEFAULT '[]',
+  created_ts TEXT NOT NULL DEFAULT ''
 );`)
 	if err != nil {
 		return fmt.Errorf("init s3 schema: %w", err)
@@ -366,6 +403,7 @@ CREATE TABLE IF NOT EXISTS %s (
   version_id TEXT NOT NULL DEFAULT '',
   seq        INTEGER NOT NULL,
   data       BLOB NOT NULL,
+  hash       TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (key, version_id, seq)
 );`,
 		"obj_"+strings.TrimPrefix(t, "obj_"),
@@ -378,6 +416,9 @@ CREATE TABLE IF NOT EXISTS %s (
 	// 存量桶表补 manifest 列（幂等：重复列报错忽略；常量默认值 ALTER 为瞬时操作）
 	_, _ = s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN manifest TEXT NOT NULL DEFAULT ''`,
 		"obj_"+strings.TrimPrefix(t, "obj_")))
+	// 存量分块表补 hash 引用列（v1.3.13：chk_ 退化为引用表；幂等）
+	_, _ = s.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN hash TEXT NOT NULL DEFAULT ''`,
+		"chk_"+strings.TrimPrefix(t, "obj_")))
 	return nil
 }
 
@@ -453,8 +494,18 @@ func (s *Store) DropBucket(name string, force bool) error {
 				Msg: "The bucket you tried to delete is not empty"}
 		}
 	}
+	// 池引用释放（v1.3.13）：先收集全表（正式行 + 未完成分片暂存行）引用，
+	// 再清理分片会话与 DROP TABLE——跨桶共享的池 chunk 不受影响，refcnt 归零者
+	// 走墓碑 GC
+	hashes, err := s.collectChunkHashes(chunkTableFor(b.TableName), "", "")
+	if err != nil {
+		return err
+	}
 	// 先清理未完成分片上传（分块表还在），再删表
 	if err := s.dropBucketUploads(b); err != nil {
+		return err
+	}
+	if err := releaseChunkRefs(s.db, hashes); err != nil {
 		return err
 	}
 	if _, err := s.db.Exec(fmt.Sprintf(`DROP TABLE IF EXISTS %s`, b.TableName)); err != nil {
@@ -776,10 +827,17 @@ func (s *Store) RunLifecycle() int {
 // deleteAllVersionsLocked 删除一个 key 的全部版本（生命周期用；调用方持 writeMu）。
 func (s *Store) deleteAllVersionsLocked(b Bucket, key string) error {
 	oldStorage, oldCount := s.keyAggLocked(s.db, b, key)
+	hashes, err := s.collectChunkHashes(chunkTableFor(b.TableName), key, "")
+	if err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=?`, chunkTableFor(b.TableName)), key); err != nil {
 		return err
 	}
 	if _, err := s.db.Exec(fmt.Sprintf(`DELETE FROM %s WHERE key=?`, b.TableName), key); err != nil {
+		return err
+	}
+	if err := releaseChunkRefs(s.db, hashes); err != nil {
 		return err
 	}
 	s.adjustAggLocked(s.db, b, key, -oldStorage, -oldCount)

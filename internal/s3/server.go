@@ -2,6 +2,7 @@ package s3
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -22,6 +23,7 @@ import (
 
 	"glaciertdb/internal/auth"
 	"glaciertdb/internal/config"
+	"glaciertdb/internal/instance"
 	"glaciertdb/internal/logx"
 )
 
@@ -72,6 +74,7 @@ type Server struct {
 	servers    []*http.Server
 	certRegs   []*certRegistry
 	imgcache   *imgCache // 图片预处理结果磁盘缓存（GET 加工链路；nil/未启用 = 关）
+	sync       *syncEngine // 数据主动同步引擎（v1.3.13；nil = 未配置规则）
 	started    bool
 }
 
@@ -91,6 +94,15 @@ func NewServer(cfg *config.Config, store *Store, auths *auth.Store) *Server {
 		}
 	}
 	s.lim = newLimiter(store.EffectiveLimit)
+	if cfg.S3.Enable {
+		s.sync = newSyncEngine(s, cfg.S3.Sync)
+		if s.sync != nil {
+			store.syncHook = s.sync // 事件驱动入队（PUT/DELETE 钩子，v1.3.13）
+		}
+		if cfg.S3.ErrorLog {
+			s3ErrorLogSink = func(r *http.Request) bool { return true }
+		}
+	}
 	return s
 }
 
@@ -128,6 +140,25 @@ func (s *Server) Start() error {
 				logx.Errorf("s3 serve: %v", err)
 			}
 		}(srv, ln)
+		// UDS 端点（v1.3.13 §5.2，仅 Linux）：curl --unix-socket 直连，
+		// SigV4 鉴权照旧（纯传输加速，不做任何免鉴权）
+		if ep.ListenUnix != "" {
+			uln, uerr := s3ListenUnix(ep.ListenUnix)
+			if uerr != nil {
+				return fmt.Errorf("s3 listen_unix %s: %w", ep.ListenUnix, uerr)
+			}
+			usrv := &http.Server{
+				Handler:           &endpointHandler{srv: s, ep: ep, certs: reg},
+				ReadHeaderTimeout: 30 * time.Second,
+			}
+			s.servers = append(s.servers, usrv)
+			logx.Infof("s3: listening on unix://%s (auth required, SigV4 unchanged)", ep.ListenUnix)
+			go func(srv *http.Server, ln net.Listener) {
+				if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
+					logx.Errorf("s3 unix serve: %v", err)
+				}
+			}(usrv, uln)
+		}
 	}
 	s.started = true
 	// 生命周期（自动删除）后台扫描
@@ -144,10 +175,16 @@ func (s *Server) lifecycleLoop() {
 	defer t.Stop()
 	for range t.C {
 		s.store.RunLifecycle()
+		if n := s.store.GCChunkTombstones(); n > 0 { // 墓碑 chunk 到期清理（v1.3.13，挂现有框架不新造调度器）
+			logx.Infof("s3: chunk tombstone GC removed %d pool chunks", n)
+		}
 		if s.imgcache.enabled() { // 图片缓存顺带做一轮容量回收
 			s.imgcache.enforce()
 		}
 		s.store.AutoReclaim() // 删除留下的空闲页增量回收（阈值触发，短事务分步免长锁；v1.3.11）
+		if s.sync != nil {
+			s.sync.reconcileTick() // 定期对账（远端 List 比对；v1.3.13）
+		}
 	}
 }
 
@@ -192,8 +229,16 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s := h.srv
 	reqID := genRequestUUID()
 	w = &timingRW{ResponseWriter: w, start: time.Now()}
+	// v1.3.13 §6.2/§6.3：排障响应头恒开（开销可忽略）——request-id / instance-id /
+	// 真实版本号（security.hide_version 开启时 Server 头退化为 GlacierTDB）
 	w.Header().Set("x-amz-request-id", reqID)
-	w.Header().Set("Server", "GlacierTDB/"+config.GlacierVersion)
+	w.Header().Set("x-glacier-request-id", reqID)
+	w.Header().Set("x-glacier-instance-id", instance.UUID())
+	if v := config.DisplayVersion(); v != "" {
+		w.Header().Set("Server", "GlacierTDB/"+v)
+	} else {
+		w.Header().Set("Server", "GlacierTDB")
+	}
 
 	// 计费导出接口（供计费系统拉取）
 	if strings.HasPrefix(r.URL.Path, "/_glacier/") {
@@ -260,12 +305,38 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case bucket == "" && key == "":
+		r = withReqInfo(r, owner, "", "", lim, userTB)
 		h.handleService(w, r, owner, reqID)
 	case key == "":
+		r = withReqInfo(r, owner, bucket, "", lim, userTB)
 		h.handleBucket(w, r, bucket, owner, reqID)
 	default:
+		r = withReqInfo(r, owner, bucket, key, lim, userTB)
 		h.handleObject(w, r, bucket, key, owner, payloadHash, lim, userTB, reqID)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// 请求上下文（结构化错误日志归属 + 限速句柄传递；v1.3.13 §6.3）
+// ---------------------------------------------------------------------------
+
+type reqInfoCtxKey struct{}
+
+type reqInfo struct {
+	owner, bucket, key string
+	lim                config.S3Limit
+	userTB             *tokenBucket
+}
+
+func withReqInfo(r *http.Request, owner, bucket, key string, lim config.S3Limit, userTB *tokenBucket) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), reqInfoCtxKey{}, &reqInfo{owner: owner, bucket: bucket, key: key, lim: lim, userTB: userTB}))
+}
+
+func reqInfoOf(r *http.Request) *reqInfo {
+	if v, ok := r.Context().Value(reqInfoCtxKey{}).(*reqInfo); ok {
+		return v
+	}
+	return &reqInfo{}
 }
 
 // resolveBucketKey virtual-host / path-style 解析（返回已解码 bucket 与 key）。
@@ -456,6 +527,17 @@ func (h *endpointHandler) handleBucket(w http.ResponseWriter, r *http.Request, b
 	q := r.URL.Query()
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
+		// 打包下载（v1.3.13 §1.5）：GET /{bucket}?x-glacier-archive=<prefix>&format=…&mode=…
+		//（限速 / 并发沿用 ServeHTTP 已获取的连接级额度；对象锁/WORM 对象照常包含）
+		if r.Method == http.MethodGet && q.Has("x-glacier-archive") {
+			if _, berr := h.srv.store.Bucket(bucket); berr != nil {
+				writeErr(w, r, reqID, toS3Err(berr))
+				return
+			}
+			info := reqInfoOf(r)
+			h.archiveDownload(w, r, bucket, q.Get("x-glacier-archive"), owner, reqID, info.lim, info.userTB)
+			return
+		}
 		if _, ok := q["uploads"]; ok {
 			h.listMultipartUploads(w, r, bucket, reqID)
 			return
@@ -678,6 +760,13 @@ func (h *endpointHandler) handleObject(w http.ResponseWriter, r *http.Request, b
 
 	switch r.Method {
 	case http.MethodPut:
+		// 防自旋直环检查（v1.3.13 §1.4）：同步出站请求恒带 x-glacier-instance-id，
+		// 上游若也是 GlacierTDB 且回写自己 → 一致即拒绝（多跳环由 sync-origin 元数据断）
+		if ih := r.Header.Get("X-Glacier-Instance-Id"); ih != "" && ih == instance.UUID() {
+			writeErr(w, r, reqID, &s3Error{Code: "OperationAborted", Status: 409,
+				Msg: "sync loop detected: x-glacier-instance-id matches this instance (a bucket must not sync to itself)"})
+			return
+		}
 		if src := r.Header.Get("X-Amz-Copy-Source"); src != "" {
 			h.copyObject(w, r, bucket, key, src, reqID)
 			return
@@ -688,6 +777,11 @@ func (h *endpointHandler) handleObject(w http.ResponseWriter, r *http.Request, b
 		// POST /{bucket}/{key}?uploads → InitiateMultipartUpload
 		if q.Has("uploads") {
 			h.initiateMultipart(w, r, bucket, key, reqID)
+			return
+		}
+		// POST /{bucket}/{key}?quick_transfer=<sha256> → 两段式闪传探测（v1.3.13 §1.2 B）
+		if qt := q.Get("quick_transfer"); qt != "" {
+			h.quickTransfer(w, r, bucket, key, owner, qt, reqID)
 			return
 		}
 		// POST /{bucket}/{key}?x-gimg-ops=...&x-gimg-save-as=dstBucket/dstKey
@@ -744,6 +838,25 @@ func (h *endpointHandler) putObject(w http.ResponseWriter, r *http.Request, buck
 	if hasImg && img.OpsErr != nil { // 非法 x-gimg-ops：显式 400，不再静默透传
 		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: img.OpsErr.Error()})
 		return
+	}
+	// 闪传 A 形态（v1.3.13 §1.2）：x-glacier-flash: sha256:<hex>（可选
+	// x-glacier-flash-size）——命中直接建对象（请求体可省略/忽略）；未命中幂等
+	// 降级，请求体照常走普通上传。头不参与 SigV4 签名，与图片管道互斥。
+	if flashSHA := r.Header.Get("X-Glacier-Flash"); flashSHA != "" && !hasImg {
+		sizeHint := int64(-1)
+		if v := r.Header.Get("X-Glacier-Flash-Size"); v != "" {
+			if n, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+				sizeHint = n
+			}
+		}
+		if m, hit, ferr := h.srv.store.FlashCreate(bucket, key, flashSHA, sizeHint, putAttrs(r)); ferr != nil {
+			writeErr(w, r, reqID, toS3Err(ferr))
+			return
+		} else if hit {
+			h.finishPut(w, r, bucket, key, m, false, owner, reqID)
+			return
+		}
+		// 未命中：继续普通上传（此时请求体应照常携带）
 	}
 	body := io.Reader(r.Body)
 	contentEnc := r.Header.Get("Content-Encoding")
@@ -866,6 +979,9 @@ func (h *endpointHandler) finishPut(w http.ResponseWriter, r *http.Request, buck
 	m ObjectMeta, replaced bool, owner, reqID string) {
 	if b, err := h.srv.store.Bucket(bucket); err == nil {
 		h.srv.notifyPut(b, m, replaced, reqCallbackOverride(r))
+		if h.srv.sync != nil {
+			h.srv.sync.objectPut(b, m) // 数据主动同步入队（规则前缀命中才入队；v1.3.13）
+		}
 	}
 	// 记账（PUT + bytes_in）已在 store.PutObject 内按桶属主完成
 	w.Header().Set("ETag", "\""+m.ETag+"\"")
@@ -873,6 +989,23 @@ func (h *endpointHandler) finishPut(w http.ResponseWriter, r *http.Request, buck
 		w.Header().Set("x-amz-version-id", m.VersionID)
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+// quickTransfer 两段式闪传探测（v1.3.13 §1.2 B 形态）：
+// POST /{bucket}/{key}?quick_transfer=<sha256hex>（无请求体）——命中直接建对象
+// 返回与普通上传一致的应答（200 + ETag）；未命中 404 QuickTransferMiss，客户端
+// 再全量 PUT（两次 RTT，省流量确定性最高，适合大文件）。
+func (h *endpointHandler) quickTransfer(w http.ResponseWriter, r *http.Request, bucket, key, owner, sha, reqID string) {
+	m, hit, err := h.srv.store.FlashCreate(bucket, key, sha, -1, putAttrs(r))
+	if err != nil {
+		writeErr(w, r, reqID, toS3Err(err))
+		return
+	}
+	if !hit {
+		writeErr(w, r, reqID, FlashMissErr())
+		return
+	}
+	h.finishPut(w, r, bucket, key, m, false, owner, reqID)
 }
 
 // callbackOverride 请求级回调覆盖（v1.3.12）：PUT / CompleteMultipartUpload 的
@@ -1069,6 +1202,29 @@ func (h *endpointHandler) getObject(w http.ResponseWriter, r *http.Request, buck
 		w.WriteHeader(http.StatusPartialContent)
 		_, cw := newLimitedWriter(w, lim.PerConnBps, userTB)
 		_, _ = io.Copy(cw, rc)
+		h.srv.store.AddUsage(usageOwner(h.srv, bucket, owner), bucket, "GET", 0, cw.count)
+		return
+	}
+	// gzip 传输压缩（v1.3.13 §1.3）：白名单 content-type + 魔数嗅探兜底，
+	// Range 一律 identity；存储字节与 bytes_in 口径不变，bytes_out 按压缩后计
+	useGz := gzWanted(r, w.Header().Get("Content-Type"), m.ContentEncoding, false, false, hasImg)
+	var bodyR io.Reader = rc
+	if useGz {
+		head := make([]byte, 8)
+		n, _ := io.ReadFull(rc, head)
+		head = head[:n]
+		if gzSkipByMagic(head) {
+			useGz = false
+		}
+		bodyR = io.MultiReader(bytes.NewReader(head), rc)
+	}
+	if useGz {
+		setGzipHeaders(w)
+		w.WriteHeader(http.StatusOK)
+		_, cw := newLimitedWriter(w, lim.PerConnBps, userTB)
+		zw := newGzipWriter(cw, parseGzipLevel(h.srv.cfg.S3.GzipLevel))
+		_, _ = io.Copy(zw, bodyR)
+		_ = zw.Close()
 		h.srv.store.AddUsage(usageOwner(h.srv, bucket, owner), bucket, "GET", 0, cw.count)
 		return
 	}
@@ -1444,11 +1600,26 @@ func writeXML(w http.ResponseWriter, status int, v any, reqID string, headOnly b
 	}
 }
 
+// writeErr 统一错误应答：x-glacier-error-code 排障头恒带（v1.3.13 §6.3）；
+// s3.error_log 开启时落结构化错误日志（时间/租户/桶/操作/错误码/耗时/IP/request-id），
+// 客户端报障凭 request-id 一查到底（需配合日志开关）。
 func writeErr(w http.ResponseWriter, r *http.Request, reqID string, e *s3Error) {
 	if e == nil {
 		e = &s3Error{Code: "InternalError", Status: 500, Msg: "internal error"}
 	}
+	w.Header().Set("x-glacier-error-code", e.Code)
 	logx.Debugf("s3 error %d %s (req %s %s): %s", e.Status, e.Code, r.Method, r.URL.Path, e.Msg)
+	if tw, ok := w.(*timingRW); ok {
+		if s := s3ErrorLogSink; s != nil && s(r) {
+			info := reqInfoOf(r)
+			ip := clientIP(r)
+			dur := time.Since(tw.start).Round(time.Millisecond)
+			// 结构化单行 JSON（grep/jq 友好；instance_id 恒带——审计排障双用途）
+			logx.Errorf(`s3_error {"ts":%q,"instance_id":%q,"owner":%q,"bucket":%q,"key":%q,"op":%q,"code":%q,"status":%d,"cost_ms":%q,"ip":%q,"request_id":%q,"msg":%q}`,
+				time.Now().Format("2006-01-02 15:04:05"), instance.UUID(), info.owner, info.bucket, info.key,
+				r.Method+" "+r.URL.Path, e.Code, e.Status, dur.String(), ip, reqID, e.Msg)
+		}
+	}
 	writeXML(w, e.Status, struct {
 		XMLName   xml.Name `xml:"Error"`
 		Code      string   `xml:"Code"`
@@ -1457,6 +1628,10 @@ func writeErr(w http.ResponseWriter, r *http.Request, reqID string, e *s3Error) 
 		RequestID string   `xml:"RequestId"`
 	}{Code: e.Code, Message: e.Msg, Resource: r.URL.Path, RequestID: reqID}, reqID, r.Method == http.MethodHead)
 }
+
+// s3ErrorLogSink 结构化错误日志开关（Server 启动时按 s3.error_log 注入；
+// nil = 关闭）。函数形态避免 writeErr 反向依赖 Server。
+var s3ErrorLogSink func(r *http.Request) bool
 
 // toS3Err 统一错误转换。
 func toS3Err(err error) *s3Error {
