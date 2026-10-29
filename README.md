@@ -1,521 +1,221 @@
 # GlacierTDB
 
-> **Glacier**（冰川 · 冷数据）+ **TDB**（Time-series Database）
-> 以 **SQLite** 为唯一存储内核的**多中间件一体机**：MySQL 协议网关 + 时序冷库 + S3 对象存储 +
-> Redis 键值队列 + RabbitMQ 消息队列（**全部已实现**）——**一个静态二进制、一个数据目录、
-> 一个端口多协议**。面向工控机 / 物联网边缘环境，一台设备替代 MySQL + Redis + RabbitMQ + MinIO
-> 的组合：**运行中安全备份 = `glaciertdb -backup <dir>`（v1.3.12 起，不阻塞业务写入）；
-> 停机状态下备份 = 拷贝目录，迁移 = 拷贝文件**。
+把 MySQL、Redis、RabbitMQ、MinIO 装进一个程序里。
 
-> 🤖 **本项目全程由 GLM5.3 驱动。**
+GlacierTDB 用 SQLite 做唯一的存储内核，Go 编写，编译产物是一个约 20 MB 的静态二进制，没有任何外部依赖。一台设备装一个它，就能同时提供：
 
-**当前版本：v1.3.13.beta**
+- **MySQL 数据库** —— 标准 SQL，多库、事务、用户权限，mysql CLI / Navicat / PyMySQL / SQLAlchemy 直连；
+- **时序数据库** —— 自动预聚合、冷数据压缩，写法还是普通 SQL；
+- **Redis 键值/队列** —— string / list，落盘重启不丢；
+- **RabbitMQ 消息队列** —— AMQP 0-9-1，另带 MQTT 接入；
+- **S3 对象存储** —— 兼容 AWS SigV4，boto3 / aws-cli / MinIO Client 直连。
 
-> 🛑 **安全公告**：v1.3.10 及更早版本存在重大安全缺陷（租户隔离越权，4 个
-> CRITICAL，详见 [CHANGELOG](CHANGELOG.md) v1.3.11 安全节），**v1.3.10 已紧急撤版**。
-> 请勿使用任何 ≤ v1.3.10 的版本，立即升级至最新版；旧版本资产已从 Releases 撤下，
-> **仅从 [Releases](https://github.com/sang8052/GlacierTDB/releases) 获取最新版**。
+所有数据都在一个目录里。MySQL/Redis/AMQP 共用端口 3309（按客户端实际说的协议自动分发，存量客户端零改动），S3 单独监听 9000。
 
-> **版本基调（v1.3.10 起）**：FEATURE 整合已收官（MySQL 网关 / 时序冷库 / S3 / Redis / RabbitMQ / MQTT / 多租户 / 静态加密全量交付）；
-> **自 1.3.10 版本开始，项目转向稳定性更新**——以性能优化、BUG 修复与运维体验为主，不再新增大特性。
-> · 二进制下载：[Releases](https://github.com/sang8052/GlacierTDB/releases)
-（三平台 + SHA256SUMS）· 许可：MIT
+它为这样的场景而生：工控机、边缘盒子、小服务器——CPU 弱、内存少、可能是 SD 卡，没人值守，坏了要现场出差。所以它的备份是运行中一条命令（`glaciertdb -backup <目录>`，不阻塞业务），迁移是拷贝目录，掉电后数据文件不会坏。
 
----
+> 🤖 本项目全程由 GLM 驱动开发。
 
-## 🎯 定位前提（先读这个）
+**当前版本：v1.3.13.beta** · [下载（三平台 + SHA256SUMS）](https://github.com/sang8052/GlacierTDB/releases) · [完整变更记录](CHANGELOG.md) · 许可 [MIT](LICENSE)
 
-GlacierTDB 的所有设计取舍基于以下共识：
-
-1. **目标环境是 1\~4 核、1\~8GB RAM、SD 卡 / eMMC / SATA SSD 的工控机与轻量服务器，不是数据中心**；
-2. **单机架构是产品决策，不是待修复缺陷**——容灾逻辑 = 盒子可弃、数据北上（备份北上传中心）、换机重部署；
-3. **"大而全"是特性**：一个二进制替代 MySQL + Redis + RabbitMQ + MinIO 的组合部署，降低边缘环境的运维负担；
-4. **无人值守是常态**：没有 DBA、没有运维、出问题需要现场出差。因此弱硬件上每个模块的资源纪律比服务器环境更严格，不是更宽松。
-
-
-## 🖥 环境要求与推荐配置（分 x86 / ARM）
-
-> 数字为综合拟定口径，供选型建立正确预期；目标硬件规格实测表（路线图阶段三）发布后
-> 以实测表为准并互相引用。一切性能数字的测量环境以 CHANGELOG 标注为准——
-> **开发/构建机（高配主机）数字仅作开发参考，不作为现场性能预期。**
-
-**x86-64**
-
-| 档位 | CPU | 内存 | 存储 | 预期形态 |
-| --- | --- | --- | --- | --- |
-| 最低 | 2 核（J1900 级低频亦可） | 2 GB | 16 GB SATA SSD / DOM（SD 卡可用但不推荐做主存储） | 五组件全开可跑：MySQL 网关 + 时序 + KV + MQ + S3 常规读写流畅；图片管道限小图、S3 并行上传低并发；建议 `GOMEMLIMIT≈1.5GiB` |
-| 推荐 | 4 核（N5105 / J4125 及以上） | 4~8 GB | 64 GB SSD | 全能力流畅：图片管道大图、S3 并行上传、时序 rollup 均可用 |
-| 最低中的最低 | 1~2 核 | 1 GB | 8 GB | **裁剪形态**：建议仅 MySQL 网关 + 时序（或 KV），关闭 S3/图片管道与 MQ（`s3.enable`/`mysql.enable` 等开关组合）；必须配 `GOMEMLIMIT=700MiB` |
-
-**ARM64**（**仅 arm64**；armv7 / 32 位 ARM 已明确不支持——算力无法支撑全套服务）
-
-| 档位 | CPU | 内存 | 存储 | 预期形态 |
-| --- | --- | --- | --- | --- |
-| 最低 | 4×Cortex-A72（树莓派 4B）或 RK3566 级 | 4 GB | 16 GB A1/A2 级 SD 卡或 eMMC | 五组件全开可跑，图片管道明显慢于 x86 最低档 |
-| 推荐 | RK3588 / 树莓派 5 | 8 GB | 64 GB NVMe / SSD | 接近 x86 推荐档 |
-
-**配套口径**
-
-- 存储余量原则：`db_dir` 预估数据量 ×2（WAL + `-backup` 备份轮转 `.old`）+ ≥20% 余量；
-  SD 卡场景必须配 v1.3.12 调优项（`sqlite.wal_autocheckpoint` / `sqlite.journal_size_limit_kb`）；
-- 现场选型一句话总结：**「按最低档选型、按推荐档选存储」**——存储介质（SSD vs SD）
-  对写入吞吐与寿命的影响大于 CPU 档位。
+> **安全公告**：v1.3.10 及更早版本存在租户隔离越权漏洞（已在 v1.3.11 修复），v1.3.10 已撤版。
+> 在用旧版本的请立即升级，只从 Releases 获取最新版。
 
 ---
 
-## 🎯 定位：多中间件一篮子混合部署
+## 快速开始
 
-工控机 / 物联网边缘环境的痛点：设备资源有限、依赖安装繁琐、多个中间件（MySQL、Redis、
-RabbitMQ、MinIO）各自为政——安装、守护、备份、升级都是负担。GlacierTDB 的答案：
-
-- **一个内核**：SQLite（全球部署量最大的数据库引擎）作为唯一存储内核，数据永不损坏、零运维；
-- **一个二进制**：纯 Go 无 CGO，五种中间件能力全部内化（约 18 MB 静态产物），零外部依赖；
-- **一个端口**：3309 承载三协议——客户端声明服务类型，不声明默认 MySQL：
-
-  | 进入方式 | 说明 |
-  | --- | --- |
-  | `mode:<service>` 声明行 | 连接首行 ASCII 单行 `mode:mysql` / `mode:redis` / `mode:rabbitmq`（自定义客户端/调试用） |
-  | 协议嗅探（兜底） | RESP 首字节（`* + - : $`）→ Redis；`AMQP` 魔数 → RabbitMQ |
-  | 默认 | 静默等握手（嗅探窗口 `mux_sniff_ms` 内无数据）→ MySQL——**存量客户端零改动** |
-
-- **一个数据目录**：业务库 `.db` + 系统库（`glacier_auth` / `glacier_s3` / `glacier_kv` /
-  `glacier_mq`）+ 密钥与任务产物全在 `db_dir` 下，拷走即迁移。
-
-> S3 对象存储不进 3309 复用：HTTP(S) + virtual-host + 泛域名证书需要独立 TLS 监听器（默认 `:9000`）。
-
----
-
-## 🧭 能力全景
-
-| 中间件角色 | 入口 | 一句话能力 | 手册 |
-| --- | --- | --- | --- |
-| **MySQL 网关** | `:3309`（默认） | MySQL 协议 + 标准 SQL，mysql CLI / Navicat / DBeaver / PyMySQL / SQLAlchemy / JDBC 直连；多库、事务、管理面 | 本文 / 系统SQL |
-| **时序冷库** | 同 MySQL | `series`+`points` 聚簇 schema、时间谓词整数化、`GROUP BY time(N)`、**rollup 预聚合自动路由**、多核并行 | 时序数据库 |
-| **异步任务** | 同 MySQL | `SUBMIT QUERY` 秒回 job_id；AT / WINDOW / WHEN / EVERY 周期调度（含每月/每年）；四通道回调 + HMAC；**SCRIPT 后处理管道** | 异步任务 |
-| **S3 对象存储** | `:9000`（HTTP/S） | AWS SigV4（表头/预签名/aws-chunked 含新版 CRC32 trailer 编码）；**multipart 分片上传**、版本、对象锁、生命周期、限速、请求策略、上传回调、**OpenCV 风格图片预处理（画框/文字/圈线/灰度/模糊/旋转/翻转；多核提速 + 结果磁盘缓存）**、计费 | S3对象存储 |
-| **Redis 键值/队列** | `:3309`（mode:redis） | RESP string/list；**BLPOP/BRPOP 阻塞弹出**；TTL 惰性+扫描；**SQLite 落盘重启无损**；每用户命名空间；LRU 淘汰 | 键值队列 |
-| **RabbitMQ 队列** | `:3309`（mode:rabbitmq） | AMQP 0-9-1：direct/fanout/topic、publish/consume/ack/nack/prefetch；**confirm 发布确认 + mandatory 回退**；消息与游标落盘重启不丢 | 消息队列 |
-| **运维与安全** | 全协议 | 用户权限（库/表/IP 授权）、防爆破自动锁（**本机回环永不锁定** + CLI 解锁）、查询 QoS、caching_sha2_password、SQL 审计日志 | 本文 / 配置说明 |
-
----
-
-## 🏗 架构
-
-```
-                        ┌─────────────────────────────────────────────┐
-   MySQL 客户端 ───┐     │ 3309 端口复用层                              │
-   redis-cli  ────┤     │  mode:<service> 声明行 优先                   │
-   pika/amqp  ────┼────►│  RESP / AMQP 魔数嗅探 兜底                    │
-                        │  静默 → MySQL                                 │
-                        └───────┬──────────┬──────────┬───────────────┘
-                                │          │          │
-                    ┌───────────▼──┐  ┌────▼─────┐ ┌──▼──────────┐
-                    │ MySQL 协议栈 │  │ RESP 栈  │ │ AMQP 0-9-1  │
-                    │ 探活/改写/   │  │ KV 存储  │ │ 交换机/队列 │
-                    │ 并行/异步/   │  │ TTL/淘汰 │ │ 路由/确认   │
-                    │ 权限/QoS    │  └────┬─────┘ └──┬──────────┘
-                    └──────┬──────┘       │          │
-                           │       glacier_kv.db  glacier_mq.db
-                    glacier_auth.db
-                           │
-   S3 客户端 ──► :9000 ──► S3 栈（SigV4/桶/版本/限速/证书）──► glacier_s3.db
-                           │
-                    ┌──────▼──────────────────────────────┐
-                    │ SQLite（WAL）：/data/<库名>.db       │
-                    │ 每客户端连接 = 1 个专属后端连接      │
-                    │ 读并发多线程 / 写单库互斥（多库并行）│
-                    └─────────────────────────────────────┘
-```
-
-### 并发模型
-
-1. **读 → 并发多线程**：WAL 下读不互斥，可按库限流（`per_db_read_threads` + 按库覆盖），并有全局闸门（`global_threads`）；
-2. **写 → 单库单线程**：每库一把互斥锁，**多库写入天然并行**（实测 A 库持锁期间 B 库写入 0.00s 完成，同库排队 1.50s）；
-3. **每客户端连接独占一个后端 SQLite 连接**——`BEGIN … COMMIT` 始终落在同一物理连接（SQLite 不支持跨连接事务，连接池会造成**静默数据错乱**，架构上根除）；
-4. **SQLite WAL**：读写互不阻塞。
-
-### 启动时 PRAGMA
-
-```sql
-PRAGMA journal_mode = WAL;      -- 读写互不阻塞的前提
-PRAGMA synchronous  = NORMAL;   -- 可配置 OFF/FULL/EXTRA
-PRAGMA foreign_keys = ON;       -- 对齐 MySQL 默认
-PRAGMA busy_timeout = 5000;     -- 兜底，非主策略
-PRAGMA cache_size   = -256;     -- 每连接 256 KB
-```
-
-### 数据高可靠
-
-- SQLite 单文件 + WAL，事务级原子提交：崩溃 / IO 闪断 / 掉电后文件**永不损坏**，已提交事务不丢；
-- 没有独立数据库守护进程——不存在"数据库服务挂了"这回事，重启即恢复；
-- **无损恢复实测**：KV 键值（含 TTL、队列顺序）与 MQ 消息（含消费游标）容器重启后全部还原（`tests/run_all.sh` 步骤 3.5）。
-
----
-
-## 📦 能力详解
-
-### 1. MySQL 协议网关
-
-- 完整握手 / 认证 / 结果集封包；**登录算法**：`mysql_native_password`（默认）+ **`caching_sha2_password` / `sha256_password`**（MySQL 8 默认算法，`auth.auth_plugin` 全局配置或 `CREATE USER … IDENTIFIED WITH <plugin>` 账号级，RSA 全认证 + 改密自动失效登录缓存）；
-- **探活语句应答表**：`SELECT @@version/@@sql_mode…`、`SHOW TABLES/COLUMNS/INDEX/CREATE TABLE/VARIABLES/PROCESSLIST…`、`SET NAMES`、`USE`、`DO 0`、`/* ping */` 逐条应答；未覆盖 `SHOW` 一律兜底空结果集；`information_schema`（21 表）/ `mysql.user` / `performance_schema` / `sys` 直接应答（支持列投影与 WHERE）；
-- **方言改写**（保守：匹配不上原样透传）：`NOW()/CURDATE()/UNIX_TIMESTAMP()/LAST_INSERT_ID()/TRUNCATE`、`NOW() ± INTERVAL n UNIT`、`GROUP BY time(N)`、日期字符串谓词整数化、`DESC 表`、`库名.表` 前缀剥除、`LIMIT o,n`、`CONCAT/IF/RAND/UUID`、`INSERT IGNORE`、**`ON DUPLICATE KEY UPDATE`（含 `VALUES(col)`）**、`FOR UPDATE` 剥离、DDL 类型映射（MySQL 建表直接粘贴）、转义序列反转义、JSON `->`/`->>` 改写；**M4 批**：`&&/||/!/XOR/DIV/RLIKE/BINARY/0x…/N'…'`、`DATE_ADD 族/EXTRACT/TRIM 方向/POSITION/GROUP_CONCAT SEPARATOR/CAST/CONVERT`、`ALTER ADD·DROP INDEX/MODIFY/CHANGE`、`RENAME TABLE`、`INSERT … SET`、`UPDATE/DELETE … ORDER BY … LIMIT`、`ANALYZE/CHECK/OPTIMIZE/REPAIR/CHECKSUM TABLE`、用户变量 `@a`；
-- **Go 标量函数**（任意表达式位置可用）：`MD5/SHA1/SHA2/SHA256`、`LEFT/RIGHT`、`SUBSTRING_INDEX`、`DATEDIFF/TIMESTAMPDIFF`、`DATE_FORMAT`（含周编号族 `%U %u %V %v %X %x`）、`CONCAT_WS/LPAD/RPAD`；JSON：`JSON_LENGTH/CONTAINS/KEYS/SEARCH/MERGE_PATCH`（原生 `JSON_EXTRACT` 等直通）；Geo：`ST_Distance/ST_Distance_Sphere/ST_Within/ST_Contains/ST_Intersects/ST_AsText/ST_GeomFromText/ST_AsGeoJSON/ST_MakePoint…`（WKT/WKB/GeoJSON 自动识别）；
-- **事务与语义对齐**：`BEGIN/COMMIT/ROLLBACK/SAVEPOINT`、`SET AUTOCOMMIT=0` 惰性隐式事务、`insert_id/affected_rows` 回填、错误码映射（1064/1290/1142/3119/1040…）；
-- **多核并行查询**：① 单表可合并聚合（COUNT/SUM/MIN/MAX/AVG）hint `/*+ PARALLEL(n) */` 或 `scan_rows` 阈值自动触发；② `GROUP BY series_id, time(N)` 按 series 取模分片并行、Go 侧按桶合并；③ 明细导出按 rowid 区间并行 scan、顺序发送；`EXPLAIN PARALLEL` 查看拆分计划。
-
-### 2. 时序冷库（含 rollup）
-
-- 标准 schema（[schema/timeseries.sql](schema/timeseries.sql)）：`series` 维表 + `points(series_id, ts, val)` 聚簇事实表（`ts` = epoch ms）；tag 表达式索引；
-- **rollup 多粒度预聚合**：写 `points` 同遍落 `points_m1/h1/d1` 汇总表（INSERT 触发器）；带时间范围的聚合查询自动路由「汇总表满桶 + 原始表边缘桶」UNION，取最粗可用粒度——**结果与全量扫精确一致**（边缘桶回退原始行）；存量回填 `REBUILD ROLLUP <db>`；
-- **冷压缩与固化**：`COMPRESS COLD points BEFORE <time> [STEP n DAY|HOUR]` 按块 gzip 固化进 `points_cold`（字节级无损，实测压缩比 ~3.8），`THAW COLD` / `SHOW COLD` 配套；**读写透明**——查询触及冻结区间自动解冻、写入撞冻结区间自动重试；解冻期间摘除 rollup 触发器保证汇总不重复计数；`timeseries.cold_after_days` 后台自动固化策略；
-- **列类型映射**：DOUBLE/FLOAT/DECIMAL 以 TEXT 落盘（防浮点 15 位格式化截断，17 位有效数字精确往返），查出按系统库 `glacier_meta` 的映射自动还原 float64 并回放 MySQL 类型码；WHERE/ORDER BY 自动 `CAST(col AS REAL)` 保数值语义；SHOW COLUMNS/CREATE TABLE/information_schema 回放建表时的原始类型；
-- 回填 ETL 规范、`EXPLAIN QUERY PLAN` 索引命中实测、压缩固化详见 [docs/时序数据库.md](docs/时序数据库.md)。
-
-### 3. 异步任务引擎
-
-- `SUBMIT QUERY '<sql>'` 秒回 job_id，结果 JSONL 落盘分页拉取（`FETCH QUERY RESULT` / `query_result()`）；
-- **调度**：`AT 'HH:MM'` 定时、`WINDOW '周五 17:00-20:00'` 每日/周几窗口、`WHEN CPU<70` 资源门槛（CPU/MEM/DISK_MBPS/连接数等）、`EVERY DAY|WEEK|MONTH|YEAR|n SECONDS…` 周期任务（含每周/每 N 周、每月/每年，月尾日自动 clamp 如 1/31→2/28）；`SHOW QUERY SCHEDULE`、`PAUSE/RESUME` 链启停；
-- **回调**：HTTP POST（HMAC 签名 + 退避重试）/ TCP 流 / RabbitMQ / Kafka 四通道；`PARTITION BY ROWS|BYTES` 分片回调；
-- **SCRIPT 后处理管道**：`SCRIPT 'x.js' OUTPUT out`——结果 JSONL 流入 nodejs/python/php 子进程，产物落 `jobs/<id>.<out>`（`script_dir` 白名单）。**⚠ v1.3.13 起临时停用**（安全边界整改，带 SCRIPT 子句的提交显式报错；恢复与增强排在 v1.3.14）；
-- 详见 [docs/异步任务.md](docs/异步任务.md)。
-
-### 4. 运维与安全
-
-- **用户权限系统**：账号入库（`glacier_auth.db`），`CREATE USER/GRANT/REVOKE/SHOW GRANTS/SET PASSWORD`，库级 + 表级 + IP（CIDR）授权，账号类型 SUPER/READONLY/USER 热切换；默认超级用户 `glacier` + 只读 `glacier_ro`；
-- **防爆破**：登录失败窗口计数自动锁 IP/账号（三模式、指数升级、持久化重启不解除）；**本机回环地址（127.x / ::1 / localhost）永不锁定**——本机客户端密码配错不会把自己锁死在管理面之外；可选 ufw/iptables/firewall-cmd 系统层封锁（同样豁免回环）；登录失败 HTTP 告警；`SHOW LOGIN ATTEMPTS/SHOW LOCKED/UNLOCK`，以及**命令行解锁** `glaciertdb -unlock-user <账号>` / `-unlock-ip <IP>` / `-show-locks`（服务运行中旁路可用，无需停机）；
-- **查询 QoS**：全系统 + 单库两级配额（qps/concurrency/rows_per_sec，wait/reject）；`SET QOS` 热改、`SHOW QOS` 实时统计；
-- **SQL 审计日志**：`log.sql_log_file` JSON 行（语句/状态/耗时/行数/连接），100MB 轮转；慢查询日志标注 QoS 排队；
-- **实例唯一 ID（v1.3.13）**：UUID 首启生成存系统库（重启不变），四面可查——MySQL
-  `SELECT @@glaciertdb_instance_id`、Redis `INFO glaciertdb_instance_id`、S3 全部响应头
-  `x-glacier-instance-id`、AMQP 能力串；异步任务回调与心跳 payload 附带，多盒子机群区分实例；
-- **主动心跳上报（v1.3.13，默认关）**：`heartbeat:` 配置定时 POST 规模/健康 JSON 到
-  用户自建 HTTP 中心（实例 ID + 版本 + uptime + 桶/KV/MQ/异步积压 + 错误计数，HMAC 签名）；
-- **版本号隐藏（v1.3.13，默认关）**：`security.hide_version: true` 后 S3 响应头 /
-  Redis INFO·HELLO / 管理面不再携带真实版本号（MySQL 握手恒回 8.0.0；启动日志不隐藏）；
-- **防爆破扩面（v1.3.13）**：AMQP / RESP / MQTT 认证失败与 MySQL 侧同一锁定器收口
-  （per-IP + per-username，回环永不锁定，`-unlock-user/-unlock-ip/-show-locks` 旁路通用）；
-- **UDS 本地连接加速（v1.3.13，仅 Linux）**：`listen_unix:` 把 3309 协议多路复用整体架在
-  Unix domain socket 上（`s3.endpoints[].listen_unix` 同款），本地连接免 TCP 层开销，
-  **鉴权照旧**（纯传输加速，不做任何免鉴权）。
-
-### 5. S3 对象存储（`s3.enable` 开启）
-
-AWS Signature **V4** 兼容（表头 + 预签名 URL + `aws-chunked` 流式——含新版 botocore / AWS CLI 默认的
-`STREAMING-*-TRAILER` CRC32 校验和编码，boto3 默认配置可直连），boto3 / aws-cli / MinIO Client 直连：
-
-- 一 bucket 一表（`glacier_s3.db`）+ 大对象分块；桶从属用户、命名空间隔离；
-- **AK/SK**：AK 32 位 `AS` 前缀 / SK 48 位 `SK` 前缀，签发/轮换/禁用/吊销（SK 明文仅一次可见）；
-- PUT/GET/HEAD/DELETE/COPY、ListObjects V1/V2、ListObjectVersions；**multipart 分片上传**（Initiate/UploadPart/Complete/Abort/ListParts/ListMultipartUploads，复合 ETag 对齐 S3 语义）；**UploadPartCopy 拷贝分片**——`x-amz-copy-source [+range]` 服务端拷贝免重传，与直传分片混合合并；**未完成上传自动回收**（`s3.abort_incomplete_days`，默认 7 天）；**单对象上限可解除**（`max_object_mb: -1` 不限制，分块存储流式）；
-- **多版本 + 对象锁（WORM/legal hold）+ 生命周期自动删除**；
-- **下载限速**：单连接 / 用户总带宽（多连接合并）/ 并发上限；**请求策略**（UA/IP/Referer/自定义 header 条件）；**上传回调**（HMAC 签名）；
-- **图片处理**：裁剪 / 缩放 / 格式转换 / base64 输出与直传；**OpenCV 风格 ops 管道多核提速**（可分离滑窗模糊、逐像素直写，大图管道从秒级降到亚秒级）+ **处理结果磁盘缓存**（`<db_dir>/sys/gimg_cache/`，键含对象 etag/version，覆盖自动失效，LRU 容量回收 `s3.image_cache_mb`）；响应观测头 `X-Using-Time` / `X-Gimg-Ops-Time` / `X-Gimg-Cache`；ops 裸名合法（`grayscale` ≡ `grayscale()`），非法管道显式 400 不再静默透传；
-- **网络**：region 通配（`'*'`）、virtual-host + path-style、多 endpoint、每 endpoint 泛域名证书 + bucket 自定义域名独立证书（SNI 分发、替换热加载）；
-- **计费**：`s3_usage` 按 用户 × 桶记账（请求数/字节/存储/对象数），SQL 直查 + `EXPORT S3 USAGE` + HTTP `/_glacier/s3/usage` 导出。
-- **chunk 池去重存储（v1.3.13）**：分块数据内容寻址入池、跨对象/版本/桶引用共享——
-  CopyObject 零拷贝（纯元数据操作）、同名覆盖与 multipart 重传自动共享未变化分块、
-  删除走 refcnt 归零墓碑 + 定期 GC；去重范围 `s3.dedup_scope`：`bucket`（桶内）/
-  `user`（同属主跨桶，默认）/ `system`（全实例，⚠ 存在闪传探测侧信道风险）；
-- **文件闪传秒传（v1.3.13）**：PUT 带 `x-glacier-flash: sha256:<hex>`（可选
-  `x-glacier-flash-size`）命中直接建对象返回 etag（请求体可省略），未命中幂等降级；
-  或两段式 `POST /{bucket}/{key}?quick_transfer=<sha256>`，未命中 404 后再全量 PUT；
-- **gzip 传输压缩（v1.3.13）**：GET 响应压缩（`s3.gzip_level`，默认 5），反代场景
-  请求头 `x-glaciertdb-gzip: 0` 关闭（非签名头，代理层可注入）；Range / 图片 / 已压缩
-  内容自动跳过；
-- **打包下载（v1.3.13）**：`GET /{bucket}?x-glacier-archive=<prefix>&format=tar|tar.gz|zip&mode=stream|done`
-  ——流式边打包边发（tar）；完成后下载先落包再整包发（总大小上限
-  `s3.archive_sync_max_mb` 默认 512MB，临时包弹性驱逐）；
-- **数据主动同步「数据北上」（v1.3.13）**：`s3.sync` 规则把桶数据事件驱动推送到远端
-  S3 端点（备份 / 业务伴随同步），失败退避重试、每对象结果回调、前缀匹配多规则；
-  防自旋三层：`x-glacier-instance-id` 头直环拒绝 + `sync-origin` 元数据断多跳环 +
-  删除传播默认关闭；
-- **排障套件（v1.3.13）**：全部响应恒带 `x-glacier-request-id` / `x-glacier-instance-id`
-  / `x-glacier-error-code` 头；`s3.error_log` 开启后所有错误落结构化 JSON 行日志；
-  `SHOW S3 SPACE` 暴露 chunk 池规模、`SHOW S3 SYNC` 暴露同步引擎观测。
-
-
-
-### 6. Redis 键值/队列（`kv.enable`）
-
-- RESP 服务（`mode:redis` 或嗅探）：string `GET/SET(EX·PX·NX·XX)/DEL/EXISTS/APPEND/INCR 族/MGET/MSET/KEYS/TYPE` + list 队列 `LPUSH/RPUSH/LPOP/RPOP/LLEN/LRANGE`；
-- **事务与发布订阅**：`MULTI/EXEC/DISCARD`（EXEC 返回逐条结果数组）；`SUBSCRIBE/PSUBSCRIBE/PUBLISH`（message/pmessage 推送、同连接 channel+pattern 双收、按账号命名空间隔离）；
-- **SCAN 真游标**：`SCAN cursor [MATCH][COUNT][TYPE]` 每批 COUNT 个、游标推进，`--scan`/`scan_iter` 多批遍历与 `KEYS` 等价；
-- **阻塞弹出**：`BLPOP/BRPOP key [key…] timeout`——按序取首个非空队列，Push 立即唤醒、超时返回空数组（`0` = 无限等待）；
-- **HELLO / RESP3 空值兼容**：`HELLO` 最小应答（server map + `proto:2`，**redis-py ≥ 8 默认 RESP3 握手直连可用**）；`HELLO 3` 连接的空值应答发 RESP3 null 帧 `_`（redis-py ≥8 的 GET miss/MGET/BLPOP 超时不再挂死），RESP2 连接维持 `$-1`/`*-1`；
-- **TTL**：惰性过期 + 定期扫描；**变更实时写 SQLite（`glacier_kv.db`）重启无损**；
-- **命名空间 = 登录账号**（跨用户不可见）；**内存治理**：`kv.max_memory_mb` + `allkeys-lru/volatile-lru/noeviction`；`SHOW KV STATS` / `kv_stats` 占用与命中率。
-- **驱逐优先级（v1.3.13）**：`KEYPRIO key <n>`（-1 = 未设置走 LRU，0-255 显式，0 最先
-  驱逐 / 255 最受保护）+ `GETPRIO key`；内存超限先按显式优先级升序淘汰、再纯 LRU，
-  INFO 暴露 `evicted_prio` / `evicted_lru` 分层计数；
-- **SQL 读穿透（v1.3.13）**：`KV SOURCE ADD <key前缀> <db> '<SQL 模板>' [TTL <ms>]`
-  注册回源规则（仅 super，模板占位 `{key}` / `{N}` 按 `:` 分段）——GET miss 时按规则
-  回源业务库（权限边界：仅同用户名下 db）并 NX 回填缓存，single-flight 防击穿，
-  命中/未命中/耗时计数进 INFO 与 SHOW KV STATS。
-
-
-
-### 7. RabbitMQ 队列（`mq.enable`）
-
-- AMQP 0-9-1（pika / amqp091-go 互通）：exchange（**direct/fanout/topic**，`*`/`#` 通配）+ queue + binding；默认交换机直达；
-- `basic.publish/consume/ack/nack(requeue 重投 + redelivered)/reject/get/qos(prefetch)/cancel/recover`；
-- **发布确认与回退**：`confirm.select` 后逐条 `basic.ack`（失败 `basic.nack`）；`mandatory` 不可路由回退 `basic.return`（312 NO_ROUTE，内容原样）；
-- **消息与消费游标落 SQLite（`glacier_mq.db`）重启不丢**；断线未确认自动重入队；`SHOW QUEUES/SHOW EXCHANGES`；
-- 异步任务 `CALLBACK 'amqp://…'` 可指向本服务自回环；
-- **RabbitMQ 版本串可配置**：`mq.server_version`（默认 3.13.0），Connection.Start 原样上报。
-
-### 8. MQTT 接入（`mq.mqtt.enable`）
-
-- MQTT 3.1 / 3.1.1，**TCP + WebSocket** 双传输：3309 复用（CONNECT 首包嗅探 0x1x / HTTP Upgrade `/mqtt` / `mode:mqtt` 声明行），可选独立监听 `mq.mqtt.listen`；
-- 桥接 RabbitMQ：topic `a/b/c` ↔ routing key `a.b.c`（`mqtt` topic 交换机），订阅过滤器 `+`/`#` ↔ `*`/`#`，与 AMQP 客户端双向互通；
-- QoS 0/1（PUBACK）、保留消息（落盘重启不丢）、clean_session=0 离线补投、遗嘱消息、keepalive 1.5 倍断开；
-- 认证沿用统一账号（CONNECT username/password），命名空间 = 账号。
-
----
-
-## 🛡 管理面 SQL 速览
-
-`USE GlacierTDB` 进入管理面（超级用户可变更；只读账号仅查看，变更返回 1290）：
-
-```sql
--- 观测
-SHOW SERVER CONFIG; SHOW CLIENTS; SHOW TRANSACTIONS; KILL <id>;
--- 账号与权限
-CREATE USER 'u1'@'%' IDENTIFIED [WITH caching_sha2_password] BY 'pwd';
-GRANT SELECT ON backup.* TO 'u1';  SHOW GRANTS FOR 'u1';  DROP USER 'u1';
--- 防爆破
-SHOW LOGIN ATTEMPTS LIMIT 50;  SHOW LOCKED;  UNLOCK ACCOUNT u1;  UNLOCK ALL;
--- QoS / 并发热改
-SET QOS GLOBAL QPS = 500;  SHOW QOS;  SET GLOBAL_THREADS = 32;
--- 时序 rollup
-REBUILD ROLLUP backup;
--- 键值 / 消息队列观测
-SHOW KV STATS;  SET KV MAX_MEMORY 64;  SET KV EVICTION allkeys-lru;
-SHOW QUEUES;  SHOW EXCHANGES;
--- S3 对象存储
-CREATE BUCKET demo OWNER 'glacier' VERSIONING ON;   SHOW BUCKETS;
-CREATE S3 KEY FOR 'glacier';                        SHOW S3 KEYS;
-SHOW S3 USAGE;  EXPORT S3 USAGE TO 'usage.csv';     SHOW S3 OBJECTS demo LIMIT 20;
--- 表形式（支持 WHERE）：server_config / clients / qos_status / users / kv_stats /
--- mq_queues / mq_exchanges / s3_usage / s3_buckets / s3_keys / query_jobs …
-SELECT * FROM s3_usage WHERE owner = 'glacier';
-```
-
-完整清单见 [docs/系统SQL.md](docs/系统SQL.md)。
-
----
-
-## 🚀 快速开始
-
-### 方式一：下载 Release 二进制（推荐）
+**1. 下载**（或用 Docker，见下）：
 
 ```bash
-# https://github.com/sang8052/GlacierTDB/releases
-# 每个版本含：glaciertdb-linux-amd64 / linux-arm64 / windows-amd64.exe + config.example.yaml + SHA256SUMS
+# 从 https://github.com/sang8052/GlacierTDB/releases 下载对应平台的二进制和 config.example.yaml
 sha256sum -c SHA256SUMS
-# 配置文件与二进制同目录时无需 -config：默认依次查找 ./config.yaml → exe 同目录 → /app/config.yaml
-./glaciertdb-linux-amd64 -db-dir /srv/glacier/data
+cp config.example.yaml config.yaml   # 改一下 auth.password
+./glaciertdb -db-dir /srv/glacier/data
 ```
 
-### 方式二：Docker Compose
+配置文件与二进制放同一目录即可自动找到，也可以用 `-config` 指定路径。
+
+**2. 连上试试**（默认账号 `glacier`，密码在 config.yaml 的 `auth.password`）：
+
+```bash
+mysql  -h <host> -P 3309 -uglacier -p'密码'   # MySQL（默认协议，直接连）
+redis-cli -h <host> -p 3309 -a '密码'          # Redis（发 RESP 命令自动识别）
+# S3 在 9000 端口，boto3 / aws-cli 指过去就能用，示例见 docs/S3对象存储.md
+```
+
+**3. Docker Compose**：
 
 ```yaml
 services:
   glaciertdb:
-    image: glaciertdb:latest        # 或 build: .
-    container_name: glaciertdb
+    image: glaciertdb:latest
     ports:
-      - "3309:3309"                 # MySQL + Redis + RabbitMQ（端口复用）
-      - "9000:9000"                 # S3 对象存储（s3.enable 时）
+      - "3309:3309"   # MySQL + Redis + RabbitMQ + MQTT
+      - "9000:9000"   # S3
     volumes:
-      # 必须挂「目录」而非单个 .db 文件 —— WAL 需在同目录创建 -wal/-shm
-      - /srv/glacier/data:/data
+      - /srv/glacier/data:/data   # 必须挂目录，不能挂单个 .db 文件（WAL 需要）
     restart: unless-stopped
 ```
 
-### 方式三：源码构建
-
-```bash
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o glaciertdb .
-```
-
-> ⚠️ **数据目录必须可写，且挂载目录而非单个文件**；默认无 TLS（内网可信环境），公网暴露请开启
-> v1.3.12 内置 TLS（`tls:` 配置段，见配置手册）或前置认证代理；
-> 首次启动后 `USE GlacierTDB; SET PASSWORD='<强口令>';`。部署/升级/备份见 [docs/部署运维.md](docs/部署运维.md)。
-
-### 连接测试（五种客户端）
-
-```bash
-# MySQL（caching_sha2 客户端无需 --default-auth；native 客户端加 --default-auth=mysql_native_password）
-mysql -h <host> -P 3309 -uglacier -p'<密码>' -e "SELECT glacier_version;"
-
-# Redis（RESP 嗅探直接进）
-redis-cli -h <host> -p 3309 -a '<密码>' SET hello world
-
-# S3（SigV4，boto3 示例见 docs/S3对象存储.md §12）
-```
-
-```python
-import pymysql                       # MySQL
-pymysql.connect(host="<host>", port=3309, user="glacier", password="<密码>", database="backup")
-
-import redis                        # 键值（pip install redis）
-r = redis.Redis(host="<host>", port=3309, password="<密码>")
-r.set("k", "v", ex=60)
-
-import pika                         # 消息队列（pip install pika）
-conn = pika.BlockingConnection(pika.ConnectionParameters(
-    host="<host>", port=3309, heartbeat=0,
-    credentials=pika.PlainCredentials("glacier", "<密码>")))
-ch = conn.channel()
-ch.queue_declare(queue="jobs", durable=True)
-```
+源码构建：`CGO_ENABLED=0 go build -o glaciertdb .`
 
 ---
 
-## ⚙️ 配置速览
+## 五种服务
 
-完整示例（含全部配置段与默认值）见 [docs/配置说明.md](docs/配置说明.md)；仓库内 [config.yaml](config.yaml) 为可直接使用的带注释样例：
+### MySQL 网关（3309，默认协议）
+
+标准的 MySQL 协议服务：建库建表、事务、`SHOW` 全家族、`information_schema`，错误码也对齐 MySQL。常见语法和函数（`NOW() - INTERVAL`、`ON DUPLICATE KEY UPDATE`、`MD5/DATE_FORMAT/JSON_*`/Geo 函数等）都已适配，MySQL 的建表语句可以直接粘贴执行。大查询会自动按库并行拆分，慢的导出也能吃满多核。
+
+管理不藏在 SQL 里，而是管理面语句（`USE GlacierTDB` 后执行）：用户授权、连接查看、限流配额、S3 桶和密钥管理等，速查见 [docs/系统SQL.md](docs/系统SQL.md)。
+
+### 时序数据库
+
+还是 MySQL 客户端，推荐用两张表：`series`（设备/测点维表）+ `points(series_id, ts, val)`。在这之上自动做了两件事：
+
+- **预聚合**：写入时同步维护分钟/小时/天三级汇总，长时间范围的聚合查询自动走汇总表，结果与逐行计算精确一致；
+- **冷压缩**：老数据按块 gzip 固化（无损，压缩比约 3.8），查询碰到冻结区间自动解冻，业务无感。
+
+schema 和细节见 [docs/时序数据库.md](docs/时序数据库.md)。
+
+### Redis（3309，自动识别）
+
+常用命令都有：`GET/SET/INCR/EXPIRE`、list 队列 `LPUSH/RPOP/BLPOP`、事务 `MULTI/EXEC`、发布订阅、`SCAN`。每个账号一个命名空间，互相不可见。所有变更实时落盘，重启后键值、TTL、队列消息原样恢复。
+
+内存超限按 LRU 淘汰；可以用 `KEYPRIO key <0-255>` 给关键键加保护（数字越小越先被赶）。详见 [docs/键值队列.md](docs/键值队列.md)。
+
+### RabbitMQ + MQTT（3309，自动识别）
+
+AMQP 0-9-1 的 direct/fanout/topic 交换机、消费者确认、prefetch、发布确认，消息和消费进度落盘重启不丢。MQTT 3.1/3.1.1（TCP 和 WebSocket）也接在同一个端口上，主题 `a/b/c` 自动映射成 AMQP 的 `a.b.c` 路由键，两边客户端互通。详见 [docs/消息队列.md](docs/消息队列.md)。
+
+### S3 对象存储（9000）
+
+兼容 AWS Signature V4，boto3、aws-cli、MinIO Client 默认配置直连。该有的都有：分片上传、多版本、对象锁（WORM）、生命周期删除、下载限速、上传回调（HMAC 签名）。
+
+几个实用的加分项：
+
+- **图片处理**：GET 时带参数即可裁剪/缩放/画框/加文字/转格式（OpenCV 风格参数），多核加速、结果带磁盘缓存——摄像头抓图场景直接省掉一个图片服务；
+- **去重存储**：相同内容的文件只存一份，重复上传、复制、秒传都不占额外空间；
+- **秒传**：先算好文件的 SHA-256，`POST /桶/键?quick_transfer=<sha256>` 一问，有就 200 直接收工，没有再全量传；
+- **打包下载**：`GET /桶?x-glacier-archive=前缀&format=zip` 把一个前缀打成 tar/zip 拉走；
+- **数据北上**：配置 `s3.sync` 规则后，新写入的对象自动推送到远端 S3（云端备份/上云），每个对象的同步结果可以回调通知你的业务。
+
+运维排障：每个响应都带 `x-glacier-request-id`，配合 `s3.error_log: true` 的结构化日志，用户报障拿 ID 一查到底。详见 [docs/S3对象存储.md](docs/S3对象存储.md)。
+
+### 异步任务
+
+长查询不想等？`SUBMIT QUERY 'SELECT ...'` 立刻返回任务号，结果落盘慢慢拉。支持定时（AT）、每日窗口（WINDOW）、资源门槛（WHEN CPU<70）、周期执行（EVERY DAY/WEEK/MONTH），完成后 HTTP/TCP/AMQP/Kafka 回调。详见 [docs/异步任务.md](docs/异步任务.md)。
+
+---
+
+## 它是怎么工作的
+
+```
+  mysql / redis-cli / pika ──► 3309（端口复用：按客户端协议自动分发）
+  S3 客户端 ────────────────► 9000（HTTP/S，SigV4）
+                 │
+                 ▼
+  协议栈（MySQL / RESP / AMQP / MQTT / S3）
+                 │
+                 ▼
+  SQLite（WAL 模式）：一个库 = 数据目录下一个 .db 文件
+  系统库（账号 / S3 / KV / MQ 元数据）在 sys/，业务库在 user/
+```
+
+几个值得知道的点：
+
+- **数据文件不会坏**。SQLite + WAL，事务级原子提交，掉电、闪断后已提交的数据都在；没有独立数据库进程，重启即恢复；
+- **默认整目录加密**。落盘的 .db 文件是密文，拿 SQLite 工具直接打开看不到内容（口令在 `security.passphrase`，记得改并妥善备份）；
+- **并发模型**：读多线程（WAL 读写不阻塞），写按库串行（不同库之间并行）；每个客户端连接独占一个后端连接，保证事务语义正确；
+- **单机单实例**。刻意不做集群和复制——边缘场景的容灾靠"数据北上"（备份上云）加换机重部署，盒子本身是可以丢弃的。
+
+v1.3.12 起支持 TLS：3309 同端口明文与 TLS 共存，S3 端点可配独立证书。v1.3.13 起 MySQL/Redis/AMQP 还可以走 Unix domain socket（`listen_unix`）做本地零开销连接，鉴权不变。
+
+---
+
+## 配置
+
+所有配置项都有默认值，最小可用配置只有几行：
 
 ```yaml
-listen: 0.0.0.0:3309        # 3309 = MySQL + Redis + RabbitMQ（端口复用）
-db_dir: /data               # 一个库 = 目录下一个 <库名>.db 文件（系统库不暴露）
-default_db: backup
-server_version: "8.99.999"  # 对外 MySQL 版本号
-
-mux_sniff_ms: 300           # 端口复用嗅探窗口（识别 mode:/RESP/AMQP，超时按 MySQL）
-
+listen: 0.0.0.0:3309
+db_dir: /data
 auth:
-  user: glacier
-  password: "<强口令>"
-  auth_plugin: mysql_native_password   # 或 caching_sha2_password（MySQL 8 默认算法）
-  readonly_user: glacier_ro
-
-concurrency: { global_threads: 0, per_db_read_threads: 0 }   # 读并发 / 写单库互斥
-parallel_query: { workers: 0, scan_rows: 1000000 }           # 并行触发
-rollup: { disable: false }             # 时序预聚合
-qos: { on_exceed: wait, global: { qps: 0, concurrency: 0, rows_per_sec: 0 } }
-lock: { enable: true, mode: mixed, window_sec: 300, max_failures: 5 }   # 防爆破
-
-async_query: { enable: true, workers: 2 }      # 异步任务（AT/WINDOW/WHEN/EVERY/SCRIPT）
-mysql: { enable: true }                        # MySQL 协议面（false = 3309 不再服务 MySQL）
-kv: { enable: true, max_memory_mb: 64, eviction: allkeys-lru }          # Redis
-mq: { enable: true, max_message_mb: 32 }                               # RabbitMQ
-s3:                                        # 对象存储（默认关闭）
-  enable: false
-  region: "*"
-  endpoints: [{ listen: "0.0.0.0:9000" }]
-  limits: { per_conn_bps: 0, per_user_bps: 0, per_user_conns: 0 }
-  image_cache: true                        # 图片预处理结果磁盘缓存（sys/gimg_cache/）
-  image_cache_mb: 1024                     # 缓存容量上限（LRU 淘汰；-1 不限）
-
-sqlite: { synchronous: NORMAL, busy_timeout_ms: 5000, cache_size_kb: 256, max_result_rows: 1000000 }
-log: { level: info, slow_query_ms: 200, sql_log_file: "" }
+  password: "改成强口令"
 ```
 
-所有项均可省略走默认；命令行 `-config` / `-db-dir` / `-listen` 覆盖（`-config` 缺省依次查找
-`./config.yaml` → exe 同目录 → `/app/config.yaml`）；`-vacuum` 离线真空；`-unlock-user` / `-unlock-ip` /
-`-show-locks` 防爆破解锁与查看（服务运行中旁路可用）。
+仓库里的 [config.yaml](config.yaml) 是带完整注释的样例，[docs/配置说明.md](docs/配置说明.md) 逐项解释。常用开关：
+
+- `kv.enable` / `mq.enable` / `mysql.enable` / `s3.enable` —— 不用的模块可以关掉，省内存；
+- `lock:` —— 防爆破锁定（本机回环永不锁定；锁死了用 `glaciertdb -unlock-user <账号>` 解）；
+- `security.encrypt` + `passphrase` —— 静态加密（默认开）；
+- `tls:` —— 证书配置（默认关，公网暴露建议开或前置反代）。
+
+命令行工具：`-backup <目录>` 在线备份（不停服务）、`-vacuum` 离线回收空间、`-unlock-user` / `-unlock-ip` / `-show-locks` 管理防爆破锁。
 
 ---
 
-## 🧪 测试与兼容性
+## 硬件要求
 
-`tests/run_all.sh` 一键全量（Docker 编排：mysql:8 CLI + python:3.12 PyMySQL/SQLAlchemy/pika），
-**全套 ALL TESTS PASSED（2026-10-27）**——黑盒脚本 + 四组重启持久化 + 回环/CLI/mysql.enable 专项检查：
+目标环境是低功耗工控机和边缘盒子，不是数据中心。选型一句话：**按最低档选机器，按推荐档选硬盘**——存储介质对写入性能和寿命的影响比 CPU 大得多。
 
-| 覆盖 | 要点 |
+| | 最低 | 推荐 |
+| --- | --- | --- |
+| x86-64 | 2 核 / 2 GB / 16 GB SSD（五组件可跑，图片处理限小图） | 4 核（N5105 级）/ 4-8 GB / 64 GB SSD |
+| ARM64 | 树莓派 4B 或 RK3566：4 GB / 16 GB A1 级 SD 卡 | RK3588 或树莓派 5：8 GB / 64 GB NVMe |
+| 极限裁剪 | 1 核 / 1 GB / 8 GB（只开 MySQL + 时序，关掉 S3 和 MQ） | —— |
+
+ARM 仅支持 64 位（arm64）。SD 卡做主存储必须配 v1.3.12 的 WAL 调优项（`sqlite.wal_autocheckpoint` / `journal_size_limit_kb`）。数据目录预留「预估数据量 × 2 + 20%」（WAL 加备份轮转）。
+
+---
+
+## 备份与恢复
+
+- **运行中**：`glaciertdb -backup <目录>`，对全部库做一致性快照，不阻塞业务；可配 systemd timer 定时跑（样例在 deploy/ 目录）；
+- **停机**：直接拷贝数据目录（运行中直接拷可能拿到主库与 WAL 不一致的组合，别这么干）；
+- 备份包是密文（开了加密时），恢复需要相同版本的服务和口令；密钥文件（`glacier.json`、`glacier_s3.key` 等）在数据目录里，跟着一起备。
+
+详细流程见 [docs/部署运维.md](docs/部署运维.md)。
+
+---
+
+## 已知限制
+
+把不能做的说在前面，免得踩坑：
+
+- 不支持 MySQL 预处理语句（`COM_STMT_*`）、XA、`LOAD DATA`、主从复制；就是单机，没有集群计划；
+- Redis 是 RESP2 语义（新客户端会自动兼容），事务没有 WATCH；
+- AMQP 是基本队列，没有镜像队列和仲裁队列；
+- 库之间没有跨库 JOIN；`DROP DATABASE` 直接删文件，不可恢复；
+- 异步任务的 SCRIPT 后处理自 v1.3.13 起临时停用（安全整改，计划 v1.3.14 恢复）。
+
+---
+
+## 文档
+
+| 手册 | 内容 |
 | --- | --- |
-| mysql CLI / PyMySQL / SQLAlchemy | 握手、SHOW 全家族、utf8mb4/emoji、BLOB、ORM 反射、事务 |
-| 并发 / 多库 / 管理面 | 跨库写并行、同库排队、KILL、改密热生效、information_schema、Navicat 兼容 |
-| 时序 / 并行 | INTERVAL/日期谓词整数化、time(N) 桶化、EXPLAIN 索引命中、80 万行并行对拍、GROUP BY 分片并行、明细并行 |
-| 异步任务 | AT/WINDOW/WHEN/EVERY/PAUSE、四通道回调 + HMAC、分片回调、SCRIPT 后处理 |
-| QoS / 权限 / 函数 | QoS 配额、每周调度、用户权限、防爆破锁定、JSON 运算符、Geo ST_* |
-| S3 对象存储 | SigV4/预签名、版本/对象锁/生命周期、限速、策略、virtual-host、计费、上传回调、multipart 全流程、UploadPartCopy、自动回收 |
-| 图片管道 | OpenCV 风格 ops（rectangle/text/circle/line/grayscale/blur/rotate/flip，GET/PUT/另存三链路）、**结果磁盘缓存 miss/hit/失效、裸名 op、非法管道 400、计时头** |
-| Redis + 重启 | 命令集、TTL、命名空间隔离、LRU/noeviction、kv_stats、MULTI/EXEC、发布订阅、SCAN 游标、RESP3 空值帧；容器重启无损 |
-| RabbitMQ + 重启 | 路由语义、consume/ack/nack/prefetch、confirm/mandatory、SHOW QUEUES、amqp 回调回环；消息重启不丢 |
-| MySQL 8 兼容 / 列类型 / MQTT | 运算符/函数/DDL/维护语句/用户变量、列类型映射（TEXT 落盘/查出还原/类型回放）、时序冷压缩固化（自动解冻）、MQTT ws+tcp 桥接 |
-| 多租户 / 加密 | 库可见性过滤/DEFAULT_DB/USE 1044/账号级配额；底层文件加密（adiantum）+ 存量自动迁移 + 加密重启持久化 |
-| v1.3.10 专项 | **本机回环防爆破豁免（40 次错误密码后本机仍可登录）、CLI -unlock-user/-show-locks（服务运行中）、mysql.enable=false 不监听 3309 冒烟** |
-| v1.3.13 专项 | **chunk 池去重 + 闪传（A/B 两形态 + 并发秒传不重复 + user 范围跨桶共享 + CopyObject 零拷贝 + 删引用保护）、gzip（压缩往返/头开关/Range identity/图片跳过）、打包下载（stream tar / done zip·tar.gz）、KV 驱逐优先级（KEYPRIO/GETPRIO/边界/INFO）、KV SQL 读穿透（回源回填/显式写优先/空结果 miss/规则管理）、SCRIPT 显式报错、实例 ID 四面一致、排障头；场景拓扑：版本号隐藏 + 心跳上报 + 数据北上同步（远端实例 + 回调接收器 + sync-origin 元数据 + 防自旋 409）+ 实例 ID 重启不变 + S3 结构化错误日志** |
+| [配置说明](docs/配置说明.md) | 全部配置项与默认值 |
+| [系统SQL](docs/系统SQL.md) | 管理面语句速查 |
+| [时序数据库](docs/时序数据库.md) | schema、rollup、冷压缩 |
+| [异步任务](docs/异步任务.md) | SUBMIT 语法、调度、回调 |
+| [S3对象存储](docs/S3对象存储.md) | 认证、API、图片处理、数据北上 |
+| [键值队列](docs/键值队列.md) | Redis 命令集与内存治理 |
+| [消息队列](docs/消息队列.md) | AMQP/MQTT 语义 |
+| [部署运维](docs/部署运维.md) | 部署、升级、备份、监控、排障 |
 
 ---
 
-## 🗺 版本历史
+## 版本
 
-| 版本 | 主题 | 状态 |
-| --- | --- | --- |
-| v1.3.10 | **稳定性更新首个版本**：图片管道多核提速 + 结果磁盘缓存；防爆破本机回环豁免 + CLI 解锁；`mysql.enable` 开关；默认配置路径 `config.yaml`；boto3 CRC32 trailer 兼容 | ⛔ 已撤版（重大安全缺陷，v1.3.11 修复） |
-| v1.3.11 | **S3 存储层重写（8MB 分片直写 + 零拷贝合并 + manifest Range 206）· 图片裁剪融合 blend · SUBMIT S3 文本/文件检索与异步删除 · SHOW S3 SPACE / S3 VACUUM 空间回收 · 时序大表谓词（TS_UNIT 秒/毫秒/微秒自动换算，冷/rollup 不再固定 points）· **租户隔离安全大修**（copy-source 越权 / DROP DATABASE / SUBMIT 绕权 / WITH-DML 误判 / 管理面禁入 / 任务属主）· S3 读记账内存化 + LIST 索引区间化** | ✅ |
-| v1.3.12 | **S3 并行上传性能重构（写路径单事务化 + 请求热路径元数据缓存 + 暂存内存化 + 连接池 4→16）· TLS 全面上线（3309 双模式共存 + MySQL 协议内升级 + mqtts/wss）· 在线备份 CLI `-backup`（VACUUM INTO 快照不阻塞业务）· SQLite 调优暴露（wal_autocheckpoint / journal_size_limit）· S3 region 统一 + 回调三级配置 + virtual-host 域名兜底解析修复 · systemd 看门狗样例** | ✅ |
+- **v1.3.13**（当前）：S3 去重存储与秒传、gzip 压缩、打包下载、数据同步上云、KV 驱逐优先级与 SQL 读穿透、实例 ID 与排障头、版本隐藏、心跳上报；
+- **v1.3.12**：TLS 全面支持、在线备份 `-backup`、S3 并行上传重构；
+- **v1.3.11**：S3 存储层重写（分片直写、零拷贝合并）、租户隔离安全大修（修复 v1.3.10 的 4 个越权漏洞）；
+- **v1.3.10**：已撤版。
 
-| v1.3.13 | **存储效率与可观测性**：S3 chunk 池内容寻址去重（link 引用 + is-delete 墓碑 GC + CopyObject 零拷贝 + `dedup_scope` 三档）· 文件闪传秒传（`x-glacier-flash` 头 + `quick_transfer` 两段式）· gzip 传输压缩（反代友好 `x-glaciertdb-gzip` 头）· 打包下载（流式 tar / 完成后 tar.gz·zip）· 数据主动同步引擎（防自旋 + sync-origin 断环 + 失败退避重试 + 每对象回调）· KV 驱逐优先级（KEYPRIO/GETPRIO）+ SQL 读穿透回源（KV SOURCE 规则 + single-flight）· 实例唯一 ID 全组件暴露 · S3 排障头 + 结构化错误日志 · 版本号隐藏 · 心跳上报 · 防爆破扩面收口 · UDS 本地连接加速 · SCRIPT 能力临时屏蔽（v1.3.14 安全重构后恢复） | ✅ |
+更早与更细的变更见 [CHANGELOG.md](CHANGELOG.md)。
 
-历史版本的完整变更见 [CHANGELOG.md](CHANGELOG.md)，下载见 [Releases](https://github.com/sang8052/GlacierTDB/releases)
-（**旧版本资产已撤下，仅从 Releases 获取最新版**）。
-
----
-
-## ⚠️ 已知限制
-
-**协议层**
-
-- 不支持预处理语句（`COM_STMT_*`），客户端走文本协议；不支持 XA / `LOAD DATA` / `LOCK TABLES` / 复制协议；TLS 已于 v1.3.12 支持（3309 双模式 + MySQL 协议内升级 + S3 端点独立证书），未启用时公网暴露请前置认证代理；
-- S3 multipart 完整支持 **UploadPartCopy 拷贝分片**（`x-amz-copy-source [+range]`)）与**未完成会话自动回收**（`s3.abort_incomplete_days`，默认 7 天，0=关闭）；单对象上限 `max_object_mb`（**`-1` = 不限制**)）；
-- Redis 为 RESP2（`HELLO` 应答 `proto:2` 自动降级不升级 RESP3；BLPOP/BRPOP 单连接串行阻塞，`timeout=0` 无限等待；事务为队列执行语义无 WATCH；SCAN 为快照游标——遍历期间写入可能漏见/重见）；
-- AMQP 为基本队列（无镜像/仲裁队列、无事务性队列；confirm 为逐条 ack、无 `immediate` 位；pika 1.4.4 客户端 close() 有自身 bug，见消息队列手册）。
-
-**语义层**
-
-- 系统库兼容层为常用表只读应答，非全量 MySQL 系统库；库间无跨库 JOIN；
-- `DROP DATABASE` 直接删文件不可恢复；`DECIMAL`/浮点经**列类型映射**（系统库 `glacier_meta`）以 TEXT 精确落盘、查出按 MySQL 类型回放（存量旧表无映射时维持原样）；`ALTER TABLE` 支持 ADD/DROP INDEX·MODIFY·CHANGE·RENAME TABLE 等，仍受 SQLite 能力集约束；
-- rollup 仅覆盖标准 `points` schema 与可合并聚合，含 `val` 谓词等形态自动回退全量扫（语义优先）。
-
-**部署层**
-
-- 单实例单写者（红线：不做多机/复制）；`db_dir` 必须可写；
-- TLS 为 v1.3.12 新增（默认关）；无列级权限——未启用 TLS 时仅限内网可信环境；
-- **备份两条路径**：运行中安全备份 = `glaciertdb -backup <dir>`（v1.3.12 起，全部库
-  VACUUM INTO 快照单文件，不阻塞业务写入，配套 systemd timer 样例）；冷拷贝 = 停机后
-  直接拷贝 `db_dir`（运行中直接拷贝可能得到主库与 WAL 不一致的组合）；
-  （务必含 `glacier.json` / `glacier_s3.key` / `glacier_rsa.pem` 等密钥文件，见部署运维手册）；底层文件默认 adiantum 加密（固定口令）），备份包即密文，恢复需同版本服务；库文件分类存放：`sys/`（系统库）与 `user/`（用户库，自动归类）。
-
----
-
-## 📁 目录结构
-
-```
-GlacierTDB/
-├── main.go               # 入口：配置/后端/监听启动（-backup 在线备份 / -vacuum / -unlock-* / -show-locks CLI + systemd 看门狗）
-├── config.yaml           # 带注释配置样例（全部配置段；默认配置路径即 config.yaml）
-├── internal/
-│   ├── proxy/            # 3309 端口复用（mode 声明 + 嗅探 + mysql.enable 门控）与连接生命周期
-│   ├── handler/          # MySQL Handler：探活→改写→并行/rollup→透传→审计 + 管理面 SQL
-│   ├── meta/             # 探活应答表 + 方言改写 + 系统库兼容层
-│   ├── sqlite/           # 多库后端、每库写锁、读限流、Go 标量函数（含 JSON/Geo）
-│   ├── auth/             # 用户权限系统（GRANT / 防爆破[回环豁免] / caching_sha2 RSA 密钥）
-│   ├── asyncq/           # 异步任务引擎（调度 / 回调 / SCRIPT 后处理）
-│   ├── s3/               # S3 对象存储（SigV4 / 桶 / 版本 / 限速 / 证书 / 计费 / 图片管道+缓存）
-│   ├── kv/               # Redis 键值/队列（RESP / TTL / 落盘 / 淘汰 / HELLO/SCAN）
-│   ├── mq/               # RabbitMQ 队列（AMQP 0-9-1 / 路由 / 持久化）
-│   ├── mqtt/             # MQTT 接入（tcp/ws / 桥接 mq / 保留消息 / 遗嘱）
-│   ├── colmeta/          # 列类型映射系统库（MySQL 类型登记 / 回放 / 存取还原）
-│   ├── admin/  dirlock/  config/  logx/
-├── schema/timeseries.sql # 时序标准 schema
-├── docs/                 # 八册手册（配置/系统SQL/时序/异步/S3/键值/消息/部署运维）
-├── tests/                # 黑盒测试（全家桶 + run_all.sh 编排 + 重启持久化/回环/CLI 检查）
-├── Dockerfile  docker-compose.yml  LICENSE  README.md  CHANGELOG.md
-```
-
-## 🔧 技术栈
-
-| 层 | 选型 | 说明 |
-| --- | --- | --- |
-| MySQL wire server | `go-mysql-org/go-mysql` | 握手 / 认证（native + caching_sha2 + sha256）/ 结果集封包 |
-| SQLite 驱动 | `ncruces/go-sqlite3`（wazero） | **纯 Go 无 CGO**，任意平台交叉编译 |
-| JSON / 数值 | 标准库 + Go 标量函数注册 | JSON1 直通 + MySQL 函数补齐；Geo/ST 手写实现 |
-| AMQP 客户端（回调/测试） | `rabbitmq/amqp091-go` / pika | 服务端协议栈自研（internal/mq） |
-| 编译产物 | `CGO_ENABLED=0` + `-trimpath -ldflags="-s -w"` | 三平台静态二进制（linux amd64/arm64、windows amd64） |
-
-## 📄 License
+## License
 
 [MIT](LICENSE)
