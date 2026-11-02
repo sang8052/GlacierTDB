@@ -2,6 +2,7 @@ package kv
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"fmt"
 	"io"
 	"net"
@@ -223,7 +224,7 @@ func ServeConn(c net.Conn, store *Store, auths *auth.Store, cfg *config.Config) 
 			inMulti = false
 			// 逐条执行：应答帧收集进缓冲，外包 *N 数组（数组元素可为任意完整帧）
 			var out bytes.Buffer
-			out.WriteString(fmt.Sprintf("*%d\r\n", len(batch)))
+			out.WriteString("*" + strconv.Itoa(len(batch)) + "\r\n")
 			savedW := s.w
 			savedExec := s.execBuf
 			s.execBuf = &out // 事务期间推送帧也进缓冲（数组元素可为任意帧）
@@ -233,7 +234,7 @@ func ServeConn(c net.Conn, store *Store, auths *auth.Store, cfg *config.Config) 
 				if len(qa) == 0 {
 					continue
 				}
-				if s.dispatch(strings.ToUpper(qa[0]), qa[1:]) {
+				if s.runDispatch(strings.ToUpper(qa[0]), qa[1:]) {
 					quitAfter = true
 					break
 				}
@@ -259,11 +260,34 @@ func ServeConn(c net.Conn, store *Store, auths *auth.Store, cfg *config.Config) 
 			s.reply(func() { s.w.Simple("OK") })
 			return
 		default:
-			if s.dispatch(cmd, rest) {
+			if s.runDispatch(cmd, rest) {
 				return
 			}
 		}
 	}
+}
+
+// blockingCmd 阻塞/会话态命令（v1.4.0）：dedicated_core 下留在连接 goroutine
+// 原地执行——BLPOP/BRPOP 会挂死全局串行执行核；SUBSCRIBE 族依赖连接本地
+// 订阅状态与确认帧顺序；AUTH/HELLO 携带会话级认证状态写入。
+func blockingCmd(cmd string) bool {
+	switch cmd {
+	case "BLPOP", "BRPOP", "SUBSCRIBE", "PSUBSCRIBE", "UNSUBSCRIBE", "PUNSUBSCRIBE", "AUTH", "HELLO":
+		return true
+	}
+	return false
+}
+
+// runDispatch 按运算核模式执行单命令（v1.4.0）：dedicated_core 开启且非阻塞
+// 命令 → 投递专用执行 goroutine（同步等待：连接内保序、EXEC 内层顺序执行）；
+// 否则原地执行。返回 true 表示连接应关闭（QUIT）。
+func (s *session) runDispatch(cmd string, rest []string) bool {
+	if s.store.execCh == nil || blockingCmd(cmd) {
+		return s.dispatch(cmd, rest)
+	}
+	quit := false
+	s.store.exec(func() { quit = s.dispatch(cmd, rest) })
+	return quit
 }
 
 // dispatch 单命令执行（EXEC 逐条复用）；返回 true 表示连接应关闭（QUIT）。
@@ -311,21 +335,27 @@ func (s *session) dispatch(cmd string, rest []string) bool {
 
 	case "INFO":
 		// v1.3.13：glaciertdb_instance_id 字段（§6.2）+ 驱逐优先级分层计数 +
-		// SQL 回源观测（§3.2）；hide_version 开启时 version 字段隐藏
+		// SQL 回源观测（§3.2）；v1.4.0：落盘模式 / 刷盘计数 / 运算核模式；
+		// hide_version 开启时 version 字段隐藏
 		ver := config.DisplayVersion()
 		if ver == "" {
 			ver = "hidden"
 		}
 		srcH, srcM, srcE, srcUs := store.SourceCounters()
+		fTotal, fFail, fDirty := store.FlushCounters()
 		reply(func() {
 			w.BulkStr(fmt.Sprintf("# Server\r\nredis_version:glaciertdb-kv\r\nglaciertdb_version:%s\r\n"+
 				"glaciertdb_instance_id:%s\r\nuptime_in_seconds:%d\r\n"+
 				"# Memory\r\nused_memory:%d\r\nmaxmemory:%d\r\nmaxmemory_policy:%s\r\n"+
 				"evicted_prio:%d\r\nevicted_lru:%d\r\n"+
+				"# Persistence\r\npersist_mode:%s\r\nasync_flush_dirty:%d\r\nflush_total:%d\r\nflush_fail:%d\r\n"+
+				"# Core\r\ncore_mode:%s\r\n"+
 				"# ReadThrough\r\nsource_hits:%d\r\nsource_misses:%d\r\nsource_errors:%d\r\nsource_exec_us_total:%d\r\n"+
 				"# Stats\r\nops:%d\r\n", ver, instance.UUID(), store.UptimeSec(), store.MemBytes(),
 				int64(store.MaxMemoryMB())<<20, store.Eviction(),
 				store.EvictedPrioCount(), store.EvictedLRUCount(),
+				store.PersistMode(), fDirty, fTotal, fFail,
+				store.CoreMode(),
 				srcH, srcM, srcE, srcUs, store.OpsTotal()))
 		})
 
@@ -985,7 +1015,7 @@ func preAuthOK(cmd string) bool {
 var helloConnSeq uint64
 
 // doAuth 认证（统一账号体系：密码比对 + host 授权 + 锁定检查 + 登录审计/防爆破）。
-// 返回命名空间（账号名）。
+// 返回命名空间（账号名）。v1.4.0：密码比对改常数时间（crypto/subtle），防时序侧信道。
 func doAuth(rest []string, ip, remote string, auths *auth.Store) (string, bool) {
 	var user, pass string
 	switch len(rest) {
@@ -995,7 +1025,8 @@ func doAuth(rest []string, ip, remote string, auths *auth.Store) (string, bool) 
 			return "", false
 		}
 		for _, u := range auths.Users() {
-			if u.Password == pass && u.Password != "" {
+			// (v1.4.0) 常数时间比较：空密码账号不参与单密码路径匹配
+			if u.Password != "" && subtle.ConstantTimeCompare([]byte(u.Password), []byte(pass)) == 1 {
 				user = u.Username
 				break
 			}
@@ -1025,7 +1056,8 @@ func doAuth(rest []string, ip, remote string, auths *auth.Store) (string, bool) 
 		}
 	}
 	u, ok, err := auths.Lookup(user)
-	if err != nil || !ok || u.Password != pass {
+	// (v1.4.0) 常数时间比较
+	if err != nil || !ok || subtle.ConstantTimeCompare([]byte(u.Password), []byte(pass)) != 1 {
 		auths.RecordLogin(ip, remote, user, false, "kv: wrong password")
 		return "", false
 	}
