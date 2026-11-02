@@ -30,10 +30,11 @@ type frame struct {
 	payload []byte
 }
 
+// readFrame 读一帧（v1.4.0：header 用栈数组，每帧仅 1 次堆分配，原 2 次）。
 func readFrame(r io.Reader) (frame, error) {
 	var f frame
-	hdr := make([]byte, 7)
-	if _, err := io.ReadFull(r, hdr); err != nil {
+	var hdr [7]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return f, err
 	}
 	f.typ = hdr[0]
@@ -53,23 +54,19 @@ func readFrame(r io.Reader) (frame, error) {
 	return f, nil
 }
 
+// writeFrame 写一帧（v1.4.0：单缓冲一次 Write，原 3 次 conn.Write；配合
+// connState.bw 的 bufio 攒批，方法帧+content 头帧+body 帧序列合并出网）。
 func writeFrame(w io.Writer, f frame) error {
-	hdr := make([]byte, 7)
-	hdr[0] = f.typ
-	binary.BigEndian.PutUint16(hdr[1:3], f.channel)
 	n := len(f.payload)
-	hdr[4] = byte(n >> 16)
-	hdr[5] = byte(n >> 8)
-	hdr[6] = byte(n)
-	if _, err := w.Write(hdr); err != nil {
-		return err
-	}
-	if n > 0 {
-		if _, err := w.Write(f.payload); err != nil {
-			return err
-		}
-	}
-	_, err := w.Write([]byte{frameEnd})
+	buf := make([]byte, 8+n)
+	buf[0] = f.typ
+	binary.BigEndian.PutUint16(buf[1:3], f.channel)
+	buf[4] = byte(n >> 16)
+	buf[5] = byte(n >> 8)
+	buf[6] = byte(n)
+	copy(buf[7:], f.payload)
+	buf[7+n] = frameEnd
+	_, err := w.Write(buf)
 	return err
 }
 
@@ -173,7 +170,10 @@ func (e *encBuf) tableVal(v any) {
 	}
 }
 
-type decBuf struct{ b []byte; off int }
+type decBuf struct {
+	b   []byte
+	off int
+}
 
 func (d *decBuf) need(n int) error {
 	if d.off+n > len(d.b) {
@@ -353,59 +353,59 @@ type methodSpec struct {
 }
 
 var methodSpecs = map[uint32]methodSpec{
-	key(10, 10): {"Connection.Start", "ootSS"},
-	key(10, 11): {"Connection.Start-Ok", "tsSs"},
-	key(10, 30): {"Connection.Tune", "hih"},
-	key(10, 31): {"Connection.Tune-Ok", "hih"},
-	key(10, 40): {"Connection.Open", "sob"},
-	key(10, 41): {"Connection.Open-Ok", "s"},
-	key(10, 50): {"Connection.Close", "hshh"},
-	key(10, 51): {"Connection.Close-Ok", ""},
-	key(20, 10): {"Channel.Open", "o"},
-	key(20, 11): {"Channel.Open-Ok", "S"},
-	key(20, 20): {"Channel.Flow", "b"},
-	key(20, 21): {"Channel.Flow-Ok", "b"},
-	key(20, 40): {"Channel.Close", "hshh"},
-	key(20, 41): {"Channel.Close-Ok", ""}, // 0-9-1 规范：CloseOk=41（51 是 Connection.Close-Ok）
-	key(40, 10): {"Exchange.Declare", "hssbbbbbt"},
-	key(40, 11): {"Exchange.Declare-Ok", ""},
-	key(40, 20): {"Exchange.Delete", "hsbb"},
-	key(40, 21): {"Exchange.Delete-Ok", ""},
-	key(50, 10): {"Queue.Declare", "hsbbbbbt"},
-	key(50, 11): {"Queue.Declare-Ok", "sii"}, // queue shortstr, message-count long, consumer-count long
-	key(50, 20): {"Queue.Bind", "hsssbt"},
-	key(50, 21): {"Queue.Bind-Ok", ""},
-	key(50, 30): {"Queue.Purge", "hsb"},
-	key(50, 31): {"Queue.Purge-Ok", "i"},
-	key(50, 40): {"Queue.Delete", "hsbbb"},
-	key(50, 41): {"Queue.Delete-Ok", "i"},
-	key(50, 50): {"Queue.Unbind", "hssst"},
-	key(50, 51): {"Queue.Unbind-Ok", ""},
-	key(60, 10): {"Basic.Qos", "ihb"},
-	key(60, 11): {"Basic.Qos-Ok", ""},
-	key(60, 20): {"Basic.Consume", "hssbbbbbt"},
-	key(60, 21): {"Basic.Consume-Ok", "s"},
-	key(60, 30): {"Basic.Cancel", "sb"},
-	key(60, 31): {"Basic.Cancel-Ok", "s"},
-	key(60, 40): {"Basic.Publish", "hssbb"},
-	key(60, 50): {"Basic.Return", "hsss"},
-	key(60, 60): {"Basic.Deliver", "sLbss"},
-	key(60, 70): {"Basic.Get", "hsb"},
-	key(60, 71): {"Basic.Get-Ok", "Lbssi"},
-	key(60, 72): {"Basic.Get-Empty", "s"},
-	key(60, 80): {"Basic.Ack", "Lb"},
-	key(60, 90): {"Basic.Reject", "Lb"},
+	key(10, 10):  {"Connection.Start", "ootSS"},
+	key(10, 11):  {"Connection.Start-Ok", "tsSs"},
+	key(10, 30):  {"Connection.Tune", "hih"},
+	key(10, 31):  {"Connection.Tune-Ok", "hih"},
+	key(10, 40):  {"Connection.Open", "sob"},
+	key(10, 41):  {"Connection.Open-Ok", "s"},
+	key(10, 50):  {"Connection.Close", "hshh"},
+	key(10, 51):  {"Connection.Close-Ok", ""},
+	key(20, 10):  {"Channel.Open", "o"},
+	key(20, 11):  {"Channel.Open-Ok", "S"},
+	key(20, 20):  {"Channel.Flow", "b"},
+	key(20, 21):  {"Channel.Flow-Ok", "b"},
+	key(20, 40):  {"Channel.Close", "hshh"},
+	key(20, 41):  {"Channel.Close-Ok", ""}, // 0-9-1 规范：CloseOk=41（51 是 Connection.Close-Ok）
+	key(40, 10):  {"Exchange.Declare", "hssbbbbbt"},
+	key(40, 11):  {"Exchange.Declare-Ok", ""},
+	key(40, 20):  {"Exchange.Delete", "hsbb"},
+	key(40, 21):  {"Exchange.Delete-Ok", ""},
+	key(50, 10):  {"Queue.Declare", "hsbbbbbt"},
+	key(50, 11):  {"Queue.Declare-Ok", "sii"}, // queue shortstr, message-count long, consumer-count long
+	key(50, 20):  {"Queue.Bind", "hsssbt"},
+	key(50, 21):  {"Queue.Bind-Ok", ""},
+	key(50, 30):  {"Queue.Purge", "hsb"},
+	key(50, 31):  {"Queue.Purge-Ok", "i"},
+	key(50, 40):  {"Queue.Delete", "hsbbb"},
+	key(50, 41):  {"Queue.Delete-Ok", "i"},
+	key(50, 50):  {"Queue.Unbind", "hssst"},
+	key(50, 51):  {"Queue.Unbind-Ok", ""},
+	key(60, 10):  {"Basic.Qos", "ihb"},
+	key(60, 11):  {"Basic.Qos-Ok", ""},
+	key(60, 20):  {"Basic.Consume", "hssbbbbbt"},
+	key(60, 21):  {"Basic.Consume-Ok", "s"},
+	key(60, 30):  {"Basic.Cancel", "sb"},
+	key(60, 31):  {"Basic.Cancel-Ok", "s"},
+	key(60, 40):  {"Basic.Publish", "hssbb"},
+	key(60, 50):  {"Basic.Return", "hsss"},
+	key(60, 60):  {"Basic.Deliver", "sLbss"},
+	key(60, 70):  {"Basic.Get", "hsb"},
+	key(60, 71):  {"Basic.Get-Ok", "Lbssi"},
+	key(60, 72):  {"Basic.Get-Empty", "s"},
+	key(60, 80):  {"Basic.Ack", "Lb"},
+	key(60, 90):  {"Basic.Reject", "Lb"},
 	key(60, 110): {"Basic.Recover", "b"},
 	key(60, 111): {"Basic.Recover-Ok", ""},
 	key(60, 120): {"Basic.Nack", "Lbb"},
-	key(85, 10): {"Confirm.Select", "b"},
-	key(85, 11): {"Confirm.Select-Ok", ""},
-	key(90, 10): {"Tx.Select", ""},
-	key(90, 11): {"Tx.Select-Ok", ""},
-	key(90, 20): {"Tx.Commit", ""},
-	key(90, 21): {"Tx.Commit-Ok", ""},
-	key(90, 30): {"Tx.Rollback", ""},
-	key(90, 31): {"Tx.Rollback-Ok", ""},
+	key(85, 10):  {"Confirm.Select", "b"},
+	key(85, 11):  {"Confirm.Select-Ok", ""},
+	key(90, 10):  {"Tx.Select", ""},
+	key(90, 11):  {"Tx.Select-Ok", ""},
+	key(90, 20):  {"Tx.Commit", ""},
+	key(90, 21):  {"Tx.Commit-Ok", ""},
+	key(90, 30):  {"Tx.Rollback", ""},
+	key(90, 31):  {"Tx.Rollback-Ok", ""},
 }
 
 func key(class, method uint16) uint32 { return uint32(class)<<16 | uint32(method) }

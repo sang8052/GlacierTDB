@@ -1,6 +1,7 @@
 package mq
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
@@ -19,13 +20,13 @@ import (
 var connIDSeq uint64
 
 type channelState struct {
-	num     uint16
-	nextTag uint64
-	unacked map[uint64]int64 // delivery-tag → message id
+	num      uint16
+	nextTag  uint64
+	unacked  map[uint64]int64 // delivery-tag → message id
 	prefetch int
-	closed  bool
-	confirm bool   // Confirm.Select 已开启 publisher confirm（v1.3.2）
-	pubTag  uint64 // 发布序号（confirm 的 delivery-tag，v1.3.2）
+	closed   bool
+	confirm  bool   // Confirm.Select 已开启 publisher confirm（v1.3.2）
+	pubTag   uint64 // 发布序号（confirm 的 delivery-tag，v1.3.2）
 }
 
 // contentCollector Basic.Publish 内容收集（header + body 帧 + 路由目标）。
@@ -41,6 +42,7 @@ type contentCollector struct {
 // connState 单条 AMQP 连接状态。
 type connState struct {
 	conn   net.Conn
+	bw     *bufio.Writer // 帧写缓冲（v1.4.0：4KB 攒批；所有写入均持 wmu，Flush 同样纳入 wmu）
 	wmu    sync.Mutex
 	store  *Store
 	auths  *auth.Store
@@ -70,8 +72,10 @@ func ServeConn(c net.Conn, store *Store, auths *auth.Store, cfg *config.Config) 
 		conn: c, store: store, auths: auths, cfg: cfg,
 		connID: connID, channels: map[uint16]*channelState{},
 		collectors: map[uint16]*contentCollector{},
-		frameMax: 131072,
+		frameMax:   131072,
 	}
+	cs.bw = bufio.NewWriterSize(c, 4096) // v1.4.0：帧写缓冲
+	defer cs.flush()                     // v1.4.0：连接结束落网残余帧（defer LIFO：在 RequeueConn 之后、c.Close 之前执行）
 	defer func() {
 		store.RequeueConn(connID)
 		logx.Debugf("mq: connection %s closed", remote)
@@ -87,10 +91,10 @@ func (cs *connState) serve(_ []byte) {
 		srvVer = cs.cfg.MQ.ServerVersion
 	}
 	props := map[string]any{
-		"product":    "GlacierTDB",
-		"version":    srvVer,
-		"platform":   "Go",
-		"copyright":  "",
+		"product":     "GlacierTDB",
+		"version":     srvVer,
+		"platform":    "Go",
+		"copyright":   "",
 		"information": "GlacierTDB AMQP 0-9-1 basic queue (instance " + instance.UUID() + ")", // 实例 ID 能力串带出（v1.3.13 §6.2）
 		"capabilities": map[string]any{
 			"basic.nack":             true,
@@ -103,6 +107,7 @@ func (cs *connState) serve(_ []byte) {
 		args: []any{byte(0), byte(9), props, []byte("PLAIN"), []byte("en_US")}}); err != nil {
 		return
 	}
+	cs.flush() // v1.4.0：Connection.Start 是服务端首推帧，必须落网否则客户端等不到（bufio 死锁）
 
 	authed := false
 	for {
@@ -112,7 +117,7 @@ func (cs *connState) serve(_ []byte) {
 		}
 		switch f.typ {
 		case frameHeartbeat:
-			continue
+			// 心跳：无应答（落到循环尾统一落网）
 		case frameHeader:
 			ch := cs.collectors[f.channel]
 			if ch == nil {
@@ -153,6 +158,7 @@ func (cs *connState) serve(_ []byte) {
 				return
 			}
 		}
+		cs.flush() // v1.4.0：每处理完一个 inbound 帧后落网本帧应答（请求-应答节奏天然攒批；阻塞读前必落网，无死锁）
 	}
 }
 
@@ -395,14 +401,31 @@ func (cs *connState) handleMethod(chNum uint16, m *methodMsg) bool {
 	return false
 }
 
-// finishPublish 内容收集完成 → 落盘；mandatory 不可路由回退（basic.return）+
+// finishPublish 内容收集完成 → 发布；mandatory 不可路由回退（basic.return）+
 // publisher confirm 确认帧（basic.ack / basic.nack，v1.3.2）。
+// v1.4.0：async_flush 模式下 confirm 改由 flusher 在 journal 批量落库后回调写出
+// （等价原"落库成功后 confirm"时序；basic.return 仍在发布时同步写——return→confirm
+// 次序不变；入口即失败（如尺寸超限）未进 journal，同步 nack）。
 func (cs *connState) finishPublish(chNum uint16, c *contentCollector) {
 	props := c.header.props
 	if len(props) == 0 {
 		props = nil
 	}
-	routed, err := cs.store.Publish(cs.ns, c.exchange, c.rk, props, c.buf, deliveryMode(props))
+	ch := cs.channels[chNum]
+	wantConfirm := ch != nil && ch.confirm
+	asyncConfirm := wantConfirm && cs.store.async()
+	var (
+		routed int
+		err    error
+	)
+	if asyncConfirm {
+		routed, err = cs.store.PublishConfirm(cs.ns, c.exchange, c.rk, props, c.buf, deliveryMode(props),
+			func(perr error) {
+				cs.writeConfirm(chNum, c.pubTag, perr) // flusher goroutine 回调；wmu 串行化线程安全
+			})
+	} else {
+		routed, err = cs.store.Publish(cs.ns, c.exchange, c.rk, props, c.buf, deliveryMode(props))
+	}
 	if err != nil {
 		logx.Debugf("mq: publish failed: %v", err)
 	}
@@ -412,16 +435,32 @@ func (cs *connState) finishPublish(chNum uint16, c *contentCollector) {
 			args: []any{uint16(312), "NO_ROUTE", c.exchange, c.rk}})
 		cs.writeContent(chNum, c.header, c.buf)
 	}
-	// publisher confirm：confirm 模式逐条确认（回退后仍 ack = 已处理；失败 nack）
-	if ch := cs.channels[chNum]; ch != nil && ch.confirm {
-		if err != nil {
-			cs.writeMethod(chNum, &methodMsg{class: 60, method: 120,
-				args: []any{uint64(c.pubTag), false, false}})
-		} else {
-			cs.writeMethod(chNum, &methodMsg{class: 60, method: 80,
-				args: []any{uint64(c.pubTag), false}})
-		}
+	if !wantConfirm {
+		return
 	}
+	if asyncConfirm {
+		if err != nil {
+			cs.writeConfirm(chNum, c.pubTag, err) // 入口即失败：同步 nack（成功路径由 flusher 回调）
+		}
+		return
+	}
+	// 同步模式（async_flush_ms=0）：保持 v1.3.2 时序——Publish 返回（落库完成）后立刻 confirm
+	//（confirm 模式逐条确认：回退后仍 ack = 已处理；失败 nack）
+	cs.writeConfirm(chNum, c.pubTag, err)
+}
+
+// writeConfirm 写 publisher confirm 帧（perr=nil→basic.ack，否则→basic.nack）；
+// v1.4.0 抽出供帧循环与 flusher 回调复用，尾部显式落网（bufio 攒批下 confirm 帧常
+// 来自非帧循环 goroutine，必须自行 Flush）。
+func (cs *connState) writeConfirm(chNum uint16, pubTag uint64, perr error) {
+	if perr != nil {
+		_ = cs.writeMethod(chNum, &methodMsg{class: 60, method: 120,
+			args: []any{pubTag, false, false}})
+	} else {
+		_ = cs.writeMethod(chNum, &methodMsg{class: 60, method: 80,
+			args: []any{pubTag, false}})
+	}
+	cs.flush()
 }
 
 // deliveryMode 解析 Basic.Properties 的 delivery-mode（属性位 0x1000）是否为 2（persistent）。
@@ -472,6 +511,7 @@ func (cs *connState) deliverFn(ch *channelState, tag string, noAck bool) func(*M
 		cs.writeMethod(ch.num, &methodMsg{class: 60, method: 60,
 			args: []any{tag, uint64(dtag), m.Redelivered, m.Exchange, m.RoutingKey}})
 		cs.writeContent(ch.num, contentHeader{bodySize: uint64(len(m.Payload)), props: m.Props}, m.Payload)
+		cs.flush() // v1.4.0：Deliver 来自派发 goroutine，显式落网（与帧循环应答经 wmu 串行）
 	}
 }
 
@@ -590,7 +630,7 @@ func (cs *connState) authenticate(user, pass string) bool {
 	return true
 }
 
-// writeMethod 写方法帧（连接写互斥）。
+// writeMethod 写方法帧（连接写互斥；v1.4.0 写入 bufio，由调用路径显式 Flush）。
 func (cs *connState) writeMethod(chNum uint16, m *methodMsg) error {
 	payload, err := m.encode()
 	if err != nil {
@@ -598,14 +638,15 @@ func (cs *connState) writeMethod(chNum uint16, m *methodMsg) error {
 	}
 	cs.wmu.Lock()
 	defer cs.wmu.Unlock()
-	return writeFrame(cs.conn, frame{typ: frameMethod, channel: chNum, payload: payload})
+	return writeFrame(cs.bw, frame{typ: frameMethod, channel: chNum, payload: payload})
 }
 
-// writeContent 写内容（header + body 分帧）。
+// writeContent 写内容（header + body 分帧；v1.4.0 写入 bufio——方法帧+内容帧序列
+// 由调用方在同序列后 Flush 落网）。
 func (cs *connState) writeContent(chNum uint16, h contentHeader, body []byte) error {
 	cs.wmu.Lock()
 	defer cs.wmu.Unlock()
-	if err := writeFrame(cs.conn, frame{typ: frameHeader, channel: chNum, payload: h.encode()}); err != nil {
+	if err := writeFrame(cs.bw, frame{typ: frameHeader, channel: chNum, payload: h.encode()}); err != nil {
 		return err
 	}
 	max := cs.frameMax
@@ -617,14 +658,22 @@ func (cs *connState) writeContent(chNum uint16, h contentHeader, body []byte) er
 		if end > len(body) {
 			end = len(body)
 		}
-		if err := writeFrame(cs.conn, frame{typ: frameBody, channel: chNum, payload: body[off:end]}); err != nil {
+		if err := writeFrame(cs.bw, frame{typ: frameBody, channel: chNum, payload: body[off:end]}); err != nil {
 			return err
 		}
 	}
 	if len(body) == 0 {
-		return writeFrame(cs.conn, frame{typ: frameBody, channel: chNum, payload: nil})
+		return writeFrame(cs.bw, frame{typ: frameBody, channel: chNum, payload: nil})
 	}
 	return nil
+}
+
+// flush 落网写缓冲（v1.4.0）：帧循环每处理完一个 inbound 帧后调用；Deliver /
+// confirm 回调等非帧循环 goroutine 写完同样调用——bufio 写入与 Flush 全部经 wmu 串行。
+func (cs *connState) flush() {
+	cs.wmu.Lock()
+	_ = cs.bw.Flush()
+	cs.wmu.Unlock()
 }
 
 // parsePlain 解析 SASL PLAIN 响应（\0user\0pass）。
@@ -639,4 +688,3 @@ func parsePlain(resp string) (string, string) {
 func atomicAdd(p *uint64, d uint64) uint64 {
 	return atomic.AddUint64(p, d)
 }
-
