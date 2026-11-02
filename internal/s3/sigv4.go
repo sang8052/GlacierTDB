@@ -25,9 +25,40 @@ const (
 	payloadEmpty      = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" // sha256("")
 	payloadUnsigned   = "UNSIGNED-PAYLOAD"
 	payloadStreaming  = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+	payloadStreamingTrailer = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" // 签名块 + checksum trailer（v1.4.0 S11）
 	signTimeSkew      = 15 * time.Minute // 允许时钟偏差
 	serviceName       = "s3"
 )
+
+// chunkSigner aws-chunked 逐块签名校验器（v1.4.0 S11）。
+// 每块的 stringToSign（AWS SigV4 流式规范）：
+//
+//	"AWS4-HMAC-SHA256-PAYLOAD\n" + dateTime + "\n" + scope + "\n" + prevSig +
+//	"\n" + hex(sha256("")) + "\n" + hex(sha256(chunkData))
+//
+// 首块 prevSig = 请求整体签名（种子，Authorization 里的 Signature）；其后每块
+// 用上一块签名推进链条——任何一块数据 / 尺寸被篡改，链条即断。
+type chunkSigner struct {
+	key      []byte // 派生签名密钥（与请求验签同一把）
+	dateTime string // yyyymmddThhmmssZ
+	scope    string // date/region/service/aws4_request
+	prev     string // 上一签名（hex；种子 = 请求整体签名）
+}
+
+// sign 计算并推进签名链（chunkHashHex = 块数据 sha256 hex；终块传空负载哈希）。
+func (c *chunkSigner) sign(chunkHashHex string) string {
+	sts := strings.Join([]string{
+		"AWS4-HMAC-SHA256-PAYLOAD",
+		c.dateTime,
+		c.scope,
+		c.prev,
+		payloadEmpty,
+		chunkHashHex,
+	}, "\n")
+	sig := hex.EncodeToString(hmacSHA256(c.key, []byte(sts)))
+	c.prev = sig
+	return sig
+}
 
 // isStreamingPayload 判断 x-amz-content-sha256 声明是否为 aws-chunked 流式编码。
 // 覆盖新版 botocore / AWS CLI 的 CRC32 默认校验和编码：
@@ -289,10 +320,12 @@ func requestPathCandidates(r *http.Request) []string {
 	return uniq
 }
 
-// verifySigV4 校验请求签名（表头鉴权或预签名 URL），返回签名身份与负载哈希声明。
+// verifySigV4 校验请求签名（表头鉴权或预签名 URL），返回签名身份、负载哈希声明
+// 与 aws-chunked 逐块签名校验器（v1.4.0 S11：仅签名流式变体返回非 nil——
+// STREAMING-UNSIGNED-PAYLOAD-TRAILER 的块帧本就无 chunk-signature，不校验）。
 // secretFor(ak) 返回 (owner, sk, status, policyJSON, scopeJSON)。
 func verifySigV4(r *http.Request, region string,
-	secretFor func(ak string) (owner, sk, status, policy, scope string, ok bool)) (credScope, string, error) {
+	secretFor func(ak string) (owner, sk, status, policy, scope string, ok bool)) (credScope, string, *chunkSigner, error) {
 	var cs credScope
 	rawQuery := requestRawQuery(r)
 
@@ -303,7 +336,7 @@ func verifySigV4(r *http.Request, region string,
 		cs.AK = strings.SplitN(q.Get("X-Amz-Credential"), "/", 2)[0]
 		credParts := strings.Split(q.Get("X-Amz-Credential"), "/")
 		if len(credParts) != 5 {
-			return cs, "", fmt.Errorf("malformed X-Amz-Credential")
+			return cs, "", nil, fmt.Errorf("malformed X-Amz-Credential")
 		}
 		cs.AK, cs.Date, cs.Region, cs.Service = credParts[0], credParts[1], credParts[2], credParts[3]
 		cs.ReqDateTime = q.Get("X-Amz-Date")
@@ -314,28 +347,28 @@ func verifySigV4(r *http.Request, region string,
 			cs.Expires = 604800 // S3 默认 7 天
 		}
 		if cs.Expires > 604800 { // v1.3.11：对齐 AWS 上限（7 天），防止万年签名
-			return cs, "", fmt.Errorf("X-Amz-Expires must be <= 604800")
+			return cs, "", nil, fmt.Errorf("X-Amz-Expires must be <= 604800")
 		}
 		if len(cs.SignedHeaders) == 0 {
-			return cs, "", fmt.Errorf("missing X-Amz-SignedHeaders")
+			return cs, "", nil, fmt.Errorf("missing X-Amz-SignedHeaders")
 		}
 		// 有效期（v1.3.11：日期不可解析时 fail-closed，不再静默跳过时效校验）
 		t, err := time.Parse("20060102T150405Z", cs.ReqDateTime)
 		if err != nil {
-			return cs, "", fmt.Errorf("malformed X-Amz-Date")
+			return cs, "", nil, fmt.Errorf("malformed X-Amz-Date")
 		}
 		if now := time.Now().UTC(); now.After(t.Add(time.Duration(cs.Expires)*time.Second)) ||
 			now.Before(t.Add(-signTimeSkew)) {
-			return cs, "", fmt.Errorf("presigned URL expired")
+			return cs, "", nil, fmt.Errorf("presigned URL expired")
 		}
 	} else {
 		auth := r.Header.Get("Authorization")
 		if auth == "" {
-			return cs, "", fmt.Errorf("missing Authorization header")
+			return cs, "", nil, fmt.Errorf("missing Authorization header")
 		}
 		var err error
 		if cs, err = parseAuthHeader(auth); err != nil {
-			return cs, "", err
+			return cs, "", nil, err
 		}
 		cs.ReqDateTime = r.Header.Get("X-Amz-Date")
 		if cs.ReqDateTime == "" {
@@ -346,39 +379,39 @@ func verifySigV4(r *http.Request, region string,
 			}
 		}
 		if cs.ReqDateTime == "" {
-			return cs, "", fmt.Errorf("missing X-Amz-Date")
+			return cs, "", nil, fmt.Errorf("missing X-Amz-Date")
 		}
 		// v1.3.11：日期不可解析时 fail-closed
 		t, terr := time.Parse("20060102T150405Z", cs.ReqDateTime)
 		if terr != nil {
-			return cs, "", fmt.Errorf("malformed X-Amz-Date")
+			return cs, "", nil, fmt.Errorf("malformed X-Amz-Date")
 		}
 		if dt := time.Now().UTC().Sub(t); dt > signTimeSkew || dt < -signTimeSkew {
-			return cs, "", fmt.Errorf("request time too skewed")
+			return cs, "", nil, fmt.Errorf("request time too skewed")
 		}
 	}
 
 	// region 范围校验：'*' / 空 = 任意；否则必须与配置一致
 	if region != "" && region != "*" && !strings.EqualFold(region, cs.Region) {
-		return cs, "", fmt.Errorf("region mismatch: signature %q, server %q", cs.Region, region)
+		return cs, "", nil, fmt.Errorf("region mismatch: signature %q, server %q", cs.Region, region)
 	}
 
 	owner, sk, status, policy, keyScope, ok := secretFor(cs.AK)
 	if !ok {
-		return cs, "", &s3Error{Code: "InvalidAccessKeyId", Status: 403,
+		return cs, "", nil, &s3Error{Code: "InvalidAccessKeyId", Status: 403,
 			Msg: "The AWS Access Key Id you provided does not exist in our records: " + cs.AK}
 	}
 	cs.Owner = owner
 	cs.Policy = policy
 	cs.Scope = keyScope
 	if status != "active" {
-		return cs, "", &s3Error{Code: "InvalidAccessKeyId", Status: 403,
+		return cs, "", nil, &s3Error{Code: "InvalidAccessKeyId", Status: 403,
 			Msg: "The AWS Access Key Id is " + status}
 	}
 
 	payloadHash := claimedPayloadHash(r, cs.Presigned)
 	if payloadHash == "" {
-		return cs, "", &s3Error{Code: "InvalidRequest", Status: 400,
+		return cs, "", nil, &s3Error{Code: "InvalidRequest", Status: 400,
 			Msg: "Missing x-amz-content-sha256 header"}
 	}
 	signQuery := rawQuery
@@ -386,9 +419,20 @@ func verifySigV4(r *http.Request, region string,
 		signQuery = stripQueryParam(rawQuery, "X-Amz-Signature")
 	}
 	if verifySignature(r, cs, sk, payloadHash, signQuery, requestPathCandidates(r)) {
-		return cs, payloadHash, nil
+		// (v1.4.0 S11) 签名流式变体：构造逐块签名校验器（种子 = 请求整体签名）。
+		// STREAMING-UNSIGNED-PAYLOAD-TRAILER 块帧无 chunk-signature，不返回校验器。
+		var ck *chunkSigner
+		if payloadHash == payloadStreaming || payloadHash == payloadStreamingTrailer {
+			ck = &chunkSigner{
+				key:      signingKey(sk, cs.Date, cs.Region, cs.Service),
+				dateTime: cs.ReqDateTime,
+				scope:    cs.Date + "/" + cs.Region + "/" + cs.Service + "/aws4_request",
+				prev:     strings.ToLower(cs.Signature),
+			}
+		}
+		return cs, payloadHash, ck, nil
 	}
-	return cs, "", &s3Error{Code: "SignatureDoesNotMatch", Status: 403,
+	return cs, "", nil, &s3Error{Code: "SignatureDoesNotMatch", Status: 403,
 		Msg: "The request signature we calculated does not match the signature you provided. " +
 			"Check your key and signing method."}
 }

@@ -115,6 +115,11 @@ func (s *Store) FlashCreate(bucket, key, fileSHA string, sizeHint int64, attrs O
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	// (v1.4.0 S6) 锁内 WORM 复检（TOCTOU 兜底，与锁前检查同语义）
+	if err := s.lockRecheckLocked(b, key); err != nil {
+		return out, false, err
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return out, false, err
@@ -170,6 +175,9 @@ func (s *Store) FlashCreate(bucket, key, fileSHA string, sizeHint int64, attrs O
 	if err := tx.Commit(); err != nil {
 		return out, false, nil
 	}
+	// (v1.4.0) 该 key 缓存失效（读缓存 + 纯内存命名空间）
+	s.memCacheInvalidatePrefix(oBucketPrefix(bucket, key))
+	s.memObjDel(bucket, key)
 	s.AddUsage(b.Owner, bucket, "PUT", 0, 0) // 闪传命中：计请求数不计 bytes_in
 
 	out = ObjectMeta{

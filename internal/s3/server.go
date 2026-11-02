@@ -25,6 +25,7 @@ import (
 	"glaciertdb/internal/config"
 	"glaciertdb/internal/instance"
 	"glaciertdb/internal/logx"
+	"glaciertdb/internal/netguard"
 )
 
 // s3Error S3 XML 风格错误（Code 对齐 AWS）。
@@ -70,10 +71,9 @@ type Server struct {
 	store      *Store
 	auths      *auth.Store
 	lim        *limiter
-	httpClient *http.Client
 	servers    []*http.Server
 	certRegs   []*certRegistry
-	imgcache   *imgCache // 图片预处理结果磁盘缓存（GET 加工链路；nil/未启用 = 关）
+	imgcache   *imgCache // 图片预处理结果缓存（GET 加工链路；memory/disk 双后端，v1.4.0；nil = 关）
 	sync       *syncEngine // 数据主动同步引擎（v1.3.13；nil = 未配置规则）
 	started    bool
 }
@@ -85,12 +85,17 @@ func NewServer(cfg *config.Config, store *Store, auths *auth.Store) *Server {
 		cfg:   cfg,
 		store: store,
 		auths: auths,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}
 	if cfg.S3.ImageCache {
-		s.imgcache = newImgCache(filepath.Join(cfg.DBDir, "sys"), cfg.S3.ImageCacheMB)
+		// (v1.4.0) 图片派生缓存双后端：image_cache_backend=memory 落统一内存缓存
+		//（store.mem 为 nil 即 mem_cache 关闭时回退磁盘）；disk 保留原目录路径
+		s.imgcache = newImgCache(filepath.Join(cfg.DBDir, "sys"), cfg.S3.ImageCacheMB, cfg.S3.ImageCacheBackend, store.mem)
 		if s.imgcache.enabled() {
-			logx.Infof("s3: image cache enabled at %s (cap %d MB)", filepath.Join(cfg.DBDir, "sys", "gimg_cache"), cfg.S3.ImageCacheMB)
+			if s.imgcache.mem != nil {
+				logx.Infof("s3: image cache enabled (backend=memory, shared mem_cache budget)")
+			} else {
+				logx.Infof("s3: image cache enabled at %s (cap %d MB)", filepath.Join(cfg.DBDir, "sys", "gimg_cache"), cfg.S3.ImageCacheMB)
+			}
 		}
 	}
 	s.lim = newLimiter(store.EffectiveLimit)
@@ -293,9 +298,10 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//（v1.3.12：此前每个请求都要二次 KeyFor 查库；v1.3.14 §2 scope 随行）。
 	var cs credScope
 	var payloadHash string
+	var csig *chunkSigner // aws-chunked 逐块签名校验器（v1.4.0 S11；nil = 不适用）
 	if !tokenAuth {
 		var err error
-		cs, payloadHash, err = verifySigV4(r, s.cfg.S3.Region, s.store.KeyFor)
+		cs, payloadHash, csig, err = verifySigV4(r, s.cfg.S3.Region, s.store.KeyFor)
 		if err != nil {
 			writeErr(w, r, reqID, toS3Err(err))
 			return
@@ -331,11 +337,37 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		keyScope = ks
 		q := r.URL.Query()
+		prefix, marker := q.Get("prefix"), q.Get("marker")
+		// (v1.4.0 S1) 打包下载的前缀越界面在 x-glacier-archive 值本身：此前 probe
+		// 用 q.Get("prefix")，带 prefixes 收窄的 AK 可用 dummy prefix 绕过、越界
+		// 打包任意前缀。archive 请求的 probe 改用 archive 目标（对象级形态 path
+		// 即默认前缀）；marker 对 archive 无分页语义，按任务定稿保持原值。
+		if q.Has("x-glacier-archive") {
+			if v := q.Get("x-glacier-archive"); v != "" {
+				prefix = v
+			} else {
+				prefix = key
+			}
+		}
 		isList := key == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead)
-		if e := checkKeyScope(ks, bucket, key, q.Get("prefix"), q.Get("marker"),
+		if e := checkKeyScope(ks, bucket, key, prefix, marker,
 			isWriteRequestMethod(r), isList); e != nil {
 			writeErr(w, r, reqID, e)
 			return
+		}
+		// (v1.4.0 S1) 纵深防御：scoped AK 的 archive 目标必须落在 scope 前缀内
+		//（防未来新增的 archive 旁路路由；全桶打包 probe 为空 → 拒绝，与 LIST
+		// 「有前缀限制不给 prefix 即 403」语义一致）
+		if q.Has("x-glacier-archive") && len(ks.Prefixes) > 0 {
+			probe := q.Get("x-glacier-archive")
+			if probe == "" {
+				probe = key
+			}
+			if !ks.prefixAllowed(probe, "") {
+				writeErr(w, r, reqID, &s3Error{Code: "AccessDenied", Status: 403,
+					Msg: "Access Denied: archive prefix outside key scope prefixes " + strings.Join(ks.Prefixes, ",")})
+				return
+			}
 		}
 	}
 
@@ -350,6 +382,17 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		} else if e := s.canAccessBucket(owner, b, isWriteRequestMethod(r)); e != nil {
+			writeErr(w, r, reqID, e)
+			return
+		}
+	}
+
+	// (v1.4.0 S2) 回调 URL 出站防 SSRF（netguard）：租户可控回调目标（请求头
+	// x-glacier-callback-url > 桶级 SET S3 CALLBACK）在对象写路径预检，违反策略
+	// 直接 403 拒绝整个写入——避免「对象已写、回调被静默吞」的不一致。全局
+	// callback_url 属 super 配置不在此静态拒绝（client 侧连接期复核兜底）。
+	if bucket != "" && key != "" && (r.Method == http.MethodPut || r.Method == http.MethodPost) {
+		if e := s.checkCallbackURL(bucket, reqCallbackOverride(r)); e != nil {
 			writeErr(w, r, reqID, e)
 			return
 		}
@@ -395,7 +438,7 @@ func (h *endpointHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleBucket(w, r, bucket, owner, reqID)
 	default:
 		r = withReqInfo(r, owner, bucket, key, lim, userTB)
-		h.handleObject(w, r, bucket, key, owner, payloadHash, lim, userTB, reqID)
+		h.handleObject(w, r, bucket, key, owner, payloadHash, csig, lim, userTB, reqID)
 	}
 }
 
@@ -496,7 +539,33 @@ func reqInfoOf(r *http.Request) *reqInfo {
 }
 
 // resolveBucketKey virtual-host / path-style 解析（返回已解码 bucket 与 key）。
+// (v1.4.0 任务2) vhost 打包下载形态修复：x-glacier-archive 请求在 vhost 判定后
+// —— path 首段 == 桶名 → 剥掉该段（key=""，桶级打包）；path 非空且非桶名 →
+// 整段 path 交给 archive 当默认前缀（handleObject 的 archive 分支承接）。三形态
+// （/{bucket}?x-glacier-archive=、/{path}?x-glacier-archive=、/?x-glacier-archive=）
+// 与 path-style（首段本就是桶名）行为对齐。
 func (h *endpointHandler) resolveBucketKey(r *http.Request) (bucket, key string) {
+	b, k, vhost := h.resolveBucketKeyV(r)
+	if vhost && b != "" && r.URL.Query().Has("x-glacier-archive") {
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path == "" {
+			return b, "" // /?x-glacier-archive=：全桶打包
+		}
+		first := path
+		if i := strings.IndexByte(path, '/'); i >= 0 {
+			first = path[:i]
+		}
+		if first == b {
+			return b, "" // /{bucket}?x-glacier-archive=：首段是桶名冗余段（vhost 下 key=整段 path），剥掉
+		}
+		// /{path}?x-glacier-archive=：k 即整段 path，交 handleObject 转投 archive
+	}
+	return b, k
+}
+
+// resolveBucketKeyV 解析核心：额外返回是否 vhost 判定（自定义域名 / server_names
+// 后缀 / 兜底域名探测；endpoint 裸域名与 IP 直访 = path-style）。
+func (h *endpointHandler) resolveBucketKeyV(r *http.Request) (bucket, key string, vhost bool) {
 	host := r.Host
 	if hh, _, err := net.SplitHostPort(host); err == nil {
 		host = hh
@@ -506,7 +575,7 @@ func (h *endpointHandler) resolveBucketKey(r *http.Request) (bucket, key string)
 
 	// 1) 自定义域名（SAN 映射到 bucket）
 	if d, ok := h.srv.store.DomainFor(host); ok {
-		return d.Bucket, path
+		return d.Bucket, path, true
 	}
 	// 2) virtual-host：{bucket}[.{region}].{endpoint 后缀}
 	for _, name := range h.ep.ServerNames {
@@ -515,25 +584,27 @@ func (h *endpointHandler) resolveBucketKey(r *http.Request) (bucket, key string)
 			continue
 		}
 		if host == name {
-			return splitPathStyle(path)
+			b, k := splitPathStyle(path)
+			return b, k, false // endpoint 裸域名：path-style
 		}
 		if strings.HasSuffix(host, "."+name) {
 			prefix := strings.TrimSuffix(host, "."+name)
 			if prefix == "" {
-				return splitPathStyle(path)
+				b, k := splitPathStyle(path)
+				return b, k, false
 			}
 			// 整段即桶名（含点桶名）优先；否则末段按 region 剥离
 			if b, err := h.srv.store.Bucket(prefix); err == nil {
 				_ = b
-				return prefix, path
+				return prefix, path, true
 			}
 			if i := strings.LastIndexByte(prefix, '.'); i > 0 {
 				maybeBucket := prefix[:i]
 				if _, err := h.srv.store.Bucket(maybeBucket); err == nil {
-					return maybeBucket, path
+					return maybeBucket, path, true
 				}
 			}
-			return prefix, path
+			return prefix, path, true
 		}
 	}
 	// 2.5) 未配置 server_names 的域名部署兜底（v1.3.12 修复）：此前未知主机名
@@ -546,13 +617,14 @@ func (h *endpointHandler) resolveBucketKey(r *http.Request) (bucket, key string)
 			cand := host[:i]
 			if ValidBucketName(cand) {
 				if _, err := h.srv.store.Bucket(cand); err == nil {
-					return cand, path
+					return cand, path, true
 				}
 			}
 		}
 	}
 	// 3) path-style：/{bucket}/{key...}
-	return splitPathStyle(path)
+	b, k := splitPathStyle(path)
+	return b, k, false
 }
 
 // isIPHost 判断主机名是否 IPv4/IPv6 字面量（vhost 剥离不适用于 IP 访问）。
@@ -715,9 +787,10 @@ func (h *endpointHandler) handleBucket(w http.ResponseWriter, r *http.Request, b
 	q := r.URL.Query()
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
-		// 打包下载（v1.3.13 §1.5）：GET /{bucket}?x-glacier-archive=<prefix>&format=…&mode=…
-		//（限速 / 并发沿用 ServeHTTP 已获取的连接级额度；对象锁/WORM 对象照常包含）
-		if r.Method == http.MethodGet && q.Has("x-glacier-archive") {
+		// 打包下载（v1.3.13 §1.5）：GET/HEAD /{bucket}?x-glacier-archive=<prefix>&format=…&mode=…
+		//（限速 / 并发沿用 ServeHTTP 已获取的连接级额度；对象锁/WORM 对象照常包含。
+		// v1.4.0：HEAD 同样支持——走同一管线，仅返回头不写包体）
+		if q.Has("x-glacier-archive") {
 			if _, berr := h.srv.store.Bucket(bucket); berr != nil {
 				writeErr(w, r, reqID, toS3Err(berr))
 				return
@@ -922,8 +995,9 @@ func (h *endpointHandler) listVersions(w http.ResponseWriter, r *http.Request, b
 }
 
 // handleObject 对象级操作（PUT / GET / HEAD / DELETE / COPY / 分片上传）。
+// csig：aws-chunked 逐块签名校验器（v1.4.0 S11；nil = 不适用）。
 func (h *endpointHandler) handleObject(w http.ResponseWriter, r *http.Request, bucket, key, owner,
-	payloadHash string, lim config.S3Limit, userTB *tokenBucket, reqID string) {
+	payloadHash string, csig *chunkSigner, lim config.S3Limit, userTB *tokenBucket, reqID string) {
 	q := r.URL.Query()
 	versionID := q.Get("versionId")
 	uploadID := q.Get("uploadId")
@@ -933,7 +1007,7 @@ func (h *endpointHandler) handleObject(w http.ResponseWriter, r *http.Request, b
 	if uploadID != "" {
 		switch r.Method {
 		case http.MethodPut:
-			h.uploadPart(w, r, bucket, key, uploadID, payloadHash, reqID)
+			h.uploadPart(w, r, bucket, key, uploadID, payloadHash, csig, reqID)
 		case http.MethodPost:
 			h.completeMultipart(w, r, bucket, key, uploadID, owner, reqID)
 		case http.MethodDelete:
@@ -959,7 +1033,7 @@ func (h *endpointHandler) handleObject(w http.ResponseWriter, r *http.Request, b
 			h.copyObject(w, r, bucket, key, src, reqID)
 			return
 		}
-		h.putObject(w, r, bucket, key, owner, payloadHash, img, hasImg, reqID)
+		h.putObject(w, r, bucket, key, owner, payloadHash, csig, img, hasImg, reqID)
 
 	case http.MethodPost:
 		// POST /{bucket}/{key}?uploads → InitiateMultipartUpload
@@ -981,6 +1055,18 @@ func (h *endpointHandler) handleObject(w http.ResponseWriter, r *http.Request, b
 		writeErr(w, r, reqID, &s3Error{Code: "MethodNotAllowed", Status: 405, Msg: "The specified method is not allowed against this resource"})
 
 	case http.MethodGet, http.MethodHead:
+		// (v1.4.0 任务2) 打包下载 vhost / 对象级形态：?x-glacier-archive 出现即按
+		// 打包下载处理（前缀 = 参数值，缺省用 path 当默认前缀，对照 path-style
+		// 桶级语义；HEAD 同样支持）。桶级形态（key==""）由 handleBucket 承接。
+		if q.Has("x-glacier-archive") {
+			prefix := q.Get("x-glacier-archive")
+			if prefix == "" {
+				prefix = key
+			}
+			info := reqInfoOf(r)
+			h.archiveDownload(w, r, bucket, strings.TrimPrefix(prefix, "/"), owner, reqID, info.lim, info.userTB)
+			return
+		}
 		h.getObject(w, r, bucket, key, versionID, owner, img, hasImg, lim, userTB, reqID)
 
 	case http.MethodDelete:
@@ -1019,12 +1105,37 @@ func (h *endpointHandler) imgResolverFor(bucket string) imgResolver {
 	}
 }
 
-// putObject 上传对象（支持 base64 上传解码、aws-chunked 流式[含新版 CRC32 trailer 编码]、
-// 负载哈希校验）。
+// putObject 上传对象（支持 base64 上传解码、aws-chunked 流式[含逐块签名校验与
+// 新版 CRC32 trailer 编码]、负载哈希校验、x-glacier-memory 纯内存对象）。
 func (h *endpointHandler) putObject(w http.ResponseWriter, r *http.Request, bucket, key, owner,
-	payloadHash string, img imgParams, hasImg bool, reqID string) {
+	payloadHash string, csig *chunkSigner, img imgParams, hasImg bool, reqID string) {
 	if hasImg && img.OpsErr != nil { // 非法 x-gimg-ops：显式 400，不再静默透传
 		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400, Msg: img.OpsErr.Error()})
+		return
+	}
+	// (v1.4.0) 纯内存对象：x-glacier-memory: true → 元数据 + 内容仅驻内存（不落
+	// SQLite，重启即失；单版本覆盖）。与闪传 / 图片管道互斥（显式 400）；头不参与
+	// SigV4 签名（客户端不将其列入 SignedHeaders 即可，与 x-glacier-flash 同惯例）。
+	if strings.EqualFold(r.Header.Get("X-Glacier-Memory"), "true") {
+		if hasImg {
+			writeErr(w, r, reqID, &s3Error{Code: "InvalidRequest", Status: 400,
+				Msg: "x-glacier-memory is mutually exclusive with image processing (x-gimg-*)"})
+			return
+		}
+		body := io.Reader(r.Body)
+		if isStreamingPayload(payloadHash) || strings.Contains(strings.ToLower(r.Header.Get("Content-Encoding")), "aws-chunked") {
+			body = newAWSChunkedReader(r.Body, csig)
+		}
+		var hr io.Reader = body
+		if payloadHash != "" && payloadHash != payloadUnsigned && !isStreamingPayload(payloadHash) {
+			hr = &hashCheckReader{r: body, h: sha256.New(), expected: payloadHash}
+		}
+		m, err := h.srv.store.PutMemoryObject(bucket, key, hr, putAttrs(r))
+		if err != nil {
+			writeErr(w, r, reqID, toS3Err(err))
+			return
+		}
+		h.finishPut(w, r, bucket, key, m, false, owner, reqID)
 		return
 	}
 	// 闪传 A 形态（v1.3.13 §1.2）：x-glacier-flash: sha256:<hex>（可选
@@ -1049,7 +1160,7 @@ func (h *endpointHandler) putObject(w http.ResponseWriter, r *http.Request, buck
 	body := io.Reader(r.Body)
 	contentEnc := r.Header.Get("Content-Encoding")
 	if isStreamingPayload(payloadHash) || strings.Contains(strings.ToLower(contentEnc), "aws-chunked") {
-		body = newAWSChunkedReader(r.Body)
+		body = newAWSChunkedReader(r.Body, csig)
 	}
 	// 负载哈希校验（BadDigest）：签名已覆盖声明值，此处验证实际字节
 	var hr io.Reader = body
@@ -1575,7 +1686,7 @@ func (h *endpointHandler) initiateMultipart(w http.ResponseWriter, r *http.Reque
 
 // uploadPart PUT /{bucket}/{key}?partNumber=N&uploadId=... → UploadPart（ETag = 分片 MD5）。
 func (h *endpointHandler) uploadPart(w http.ResponseWriter, r *http.Request, bucket, key, uploadID,
-	payloadHash, reqID string) {
+	payloadHash string, csig *chunkSigner, reqID string) {
 	partNumber, _ := strconv.Atoi(r.URL.Query().Get("partNumber"))
 	if partNumber <= 0 {
 		writeErr(w, r, reqID, &s3Error{Code: "InvalidArgument", Status: 400,
@@ -1591,7 +1702,7 @@ func (h *endpointHandler) uploadPart(w http.ResponseWriter, r *http.Request, buc
 	chunked := isStreamingPayload(payloadHash) ||
 		strings.Contains(strings.ToLower(r.Header.Get("Content-Encoding")), "aws-chunked")
 	if chunked {
-		body = newAWSChunkedReader(r.Body)
+		body = newAWSChunkedReader(r.Body, csig)
 	}
 	var hr io.Reader = body
 	if payloadHash != "" && payloadHash != payloadUnsigned && !isStreamingPayload(payloadHash) {
@@ -1763,7 +1874,7 @@ func (h *endpointHandler) listMultipartUploads(w http.ResponseWriter, r *http.Re
 
 func (h *endpointHandler) serveInternal(w http.ResponseWriter, r *http.Request, reqID string) {
 	s := h.srv
-	cs, _, err := verifySigV4(r, s.cfg.S3.Region, s.store.KeyFor)
+	cs, _, _, err := verifySigV4(r, s.cfg.S3.Region, s.store.KeyFor)
 	if err != nil {
 		writeErr(w, r, reqID, toS3Err(err))
 		return
@@ -1851,7 +1962,42 @@ func toS3Err(err error) *s3Error {
 	if e, ok := err.(*s3Error); ok {
 		return e
 	}
-	return &s3Error{Code: "InternalError", Status: 500, Msg: err.Error()}
+	// (v1.4.0 S7) 非受控错误（SQL/文件系统/内部不变量破坏等）不把 err.Error()
+	// 透出到 500 响应体——内部路径 / 存储布局细节可能借此泄漏给租户；对外统一
+	// 通用消息，原始错误落结构化日志（x-glacier-request-id 关联排障）。
+	logx.Errorf("s3 internal error: %v", err)
+	return &s3Error{Code: "InternalError", Status: 500,
+		Msg: "We encountered an internal error. Please try again."}
+}
+
+// ---------------------------------------------------------------------------
+// 上传回调出站防护（v1.4.0 S2，netguard 防 SSRF）
+// ---------------------------------------------------------------------------
+
+// callbackTarget 解析生效回调 URL（请求级 > 桶级 > 全局；与 notifyPut 同序）。
+func (s *Server) callbackTarget(bucket string, ov *callbackOverride) string {
+	if ov != nil && ov.url != "" {
+		return ov.url
+	}
+	if b, err := s.store.Bucket(bucket); err == nil && b.CallbackURL != "" {
+		return b.CallbackURL
+	}
+	return s.cfg.S3.CallbackURL
+}
+
+// checkCallbackURL 对象写路径回调目标预检（v1.4.0 S2）：租户可控回调（请求头 /
+// 桶级）违反 netguard 策略 → 403 拒绝写入；无生效回调 URL 直接放行。全局
+// callback_url 是 super 配置，静态校验不拒绝（真正出站时 client 侧 Control 兜底）。
+func (s *Server) checkCallbackURL(bucket string, ov *callbackOverride) *s3Error {
+	url := s.callbackTarget(bucket, ov)
+	if url == "" {
+		return nil
+	}
+	if err := netguard.Check(url, netguard.ParsePolicy(s.cfg.Security.CallbackNetPolicy)); err != nil {
+		return &s3Error{Code: "AccessDenied", Status: 403,
+			Msg: "callback url rejected by security policy (" + err.Error() + ")"}
+	}
+	return nil
 }
 
 // isoTime "2006-01-02 15:04:05"（本地）→ ISO8601 UTC。

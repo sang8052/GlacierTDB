@@ -1,15 +1,19 @@
-// Package s3 — 图片预处理结果磁盘缓存（GET 加工链路，v1.3.10）。
+// Package s3 — 图片预处理结果缓存（GET 加工链路，v1.3.10；v1.4.0 双后端）。
 //
 // 缓存键 = sha256(bucket + key + versionId + etag + 参数规范化串)：对象被覆盖/
 // 删除后 etag/version 变化，旧缓存条目自然失效（残留由 LRU 容量回收清理）。
-// 存储位置 <db_dir>/sys/gimg_cache/（系统数据区，明文派生图，与底层加密库分离）；
-// 条目为 <hash>.bin（结果字节）+ <hash>.meta（content-type 的 JSON）。
-// 容量上限 s3.image_cache_mb（默认 1024，-1 不限）：写满后按 mtime 从旧到新淘汰。
-// 单飞（single-flight）：并发同参数请求只处理一次，其余等结果落缓存。
+// 后端（s3.image_cache_backend）：
+//   - memory（默认）：统一内存缓存 "g:<sha256>"，计入 mem_cache_mb 预算，不落盘；
+//   - disk：<db_dir>/sys/gimg_cache/（系统数据区，明文派生图，与底层加密库分离）；
+//     条目为 <hash>.bin（结果字节）+ <hash>.meta（content-type 的 JSON）。
+//
+// 磁盘后端容量上限 s3.image_cache_mb（默认 1024，-1 不限）：写满后按 mtime 从旧
+// 到新淘汰。单飞（single-flight）：并发同参数请求只处理一次，其余等结果落缓存。
 package s3
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -23,14 +27,20 @@ import (
 	"glaciertdb/internal/logx"
 )
 
-// imgCache 磁盘缓存器（dir 空 = 功能关闭，所有操作变 no-op）。
+// imgCache 图片派生缓存器（v1.4.0 双后端）：
+//   - memory：落统一内存缓存（"g:<sha256>"，计入 mem_cache_mb 预算；image_cache_mb
+//     不生效），不写 <db_dir>/sys/gimg_cache/；
+//   - disk：原磁盘目录路径（<hash>.bin + <hash>.meta，mtime LRU）。
+//
+// dir 空 = 功能关闭（memory 后端不受此限）；对外接口 get/put/do/key/enabled 不变。
 type imgCache struct {
-	dir      string
-	maxBytes int64 // -1 = 不限
+	dir      string    // 磁盘后端目录（memory 后端恒空）
+	maxBytes int64     // 磁盘后端容量上限（-1 = 不限）
+	mem      *memCache // memory 后端（nil = 磁盘后端；v1.4.0）
 
-	mu       sync.Mutex
-	flights  map[string]*imgCacheFlight
-	writes   atomic.Int64 // 自上次清理以来的写入字节数（触发阈值后异步 enforce）
+	mu        sync.Mutex
+	flights   map[string]*imgCacheFlight
+	writes    atomic.Int64 // 自上次清理以来的写入字节数（触发阈值后异步 enforce）
 	enforcing atomic.Bool
 }
 
@@ -47,11 +57,22 @@ type imgCacheMeta struct {
 	CreatedTS   string `json:"ts"`
 }
 
-// newImgCache 创建缓存器（dir 空 或 maxMB==0 关闭；maxMB<0 = 不限容量）。
-func newImgCache(dir string, maxMB int) *imgCache {
+// imgMemKey 内存后端缓存键（统一内存缓存命名空间 "g:"）。
+func imgMemKey(hash string) string { return "g:" + hash }
+
+// newImgCache 创建缓存器（v1.4.0：backend=memory 走统一内存缓存——mem 为 nil
+// 时（mem_cache 关闭）告警回退磁盘后端；dir 空 或 maxMB==0 关闭）。
+func newImgCache(dir string, maxMB int, backend string, mem *memCache) *imgCache {
 	c := &imgCache{flights: map[string]*imgCacheFlight{}}
 	if dir == "" || maxMB == 0 {
 		return c
+	}
+	if backend == "memory" {
+		if mem != nil {
+			c.mem = mem
+			return c
+		}
+		logx.Warnf("s3: image_cache_backend=memory but s3.mem_cache is disabled — falling back to disk")
 	}
 	c.dir = filepath.Join(dir, "gimg_cache")
 	c.maxBytes = int64(maxMB) << 20
@@ -62,8 +83,8 @@ func newImgCache(dir string, maxMB int) *imgCache {
 	return c
 }
 
-// enabled 缓存是否启用。
-func (c *imgCache) enabled() bool { return c != nil && c.dir != "" }
+// enabled 缓存是否启用（memory 后端与磁盘后端任一就绪即启用）。
+func (c *imgCache) enabled() bool { return c != nil && (c.dir != "" || c.mem != nil) }
 
 // key 计算缓存键（对象身份 + 参数规范化串）。
 func (c *imgCache) key(bucket, key, versionID, etag string, p imgParams) string {
@@ -83,9 +104,18 @@ func (c *imgCache) key(bucket, key, versionID, etag string, p imgParams) string 
 func (c *imgCache) binPath(hash string) string  { return filepath.Join(c.dir, hash+".bin") }
 func (c *imgCache) metaPath(hash string) string { return filepath.Join(c.dir, hash+".meta") }
 
-// get 命中则返回结果与 content-type（并 touch mtime 维持 LRU 语义）。
+// get 命中则返回结果与 content-type（磁盘后端并 touch mtime 维持 LRU 语义）。
 func (c *imgCache) get(hash string) ([]byte, string, bool) {
 	if !c.enabled() {
+		return nil, "", false
+	}
+	if c.mem != nil { // (v1.4.0) 内存后端：封包 [ctLen u16][ct][data]
+		if raw, ok := c.mem.get(imgMemKey(hash)); ok && len(raw) >= 2 {
+			n := int(binary.BigEndian.Uint16(raw[:2]))
+			if 2+n <= len(raw) {
+				return raw[2+n:], string(raw[2 : 2+n]), true
+			}
+		}
 		return nil, "", false
 	}
 	data, err := os.ReadFile(c.binPath(hash))
@@ -104,9 +134,21 @@ func (c *imgCache) get(hash string) ([]byte, string, bool) {
 	return data, ct, true
 }
 
-// put 写入条目（临时文件 + 原子改名），超阈值后异步触发容量回收。
+// put 写入条目（memory 后端：统一内存缓存封包；磁盘后端：临时文件 + 原子改名，
+// 超阈值后异步触发容量回收）。
 func (c *imgCache) put(hash string, data []byte, ct string) {
 	if !c.enabled() || len(data) == 0 {
+		return
+	}
+	if c.mem != nil { // (v1.4.0) 内存后端：计入 mem_cache_mb 统一预算（LRU 自管）
+		if len(ct) > 65535 {
+			ct = ct[:65535]
+		}
+		buf := make([]byte, 2+len(ct)+len(data))
+		binary.BigEndian.PutUint16(buf[:2], uint16(len(ct)))
+		copy(buf[2:], ct)
+		copy(buf[2+len(ct):], data)
+		c.mem.put(imgMemKey(hash), buf, int64(len(buf)))
 		return
 	}
 	meta, _ := json.Marshal(imgCacheMeta{ContentType: ct, CreatedTS: nowTS()})
@@ -164,9 +206,10 @@ func (c *imgCache) do(hash string, fn func() ([]byte, string, error)) ([]byte, s
 	return data, ct, err
 }
 
-// enforce 容量回收：目录内 .bin 按 mtime 从旧到新删除，直至总量 ≤ maxBytes。
+// enforce 容量回收：仅磁盘后端（目录内 .bin 按 mtime 从旧到新删除，直至总量
+// ≤ maxBytes）；memory 后端由统一内存缓存 LRU 自管，no-op。
 func (c *imgCache) enforce() {
-	if !c.enabled() || c.maxBytes <= 0 {
+	if !c.enabled() || c.mem != nil || c.maxBytes <= 0 {
 		return
 	}
 	entries, err := os.ReadDir(c.dir)

@@ -381,6 +381,11 @@ func (s *Store) CompleteMultipart(bucket, key, uploadID string, parts []PartSpec
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	// (v1.4.0 S6) 锁内 WORM 复检（TOCTOU 兜底，与锁前检查同语义）
+	if err := s.lockRecheckLocked(b, key); err != nil {
+		return out, false, err
+	}
+
 	// versioning 桶：uploadId 即最终版本号（分块行无需搬动）；
 	// 非 versioning 桶：最终 version_id=''，暂存行随后改写。
 	versionID := ""
@@ -542,6 +547,9 @@ func (s *Store) CompleteMultipart(bucket, key, uploadID string, parts []PartSpec
 	if err := tx.Commit(); err != nil {
 		return out, false, err
 	}
+	// (v1.4.0) 该 key 缓存失效（读缓存 + 纯内存命名空间）
+	s.memCacheInvalidatePrefix(oBucketPrefix(bucket, key))
+	s.memObjDel(bucket, key)
 
 	s.AddUsage(b.Owner, bucket, "PUT", total, 0)
 

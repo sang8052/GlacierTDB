@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -122,6 +123,24 @@ func (s *Store) spoolMemMax() int {
 		m = 1 << 20
 	}
 	return m
+}
+
+// lockRecheckLocked 写锁内 WORM 复检（v1.4.0 S6，TOCTOU 兜底）：锁前 HeadObject
+// 检查与真正写事务之间存在窗口——SetLegalHold / SetRetain 同样要拿 writeMu，
+// 完全可能插在「锁前检查之后、写锁获取之前」。持锁后对当前最新版本再判一次，
+// 与锁前检查同语义（仅非 versioning 覆盖场景；versioning 写新版本不覆盖旧版本）。
+func (s *Store) lockRecheckLocked(b Bucket, key string) error {
+	if b.Versioning {
+		return nil
+	}
+	cur, err := s.headLatestLocked(b, key)
+	if err != nil {
+		if se, ok := err.(*s3Error); ok && se.Code == "NoSuchKey" {
+			return nil // 无既有对象（或仅删除标记）：无覆盖面，放行
+		}
+		return err
+	}
+	return cur.lockViolation(false)
 }
 
 func newSpool(tmpDir string, memMax int) *spool {
@@ -271,6 +290,12 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	// (v1.4.0 S6) 锁内 WORM 复检（TOCTOU 兜底）：锁前检查到拿锁之间，SetLegalHold
+	// / SetRetain 可持锁插入——覆盖语义与锁前检查一致
+	if err := s.lockRecheckLocked(b, key); err != nil {
+		return out, false, err
+	}
+
 	tx, err := s.db.Begin()
 	if err != nil {
 		return out, false, err
@@ -332,6 +357,16 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 		return out, false, err
 	}
 
+	// (v1.4.0) 写路径缓存失效：该 key 全版本读缓存（o: 前缀，键带 version/etag
+	// 本就错位即 miss，此处是空间卫生）+ 纯内存对象命名空间（权威副本唯一化）。
+	// deleteObjectRowsTx 已覆盖非 versioning 路径，这里统一再清一次（幂等）。
+	s.memCacheInvalidatePrefix(oBucketPrefix(bucket, key))
+	s.memObjDel(bucket, key)
+	// 热身：新写的内联内容直接进读缓存（write-then-read 场景首读即命中）
+	if storage == "inline" && s.mem != nil {
+		s.mem.put(ocacheKey(bucket, key, versionID, etag), content, int64(len(content)))
+	}
+
 	// 闪传索引登记（v1.3.13）：仅分块对象（≤内联阈值小对象无共享收益，不登记；
 	// multipart 合并对象不在写路径流式，亦不登记——见 docs/S3对象存储.md）
 	if storage == "chunk" {
@@ -351,7 +386,10 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 
 // deleteObjectRowsTx 删除对象行 + 分块引用行，并释放池引用（单事务内；
 // versionID 空 = 该 key 的全部正式行 version_id=''）。调用方持 writeMu。
+// (v1.4.0) 行删除即失效该 key 读缓存 + 纯内存命名空间（事务回滚时只是多余 miss）。
 func (s *Store) deleteObjectRowsTx(tx *sql.Tx, b Bucket, key, versionID string) error {
+	s.memCacheInvalidatePrefix(oBucketPrefix(b.Name, key))
+	s.memObjDel(b.Name, key)
 	tbl := chunkTableFor(b.TableName)
 	hashes, err := s.collectChunkHashes(tbl, key, versionID)
 	if err != nil {
@@ -401,7 +439,14 @@ const objectCols = `key,version_id,is_latest,delete_marker,size,etag,content_typ
 	cache_control,content_disposition,metadata,storage,manifest,legal_hold,retention_mode,retain_until,created_ts`
 
 // HeadObject 查对象元数据（versionID 空 = 最新版本；不存在返回 NoSuchKey）。
+// (v1.4.0) 纯内存对象优先：内存对象单版本（VersionID 恒空），带 versionId 的
+// 查询不命中内存命名空间、照旧走库。
 func (s *Store) HeadObject(bucket, key, versionID string) (ObjectMeta, error) {
+	if versionID == "" {
+		if mo, ok := s.memObjMeta(bucket, key); ok {
+			return mo, nil
+		}
+	}
 	b, err := s.Bucket(bucket)
 	if err != nil {
 		return ObjectMeta{}, err
@@ -497,12 +542,19 @@ func (c *contentReader) fetchNext() error {
 				return io.EOF
 			}
 			var data []byte
-			err := c.store.db.QueryRow(`SELECT data FROM s3_chunks WHERE hash=?`, c.hashes[c.hidx]).Scan(&data)
-			if err == sql.ErrNoRows {
-				return io.EOF
-			}
-			if err != nil {
-				return err
+			// (v1.4.0) chunk 池读缓存："c:<poolKey>"——内容寻址（数据不可变），
+			// 无需失效；热点对象 Range/整读免 SQL 大 BLOB 拉取
+			if b, ok := c.store.memCacheGet("c:" + c.hashes[c.hidx]); ok {
+				data = b
+			} else {
+				err := c.store.db.QueryRow(`SELECT data FROM s3_chunks WHERE hash=?`, c.hashes[c.hidx]).Scan(&data)
+				if err == sql.ErrNoRows {
+					return io.EOF
+				}
+				if err != nil {
+					return err
+				}
+				c.store.memCachePut("c:"+c.hashes[c.hidx], data)
 			}
 			c.hidx++
 			if len(data) == 0 { // 池行空数据（理论不该出现）：跳过
@@ -665,6 +717,24 @@ func (s *Store) GetObjectRange(bucket, key, versionID string, start, length int6
 }
 
 func (s *Store) getObjectRange(bucket, key, versionID string, start, length int64) (ObjectMeta, io.ReadCloser, error) {
+	// (v1.4.0) 纯内存对象：内容就在内存，直接出内联读取器（versionId 不适用）
+	if versionID == "" {
+		if mo, body, ok := s.memObjGet(bucket, key); ok {
+			if start > mo.Size {
+				return mo, nil, &s3Error{Code: "InvalidRange", Status: 416,
+					Msg: fmt.Sprintf("Range start %d is beyond object size %d", start, mo.Size)}
+			}
+			if length < 0 || start+length > mo.Size {
+				length = mo.Size - start
+			}
+			content := body
+			if start > 0 || start+length < int64(len(content)) {
+				content = content[start : start+length]
+			}
+			// remain=-1：inline 缓冲即最终字节（已按需切片），不限长输出
+			return mo, &contentReader{inline: true, buf: content, remain: -1}, nil
+		}
+	}
 	b, err := s.Bucket(bucket)
 	if err != nil {
 		return ObjectMeta{}, nil, err
@@ -701,10 +771,18 @@ func (s *Store) getObjectRange(bucket, key, versionID string, start, length int6
 	}
 	// 内容
 	if m.Storage == "inline" {
+		// (v1.4.0) 热点内联对象读缓存：稳定键 bucket+key+version+etag（错位即
+		// miss，见 memcache.go 文件头），GET 路径零 SQL 内容读取
 		var content []byte
-		if err := s.db.QueryRow(fmt.Sprintf(`SELECT content FROM %s WHERE key=? AND version_id=?`, b.TableName),
-			key, m.VersionID).Scan(&content); err != nil {
-			return ObjectMeta{}, nil, err
+		ck := ocacheKey(bucket, key, m.VersionID, m.ETag)
+		if hit, ok := s.memCacheGet(ck); ok {
+			content = hit
+		} else {
+			if err := s.db.QueryRow(fmt.Sprintf(`SELECT content FROM %s WHERE key=? AND version_id=?`, b.TableName),
+				key, m.VersionID).Scan(&content); err != nil {
+				return ObjectMeta{}, nil, err
+			}
+			s.memCachePut(ck, content)
 		}
 		if start > 0 || start+length < int64(len(content)) {
 			content = content[start : start+length]
@@ -745,6 +823,19 @@ func (s *Store) DeleteObject(bucket, key, versionID string, bypassGovernance boo
 	b, err := s.Bucket(bucket)
 	if err != nil {
 		return ObjectMeta{}, err
+	}
+	// (v1.4.0) 纯内存对象：删除即移除（单版本覆盖语义，无版本链 / 删除标记；
+	// 对象锁不适用——内存对象无 SQLite 行可挂）。带 versionId 的查询不命中内存
+	// 命名空间（内存对象无版本），照旧走库。
+	if versionID == "" {
+		if mo, ok := s.memObjDel(bucket, key); ok {
+			s.AddUsage(b.Owner, bucket, "DELETE", 0, 0)
+			if s.syncHook != nil {
+				s.syncHook.objectDeleted(bucket, key)
+			}
+			return ObjectMeta{Key: key, IsLatest: true, Size: mo.Size, ETag: mo.ETag,
+				ContentType: mo.ContentType, CreatedTS: mo.CreatedTS}, nil
+		}
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
@@ -976,8 +1067,64 @@ func (s *Store) ListObjects(bucket, prefix, delimiter, marker, startAfter string
 		})
 		count++
 	}
+	// (v1.4.0) 合并纯内存对象（简化语义：追加在 SQL 结果之后——prefix 过滤 +
+	// marker 下界 + delimiter 折叠 + maxKeys 触顶置 IsTruncated；不参与公共前缀
+	// 与 SQL 行的精确交叉分页，只保证可见性。键冲突以 SQL 行为准——写路径保证
+	// 同 key 写入清除内存对象，此处兜底去重）
+	s.mergeMemObjects(bucket, prefix, delimiter, after, &res, maxKeys, &count, seenPrefix)
 	s.AddUsage(b.Owner, bucket, "LIST", 0, 0)
 	return res, nil
+}
+
+// mergeMemObjects LIST 结果并入纯内存对象（v1.4.0；见 ListObjects 调用点注释）。
+func (s *Store) mergeMemObjects(bucket, prefix, delimiter, after string, res *ListResult,
+	maxKeys int, count *int, seenPrefix map[string]bool) {
+	metas := s.memObjMetas(bucket)
+	if len(metas) == 0 {
+		return
+	}
+	have := make(map[string]bool, len(res.Entries))
+	for _, e := range res.Entries {
+		have[e.Key] = true
+	}
+	keys := make([]string, 0, len(metas))
+	for k := range metas {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if k <= after || have[k] {
+			continue
+		}
+		if prefix != "" && !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		m := metas[k]
+		if delimiter != "" {
+			rest := strings.TrimPrefix(k, prefix)
+			if i := strings.Index(rest, delimiter); i >= 0 {
+				cp := prefix + rest[:i+len(delimiter)]
+				if !seenPrefix[cp] {
+					if *count >= maxKeys {
+						res.IsTruncated = true
+						return
+					}
+					seenPrefix[cp] = true
+					res.CommonPrefixes = append(res.CommonPrefixes, cp)
+					*count++
+				}
+				continue
+			}
+		}
+		if *count >= maxKeys {
+			res.IsTruncated = true
+			return
+		}
+		res.Entries = append(res.Entries, ListEntry{
+			Key: k, Size: m.Size, ETag: m.ETag, LastModified: m.CreatedTS, IsLatest: true,
+		})
+		*count++
+	}
 }
 
 // ListVersions 列对象版本链（含删除标记）。
@@ -1237,6 +1384,10 @@ func (s *Store) copyObjectRefs(srcBucket, srcKey string, m ObjectMeta, dstBucket
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	// (v1.4.0 S6) 锁内 WORM 复检（TOCTOU 兜底，与锁前检查同语义）
+	if err := s.lockRecheckLocked(db, dstKey); err != nil {
+		return out, err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return out, err
@@ -1296,6 +1447,9 @@ func (s *Store) copyObjectRefs(srcBucket, srcKey string, m ObjectMeta, dstBucket
 	if err := tx.Commit(); err != nil {
 		return out, err
 	}
+	// (v1.4.0) 目标 key 缓存失效（读缓存 + 纯内存命名空间）
+	s.memCacheInvalidatePrefix(oBucketPrefix(dstBucket, dstKey))
+	s.memObjDel(dstBucket, dstKey)
 	s.AddUsage(db.Owner, dstBucket, "PUT", 0, 0) // 零拷贝：不计 bytes_in（内容未经过网络/磁盘重写）
 
 	out = ObjectMeta{
@@ -1447,6 +1601,12 @@ func (s *Store) MoveObject(srcBucket, srcKey, dstBucket, dstKey string, _ Object
 	if err := tx.Commit(); err != nil {
 		return ObjectMeta{}, err
 	}
+
+	// (v1.4.0) 源/目标 key 缓存失效（读缓存 + 纯内存命名空间）
+	s.memCacheInvalidatePrefix(oBucketPrefix(srcBucket, srcKey))
+	s.memCacheInvalidatePrefix(oBucketPrefix(dstBucket, dstKey))
+	s.memObjDel(srcBucket, srcKey)
+	s.memObjDel(dstBucket, dstKey)
 
 	s.AddUsage(db.Owner, dstBucket, "PUT", 0, 0)
 	s.AddUsage(sb.Owner, srcBucket, "DELETE", 0, 0)
