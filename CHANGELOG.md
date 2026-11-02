@@ -2,6 +2,118 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
+## [1.4.0.beta] - 2026-11-03
+
+> 版本主题「**安全加固 + 四线性能重构**」：全仓安全审计修复（SSRF / 越权 / TOCTOU
+> 等 13 项）+ MySQL 查询性能重构 + SQL 错误消息 MySQL 标准化 + Redis 层重构
+>（分片锁 / 异步落盘 / 独立运算核）+ MQ 写后落盘 + S3 内存缓存（内存换硬盘）
+> 与打包下载 vhost 修复。
+>
+> **2H4G 对位实测**（docs/性能损失与比较.md §2.1）：MySQL 简单查询 13%→**39%**（达
+> mysql:8 的 1/3 目标）、Redis getset 3%→**71.6%**（达 redis:7 的 1/2 目标，最高单轮
+> 53k ops/s）、MQ durable 发布 26%→**94.5~101.9%**（反超 rabbitmq:3.13）、插入 38%±
+> （UNIQUE 约束修复后索引维护为真实开销）；未达标：Redis 队列 21%（110× 于基线，
+> C 内核地板差距）、MQ 消费 22%（客户端 RTT 主导，与基线持平）。
+
+### 安全（S1–S13）
+- **S1（高危）scoped AK 前缀越权**：`x-glacier-archive` 打包下载此前不参与 AK
+  scope 前缀校验——带 `prefixes` 收窄的密钥可用「任意越界 archive 前缀 + 范围内
+  dummy `prefix` 参数」绕过校验整前缀拖库；现 archive 请求以 `x-glacier-archive`
+  值作前缀探测参与校验，越界 403。
+- **S2 回调 SSRF 防护**：新增 `internal/netguard` 包；租户可控回调
+  （S3 `x-glacier-callback-url` 头、`SUBMIT QUERY ... CALLBACK`）统一按
+  `security.callback_net_policy` 校验：`standard`（默认）封回环/链路本地
+  （含 169.254.169.254 云元数据端点）、`strict` 加封全部私网段、`open` 仅限
+  scheme；回调 client 一律禁跟随重定向 + 连接期解析 IP 复核（防 DNS rebinding）；
+  SUBMIT 提交期即校验拒绝，S3 回调 URL 非法直接拒绝 PUT。
+- **S3 口令比较常数时间化**：kv/mq/mqtt 认证路径 `!=` 改 `subtle.ConstantTimeCompare`。
+- **S4 `SHOW S3 TOKENS` 脱敏**：魔法 Token 即 bearer 凭证，非 super 一律
+  `前8位****` 展示（此前 readonly 账号可读出全部活跃 token 直访对象）。
+- **S5 自定义域名白名单**：`ALTER BUCKET ... ADD DOMAIN` host 强制
+  `^[A-Za-z0-9._*-]+$` + 落盘前 `filepath.Base` 复核（防 `..`/反斜杠证书路径穿越）。
+- **S6 WORM/legal-hold 锁内复检**：PutObject / Complete / copy / flash 在拿写锁后
+  对保留状态二次校验，封「锁前检查与拿锁之间被 SetLegalHold/SetRetain」TOCTOU 窗口。
+- **S7 内部错误脱敏**：S3 非 s3Error 的 500 统一 `InternalError` + request-id，
+  内部路径/驱动细节只进 error_log，不再回客户端。
+- **S8 打包下载 zip-slip**：tar/zip 条目名清洗（剥前导 `/`、`..` 段替换、连续 `/` 压缩）。
+- **S9 UsageCSV 公式注入**：owner/bucket 值首字符 `=+-@	` 时补 `'` 前缀。
+- **S10 KV SOURCE 回源加固**：内联值拒绝 NUL 字符 + 模板长度上限（真参数绑定
+  受只读执行器签名限制，列为后续项）。
+- **S11 aws-chunked 逐块签名校验**：STREAMING-AWS4-HMAC-SHA256-PAYLOAD 每块
+  chunk-signature 入签名链校验（UNSIGNED-TRAILER 照常跳过 trailer 段），HTTP 明文
+  端点上传输中被篡改可发现。
+- **S12 默认口令启动告警**：静态加密使用内置默认口令时启动日志告警（行为不变，
+  改默认值会破坏存量数据）。
+- **S13 全局连接上限**：`max_connections` 此前仅 KV 面生效，现 TCP/UDS 全协议
+  统一记账，超限拒绝并限频日志。
+
+### 性能（MySQL 面）
+- **auth 世代缓存**：每查询对 glacier_auth 库（单物理连接）的账号类型 SELECT
+  （全并发串行化的最大瓶颈）改为世代号原子比对直读，用户/权限写路径统一 bump。
+- **prepared statement 会话级 LRU**：ncruces WASM 驱动每查询 compile/finalize
+  → 按语句文本缓存 `*sql.Stmt`（`sqlite.stmt_cache_size` 默认 256，-1 关闭；
+  切库/关闭清理）。
+- **改写管线快路径**：约 60 触发词并集单趟判定，纯 SELECT（无反引号/@@/::
+  /日期函数等）跳过全部方言改写重扫描；`RewriteDBPrefix` 与浮点列谓词等
+  7 处每查询现场 `MustCompile` 全部提为包级或 `sync.Map` 缓存。
+- **QoS/信号量零开销**：配额全零与不限额信号量走原子快路径（每查询省 6–8 次锁操作）。
+- **结果集减拷贝**：`BuildResultset` 空值规范化就地改写，消除逐行深拷贝。
+- `sqlite.cache_size_kb` 默认 256→2048。
+- **SQL 审计日志缓冲批量落盘**：逐行 write syscall 改 64KB 缓冲 + 200ms 周期落盘
+  （点查场景审计开销约占 1/3，缓冲后趋近于零；异常退出丢 ≤ 一个窗口审计行）。
+- **UNIQUE KEY 建表修复**：`UNIQUE KEY uk(cols)` 此前被方言改写整段删除（唯一约束
+  静默丢失、重复插入不报错）→ 转换为 SQLite 表级 `UNIQUE(cols)` 约束；DDL 一律
+  走完整改写（快路径不再跳过）。
+- **空语句防护**：纯注释/空白语句（mysql CLI 批量脚本首块）此前交 SQLite 预备得到
+  零语句、驱动执行期 panic 断连 → 提前识别返回 OK；查询/执行路径加 panic→error 兜底。
+
+### SQL 错误 MySQL 标准化
+- 新 `internal/meta/errmap.go` 统一映射：`no such table`→1146 `Table 'x' doesn't
+  exist`、`no such column`→1054、`no such function`→1305、UNIQUE→1062、
+  NOT NULL→1048、CHECK→3819、FOREIGN KEY→1452、`already exists`→1050、语法错→1064
+  标准文案、`database is locked`→1205、readonly→1290；此前「表不存在也报 1064 +
+  SQLite 原文裸透传」，ORM/客户端可按错误码分支；async/admin 面裸透传点一并收口。
+
+### 性能（KV / Redis 面）
+- **分片锁**：全局单 `sync.Mutex` 拆 16 分片（FNV(ns+key)），多连接命令并行；
+  LRU 改双向链表 O(1) 摘除（原每淘汰一键 O(全库) 扫描）；内存估值增量维护
+  （原 O(list 长) 且 Push/Pop 双算）。
+- **异步落盘模式**（`kv.persist_mode: async`，默认 sync 保持原语义）：写命令只改
+  内存 + 标脏，后台按 `kv.async_flush_ms`（默认 200）单事务批量落盘；崩溃丢失
+  ≤ flush 窗口（适合作缓存/计数器）；优雅停机（SIGTERM/SIGINT）自动补刷丢失窗口为 0；
+  sync 模式同样收益：每命令 2–3 条隐式事务合并单事务。
+- **独立运算核模式**（`kv.dedicated_core`，仅 Linux）：RESP 命令单线程串行执行 +
+  `SchedSetaffinity` 绑核（`kv.core_cpu`，-1 自动选末核），隔离 MySQL/S3 调度噪声；
+  非 Linux 自动忽略。INFO 输出运行模式与 flush 计数。
+- **RESP IO 去开销**：应答 `fmt.Fprintf` 改字节缓冲直写、读路径复用缓冲。
+
+### 性能（MQ 面）
+- **路由内存缓存**：exchange/queue/binding 常驻内存（declare/bind 写穿），
+  发布热路径不再逐消息查库。
+- **写后落盘**（`mq.async_flush_ms` 默认 200，0=回退同步路径）：durable 消息进
+  内存 journal，后台单事务批量 INSERT 后才 publisher confirm / 派发；transient
+  （delivery_mode=1）纯内存不入库；优雅停机补刷；journal 积压 >4096 触发背压。
+- **派发/ACK 批量化**：批量取消息 + `UPDATE ... WHERE id IN`，ACK 免逐条
+  SELECT；统计改内存聚合周期落库；空闲派发循环 50ms→250ms 退避。
+- **帧写 bufio 化**：AMQP 每帧 3 次 write 合并为缓冲写。
+
+### S3 内存缓存（内存换硬盘）
+- 新 `internal/s3/memcache.go` 统一 LRU 字节缓存（预算 `s3.mem_cache_mb` 默认 128，
+  0 关 / -1 不限；单条目上限 `s3.mem_cache_item_mb` 默认 4MB）：
+  - **热点对象读缓存**：inline 内容与 chunk 池块按（桶,key,version,etag）/(池键)
+    命中免 SQL，写路径失效；
+  - **纯内存对象**：PUT 带 `x-glacier-memory: true`（不参与签名）→ 元数据+内容
+    仅存内存，GET/HEAD/LIST/DELETE 可见，重启即失（缩略图/验证码等可丢失数据不再写盘）；
+  - **图片派生缓存内存后端**：`s3.image_cache_backend` 默认 `memory`（原磁盘目录
+    `gimg_cache/` 不再写入，`disk` 可回退），复用 LRU+single-flight 外壳；
+  - `SHOW S3 STATS` 增补内存缓存 hit/miss/bytes/evicted。
+
+### 修复
+- **打包下载 vhost 三形态修复**：virtual-host 端点上 `/bucket?x-glacier-archive=`
+  （文档形态打到 vhost 域名，path 段被当 key 报 404）、`/prefix?x-glacier-archive=`
+  现正确剥离/映射；`handleObject` 带 archive 参数转投打包下载；HEAD 支持；
+  archive 前缀值剥前导 `/`。
+
 ## [1.3.14.beta] - 2026-10-29
 
 > 版本主题「**权限体系与 S3 能力补全**」：S3 桶共享模型（§1）+ AK 细粒度资源

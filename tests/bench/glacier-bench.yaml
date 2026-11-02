@@ -1,0 +1,67 @@
+# GlacierTDB 基准测试配置（bench_2h4g.sh 的 gt-bench 容器专用，v1.4.0）
+#
+# 与线上测试配置 /tmp/glacier-async.yaml 同基线（账号/库/S3 端点一致，保证
+# 跨版本可比），另外显式打开 v1.4.0 性能模式：
+#   - kv.persist_mode: async      内存缓存+异步落盘（可丢失场景，崩溃丢 ≤ flush 窗口）
+#   - kv.dedicated_core: true     独立运算核（RESP 命令单线程串行+绑核）
+#   - mq.async_flush_ms: 20       durable 消息内存 journal 写后批量落盘
+#   - sqlite.stmt_cache_size / cache_size_kb  v1.4.0 新默认已含（显式声明便于核对）
+# 对照组（mysql:8 / redis:7 / rabbitmq:3.13 / minio）各容器独占同规格资源，
+# 详见 bench_2h4g.sh 头注。
+
+listen: 0.0.0.0:3309
+db_dir: /data
+default_db: backup
+auth:
+  user: glacier
+  password: "iloveyou~"
+log:
+  sql_log_file: /data/sql.log   # v1.4.0 起缓冲批量落盘，对查询路径影响极小（口径与 v1.3.14 基线一致）
+
+sqlite:
+  synchronous: NORMAL
+  busy_timeout_ms: 5000
+  cache_size_kb: 2048
+  stmt_cache_size: 256
+  wal_autocheckpoint: 1000
+  journal_size_limit_kb: 65536
+  max_result_rows: 1000000
+
+mux_sniff_ms: 40
+
+kv:
+  enable: true
+  max_memory_mb: 0
+  eviction: allkeys-lru
+  scan_interval_sec: 5
+  persist_mode: async
+  async_flush_ms: 20
+  dedicated_core: false   # 基准口径：与 v1.3.14 基线（无运算核）同构。
+                          # dedicated_core:true 为延迟隔离模式（跨组件调度噪声隔离），
+                          # 单命令同步投递有吞吐开销，吞吐敏感场景保持 false
+  core_cpu: -1
+
+mq:
+  enable: true
+  max_message_mb: 32
+  async_flush_ms: 20
+  server_version: "3.13.0"
+  mqtt:
+    enable: true
+    ws_path: /mqtt
+
+async_query:
+  enable: true
+
+s3:
+  enable: true
+  region: "*"
+  endpoints:
+    - listen: 0.0.0.0:9000
+      server_names: [glacier-s3.local]
+  # v1.4.0 内存缓存：热点对象/纯内存对象/图片派生缓存统一预算（内存换硬盘）
+  mem_cache: true
+  mem_cache_mb: 512
+  mem_cache_item_mb: 8
+  image_cache: true
+  image_cache_backend: memory

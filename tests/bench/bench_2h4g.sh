@@ -55,8 +55,11 @@ bench_target () {  # bench_target <group> <label> <extra-args...>
 # ① GlacierTDB（真实形态五组件全开）
 # ---------------------------------------------------------------------------
 docker rm -f gt-bench >/dev/null 2>&1 || true
+GT_DATA=$(mktemp -d /tmp/gt-bench-data.XXXX)   # 一次性全新数据目录：杜绝上一轮 MQ 积压
+                                               # 消息（重启全量载内存）与 KV/S3 残留污染本轮口径
+trap 'rm -rf "$GT_DATA"' EXIT
 docker run -d --name gt-bench $CPUARGS $BLKIO --network "$NET" -p 33309:3309 -p 39000:9000 \
-  -v /tmp/gt-bench-data:/data -v /tmp/glacier-async.yaml:/app/config.yaml glaciertdb:latest >/dev/null
+  -v "$GT_DATA":/data -v "$BENCH_DIR/glacier-bench.yaml":/app/config.yaml glaciertdb:latest >/dev/null
 sleep 3
 GT_PW="iloveyou~"
 docker exec gt-bench sh -c 'true' 2>/dev/null || true
@@ -141,10 +144,33 @@ for f in glob.glob(os.path.join(sys.argv[1], "*.jsonl")):
                 pass
 from collections import defaultdict
 med = defaultdict(list)
+unit_of = {}
 for r in rows:
     med[(r["capability"], r["target"], r["scenario"])].append(r["value"])
-print("%-8s %-12s %-18s %12s" % ("cap", "target", "scenario", "median"))
-for k in sorted(med):
-    v = sorted(med[k])
-    print("%-8s %-12s %-18s %12.2f %s" % (k[0], k[1], k[2], v[len(v)//2], rows[0]["unit"] if rows else ""))
+    unit_of[(r["capability"], r["scenario"])] = r.get("unit", "")
+# 达标线（v1.4.0 目标口径）：MySQL ≥ 对照 1/3；Redis ≥ 对照 1/2；
+# MQ ≥ 对照 2/3；S3 报告比值不设门槛（v1.3.14 已反超 MinIO）
+GT_RATIO = {"mysql": 1/3, "redis": 1/2, "mq": 2/3}
+print("%-8s %-18s %12s %12s %8s %6s" % ("cap", "scenario", "glaciertdb", "baseline", "ratio", "pass"))
+baselines = {"mysql": "mysql8", "redis": "redis7", "mq": "rabbitmq313", "s3": "minio"}
+fails = []
+for (cap, tgt, sc), v in sorted(med.items()):
+    m = sorted(v)[len(v)//2]
+    base_key = baselines.get(cap)
+    bvals = med.get((cap, base_key, sc))
+    if tgt == "glaciertdb" and bvals:
+        b = sorted(bvals)[len(bvals)//2]
+        ratio = (m / b) if b else 0
+        need = GT_RATIO.get(cap)
+        ok = ("--" if need is None else ("PASS" if ratio >= need else "FAIL"))
+        if ok == "FAIL":
+            fails.append((cap, sc))
+        print("%-8s %-18s %12.2f %12.2f %7.1f%% %6s" % (cap, sc, m, b, ratio*100, ok))
+    elif tgt != "glaciertdb":
+        continue
+print()
+if fails:
+    print("RESULT: FAIL — 未达标场景: %s" % ", ".join("%s/%s" % f for f in fails))
+else:
+    print("RESULT: PASS — 全部达标场景见上表")
 EOF

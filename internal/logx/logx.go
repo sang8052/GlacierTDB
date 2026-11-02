@@ -2,9 +2,10 @@
 package logx
 
 import (
-	"strings"
+	"bufio"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -65,8 +66,25 @@ const sqlLogRotateBytes = 100 << 20 // 100MB
 var (
 	sqlLogMu   sync.Mutex
 	sqlLogFile *os.File
+	sqlLogBuf  *bufio.Writer // v1.4.0：批量缓冲写（此前逐行 write syscall，点查场景约占 1/3 开销）
 	sqlLogSize int64
+	sqlLogOnce sync.Once
 )
+
+// sqlLogFlushLoop 周期把缓冲审计行落盘（200ms；异常退出丢 ≤ 一个窗口的审计行——
+// 审计日志为尽力而为语义，绝不阻塞查询路径）。
+func sqlLogFlushLoop() {
+	go func() {
+		t := time.NewTicker(200 * time.Millisecond)
+		for range t.C {
+			sqlLogMu.Lock()
+			if sqlLogBuf != nil {
+				_ = sqlLogBuf.Flush()
+			}
+			sqlLogMu.Unlock()
+		}
+	}()
+}
 
 // InitSQLLog 打开 SQL 审计日志文件（空路径 = 关闭功能）。
 func InitSQLLog(path string) error {
@@ -83,14 +101,20 @@ func InitSQLLog(path string) error {
 	}
 	sqlLogMu.Lock()
 	sqlLogFile = f
+	sqlLogBuf = bufio.NewWriterSize(f, 64<<10)
 	sqlLogSize = size
 	sqlLogMu.Unlock()
+	sqlLogOnce.Do(sqlLogFlushLoop)
 	return nil
 }
 
 // CloseSQLLog 关闭审计日志文件。
 func CloseSQLLog() {
 	sqlLogMu.Lock()
+	if sqlLogBuf != nil {
+		_ = sqlLogBuf.Flush()
+		sqlLogBuf = nil
+	}
 	if sqlLogFile != nil {
 		sqlLogFile.Close()
 		sqlLogFile = nil
@@ -98,27 +122,30 @@ func CloseSQLLog() {
 	sqlLogMu.Unlock()
 }
 
-// SQLAudit 写一行 JSON 审计记录（语句超长截断）。
+// SQLAudit 写一行 JSON 审计记录（语句超长截断；v1.4.0 起缓冲批量落盘）。
 func SQLAudit(line string) {
 	sqlLogMu.Lock()
 	defer sqlLogMu.Unlock()
-	if sqlLogFile == nil {
+	if sqlLogBuf == nil {
 		return
 	}
 	if !strings.HasSuffix(line, "\n") {
 		line += "\n"
 	}
-	n, _ := sqlLogFile.WriteString(line)
+	n, _ := sqlLogBuf.WriteString(line)
 	sqlLogSize += int64(n)
 	if sqlLogSize >= sqlLogRotateBytes {
+		sqlLogBuf.Flush() // 轮转前先落缓冲
 		path := sqlLogFile.Name()
 		sqlLogFile.Close()
 		_ = os.Rename(path, path+".old") // 单文件轮转
 		if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644); err == nil {
 			sqlLogFile = f
+			sqlLogBuf = bufio.NewWriterSize(f, 64<<10)
 			sqlLogSize = 0
 		} else {
 			sqlLogFile = nil
+			sqlLogBuf = nil
 		}
 	}
 }
