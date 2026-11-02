@@ -65,8 +65,11 @@ var (
 		{regexp.MustCompile(`(?i)\s+COLLATE\s+[A-Za-z0-9_]+`), ""},  // 列级排序规则（v1.3.3）
 		{regexp.MustCompile(`(?i)\s+CHARACTER\s+SET\s+[A-Za-z0-9_]+`), ""},
 		{regexp.MustCompile(`(?i)\s+USING\s+BTREE`), ""}, // 索引存储引擎提示
-		// MySQL 建表内联 KEY/INDEX 段（SQLite 用独立 CREATE INDEX）
-		{regexp.MustCompile(`(?i),\s*(?:UNIQUE\s+)?(?:FULLTEXT\s+|SPATIAL\s+)?(?:KEY|INDEX)\s+` + "`?" + `\w+` + "`?" + `\s*\([^)]*\)`), ""},
+		// MySQL 建表内联 UNIQUE KEY 段 → SQLite 表级 UNIQUE 约束（v1.4.0 修复：
+		// 此前整段删除导致唯一约束静默丢失、重复插入不报 1062）
+		{regexp.MustCompile(`(?i),\s*UNIQUE\s+(?:KEY|INDEX)\s+` + "`?" + `\w+` + "`?" + `\s*\(`), ", UNIQUE ("},
+		// 其余内联 KEY/INDEX 段（普通二级索引，SQLite 用独立 CREATE INDEX）照旧删除
+		{regexp.MustCompile(`(?i),\s*(?:FULLTEXT\s+|SPATIAL\s+)?(?:KEY|INDEX)\s+` + "`?" + `\w+` + "`?" + `\s*\([^)]*\)`), ""},
 		// 表尾属性：) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 ...
 		{regexp.MustCompile(`(?is)\)\s*ENGINE\s*=\s*\w+.*$`), ")"},
 		// v1.3.3：无 ENGINE 前缀的表尾属性兜底（AUTO_INCREMENT=/CHARSET=/COLLATE=/COMMENT=/ROW_FORMAT=…）

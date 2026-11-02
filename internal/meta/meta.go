@@ -211,8 +211,96 @@ func IsAttachStmt(q string) bool { return reAttach.MatchString(q) }
 // RewriteLastInsertID 把 LAST_INSERT_ID() 改写为 SQLite 等价函数。
 func RewriteLastInsertID(q string) string { return reLastInsertIDCall.ReplaceAllString(q, "last_insert_rowid()") }
 
+// dialectTriggerFragments RewriteDialect 全部改写器的触发词并集（v1.4.0 快路径）。
+// 逐项核对来源：RewriteOperators（&& || ! XOR RLIKE BINARY/DIV/0x/字符集前缀）、
+// RewriteJSONOps（->）、expandInterval（INTERVAL）、reDatePred（ISO 日期字面量）、
+// reTimeBucket（time(）、reFromUnix、reNow/reCurdate/reCurtime/reUnixsw、reTrunc、
+// RewriteMySQLCompat（两参 LIMIT/IGNORE/DUPLICATE/FOR UPDATE|SHARE/TIMESTAMPDIFF/
+// RAND/UUID/CONCAT/IF）、RewriteMySQLCompat2（GROUP_CONCAT/CAST/CONVERT/EXTRACT/
+// DATE_ADD 族/TIMESTAMPADD/TRIM/POSITION/SUBSTRING 族/ISNULL/SYSDATE/SEPARATOR/
+// INSERT...SET/UPDATE·DELETE...ORDER BY...LIMIT/CREATE LIKE）、RewriteDDLTypes（CREATE/ALTER）。
+// 反引号/@ 与 ::/DATE_FORMAT/STR_TO_DATE 按保守策略一并触发（可能误伤、绝不漏改）。
+var dialectTriggerFragments = []string{
+	"(?i)^\\s*(CREATE|ALTER|DROP|RENAME)\\b", // DDL 一律走完整改写：UNIQUE KEY uk(cols) 等
+	// MySQL 专有 DDL 语法依赖 RewriteMySQLCompat/RewriteDDLTypes 转换（v1.4.0 修复：
+	// 快路径曾跳过导致 UNIQUE KEY 建表丢唯一索引）
+	"[`@]",             // 反引号标识符 / 用户·系统变量（INSERT SET、DDL 规则等）
+	"::",               // PostgreSQL 风格 cast（保守触发）
+	"->",               // JSON 运算符
+	"&&",               // 逻辑与
+	`\|\|`,             // 逻辑或
+	"![^=]",            // 独立「!」（!= 不触发；RE2 无负向断言）
+	"!$",               // 结尾独立「!」
+	`\bXOR\b`,
+	`\bRLIKE\b`,
+	`\bDIV\b`,
+	`\bBINARY\b`,
+	"N'",               // 字符集引导符（THEN'x' 等误触发可接受）
+	"utf8",             // _utf8' / utf8mb4' 前缀
+	`0[xX][0-9a-fA-F]`, // 十六进制字面量
+	`\bINTERVAL\b`,
+	`\bCURRENT_TIMESTAMP\b`,
+	`\bNOW\s*\(`,
+	`\bCURDATE\s*\(`,
+	`\bCURTIME\s*\(`,
+	`\bUNIX_TIMESTAMP\s*\(`,
+	`\bSYSDATE\s*\(`,
+	`\bFROM_UNIXTIME\s*\(`,
+	`\bDATE_FORMAT\s*\(`,
+	`\bSTR_TO_DATE\s*\(`,
+	`\bTIMESTAMPDIFF\s*\(`,
+	`\bTIMESTAMPADD\s*\(`,
+	`\bDATE_ADD\s*\(`,
+	`\bDATE_SUB\s*\(`,
+	`\bADDDATE\s*\(`,
+	`\bSUBDATE\s*\(`,
+	`\bGROUP_CONCAT\s*\(`,
+	`\bCAST\s*\(`,
+	`\bCONVERT\s*\(`,
+	`\bEXTRACT\s*\(`,
+	`\bPOSITION\s*\(`,
+	`\bTRIM\s*\(`,
+	`\bSUBSTRING\s*\(`,
+	`\bSUBSTR\s*\(`,
+	`\bMID\s*\(`,
+	`\bISNULL\s*\(`,
+	`\bRAND\s*\(`,
+	`\bUUID\b`,
+	`\bCONCAT\s*\(`,
+	`\bIF\s*\(`,
+	`\bTRUNCATE\b`,
+	`LIMIT\s+\d+\s*,`,                        // 两参 LIMIT（LIMIT offset,count）
+	`\bIGNORE\b`,                             // INSERT IGNORE
+	`\bDUPLICATE\b`,                          // ON DUPLICATE KEY UPDATE
+	`\bSEPARATOR\b`,                          // GROUP_CONCAT ... SEPARATOR
+	`\bFOR\s+(UPDATE|SHARE)\b`,               // 行锁子句剥离
+	`\bLOCK\s+IN\b`,                          // LOCK IN SHARE MODE
+	`\bINSERT\b`,                             // INSERT ... SET / IGNORE / ON DUPLICATE（写路径保守全触发）
+	`\bREPLACE\b`,
+	`\bCREATE\b`,                             // DDL 类型映射（含 CREATE TABLE LIKE）
+	`\bALTER\b`,
+	`'\d{4}-`,                                // ISO 日期字面量（ts/time 谓词整数化）
+	`\btime\s*\(`,                            // time(N) 分桶（datetime( 等误触发可接受）
+	`^UPDATE.*\bORDER\s+BY\b.*\bLIMIT\s+\d+`, // UPDATE ... ORDER BY ... LIMIT → rowid 子查询
+	`^DELETE.*\bORDER\s+BY\b.*\bLIMIT\s+\d+`,
+}
+
+// reDialectTrigger 合并触发词正则：命中 = 需要重改写；全部未命中 = 可安全跳过。
+var reDialectTrigger = regexp.MustCompile(`(?is)` + strings.Join(dialectTriggerFragments, "|"))
+
+// RewriteFastPath 判断语句是否可走改写快路径（v1.4.0）：
+// 返回 true = 不含任何改写触发词，可跳过 RewriteDialect 的全套正则重改写
+//（StripComments / RewriteDBPrefix / UnescapeLiterals 等基础改写不在此列，仍须执行）。
+// 保守策略：不确定语法一律按需要改写处理（误触发只损失性能，漏触发破坏正确性）。
+func RewriteFastPath(q string) bool { return !reDialectTrigger.MatchString(q) }
+
 // RewriteDialect 少量 MySQL 函数改写。
 func RewriteDialect(q string) string {
+	// ---- v1.4.0 快路径：无触发词时跳过全套重改写（RewriteLastInsertID 幂等，
+	//      调用链已预处理时为 no-op，未预处理时在此补齐，语义不变）----
+	if !reDialectTrigger.MatchString(q) {
+		return RewriteLastInsertID(q)
+	}
 	// ---- 运算符级改写（v1.3.3 M4；必须在 CONCAT→|| 展开之前：MySQL || 是 OR）----
 	q = RewriteOperators(q)
 	// ---- JSON 运算符（v1.0.10）----
@@ -287,8 +375,9 @@ func expandInterval(q string) string {
 // 探活总入口：handled=true 表示已消费
 // ---------------------------------------------------------------------------
 
-// HandleProbe 处理探活/元语句。MapSQLError 在 main 里注入（避免 import cycle）。
-var MapSQLError = func(err error) error { return err }
+// HandleProbe 处理探活/元语句。MapSQLError 在 main 里注入（避免 import cycle）；
+// v1.4.0 缺省即走 SQLite→MySQL 细化映射（proxy 注入 handler.MapSQLiteErr 时含 QoS 分支）。
+var MapSQLError = func(err error) error { return MapSQLiteToMySQLError(err, "") }
 
 // ColumnTypeLookuper 列类型回放钩子（handler 注入 colmeta：SQLite 声明类型 →
 // 建表时的 MySQL 原始类型；无映射返回 ""，v1.3.3）。
@@ -1141,6 +1230,28 @@ func StripComments(q string) string {
 	return strings.TrimSpace(s)
 }
 
+// reLineComment 行注释（MySQL/SQLite 行注释语义：-- 至行尾；# 至行尾）。
+// 仅用于空语句判定，不参与执行改写——带正文的语句原样透传，SQLite 本身支持
+// `--` 行注释，行为不变。
+var reLineComment = regexp.MustCompile(`--[^
+]*|#[^
+]*`)
+
+// IsEmptyStatement 判断是否空语句（仅注释 / 空白 / 分号，v1.4.0）。
+// 纯注释语句交 SQLite 预备会得到零条语句——ncruces 驱动随后执行必 panic
+//（*Stmt 为 nil，BindCount 解引用），连接随之死亡/挂起；mysql CLI 批量脚本
+//（init_schema.sql 等以注释头开头的文件）会发出这种语句。必须提前拦截。
+// 误判面分析：字符串字面量残留引号/正文必使结果非空，落入正常执行路径；
+// 整体归空只可能发生在「本来就没有可执行内容」的语句上。
+func IsEmptyStatement(q string) bool {
+	s := reBlockComment.ReplaceAllStringFunc(q, func(m string) string {
+		return " " // hint 亦视为占位空白：带 hint 必带正文，hint 本身不构成语句
+	})
+	s = reLineComment.ReplaceAllString(s, " ")
+	s = strings.ReplaceAll(s, ";", " ")
+	return strings.TrimSpace(s) == ""
+}
+
 
 
 // rowGet 越界安全的行取值（PRAGMA 列数随版本/驱动不同）。
@@ -1160,6 +1271,10 @@ func rowGet(row []any, i int) string {
 	}
 }
 
+// dbPrefixReCache 库名 → 编译正则缓存（v1.4.0：此前每查询按库名现场编译，
+// 一条查询一次 MustCompile 是改写管线的隐藏热点）。
+var dbPrefixReCache sync.Map // string → *regexp.Regexp
+
 // RewriteDBPrefix 剥掉查询中「当前库名.表」的库名前缀（客户端工具常发
 // `backup`.`blob_t` / backup.blob_t；SQLite 会把 backup 当附加库名报 no such table）。
 // 仅当前缀库等于当前库名时剥除；其他库名（跨库查询不支持）保持原样交由 SQLite 报错。
@@ -1167,7 +1282,13 @@ func RewriteDBPrefix(q, dbName string) string {
 	if dbName == "" {
 		return q
 	}
-	esc := regexp.QuoteMeta(dbName)
-	re := regexp.MustCompile("(?i)(`" + esc + "`|\"" + esc + "\"|" + esc + ")\\s*\\.\\s*(`[^`]+`|\"[^\"]+\"|[A-Za-z0-9_\\x{4e00}-\\x{9fa5}]+)")
+	var re *regexp.Regexp
+	if v, ok := dbPrefixReCache.Load(dbName); ok {
+		re = v.(*regexp.Regexp)
+	} else {
+		esc := regexp.QuoteMeta(dbName)
+		re = regexp.MustCompile("(?i)(`" + esc + "`|\"" + esc + "\"|" + esc + ")\\s*\\.\\s*(`[^`]+`|\"[^\"]+\"|[A-Za-z0-9_\\x{4e00}-\\x{9fa5}]+)")
+		dbPrefixReCache.Store(dbName, re)
+	}
 	return re.ReplaceAllString(q, "$2")
 }

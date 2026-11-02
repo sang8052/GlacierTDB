@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 
+	"glaciertdb/internal/auth"
 	"glaciertdb/internal/logx"
 	"glaciertdb/internal/meta"
 	"glaciertdb/internal/s3"
@@ -118,6 +119,8 @@ func (h *Handler) handleS3Admin(q string) (*mysql.Result, bool, error) {
 			return h.s3ShowUploads(toks)
 		case up(1) == "S3" && up(2) == "SPACE":
 			return h.s3ShowSpace()
+		case up(1) == "S3" && up(2) == "CACHE":
+			return h.s3ShowCache()
 		case up(1) == "S3" && up(2) == "SYNC":
 			return h.s3ShowSync()
 		}
@@ -199,7 +202,7 @@ func isS3Command(up func(int) string) bool {
 		return up(1) == "BUCKETS" || (up(1) == "S3" && (up(2) == "KEYS" || up(2) == "USAGE" ||
 			up(2) == "LIFECYCLE" || up(2) == "DOMAINS" || up(2) == "POLICIES" || up(2) == "OBJECTS" ||
 			up(2) == "UPLOADS" || up(2) == "SPACE" || up(2) == "SYNC" ||
-			up(2) == "GRANTS" || up(2) == "TOKENS")) // v1.3.14 §1/§4
+			up(2) == "GRANTS" || up(2) == "TOKENS" || up(2) == "CACHE")) // v1.3.14 §1/§4 + v1.4.0 CACHE
 	case "ALTER":
 		return up(1) == "BUCKET" || (up(1) == "S3" && up(2) == "KEY") // SET SCOPE（v1.3.14 §2）
 	case "SET", "CLEAR":
@@ -894,6 +897,15 @@ func (h *Handler) s3ShowSpace() (*mysql.Result, bool, error) {
 	return res, true, err
 }
 
+// s3ShowCache SHOW S3 CACHE：内存缓存观测（v1.4.0「内存换硬盘」）。
+func (h *Handler) s3ShowCache() (*mysql.Result, bool, error) {
+	if h.s3store == nil {
+		return nil, true, mysql.NewError(1105, "S3 module is disabled")
+	}
+	res, err := meta.SimpleRS([]string{"mem_cache_stats"}, [][]any{{h.s3store.MemCacheStats()}})
+	return res, true, err
+}
+
 // s3ShowSync SHOW S3 SYNC：数据主动同步引擎观测（v1.3.13）。
 func (h *Handler) s3ShowSync() (*mysql.Result, bool, error) {
 	if h.s3srv == nil {
@@ -1305,13 +1317,20 @@ func (h *Handler) s3ShowTokens(toks []string) (*mysql.Result, bool, error) {
 			i++
 		}
 	}
+	// v1.4.0 S4：token 即 bearer 凭证（持之可直访对象）——非 super（readonly/其他
+	// 管理面可入账号）一律脱敏展示（前 8 位 + ****），防止只读账号拖库后越权直访
+	maskToken := h.userType != auth.TypeSuper
 	var rows [][]any
 	for _, t := range h.s3store.MagicTokens(user, bucket) {
 		expired := ""
 		if t.ExpiresTS != "" && time.Now().Format("2006-01-02 15:04:05") > t.ExpiresTS {
 			expired = "expired"
 		}
-		rows = append(rows, []any{t.Token, t.Bucket, t.Key, t.Actions, t.GimgParams,
+		tok := t.Token
+		if maskToken && len(tok) > 8 {
+			tok = tok[:8] + "****"
+		}
+		rows = append(rows, []any{tok, t.Bucket, t.Key, t.Actions, t.GimgParams,
 			t.ExpiresTS, t.CreatedBy, t.CreatedTS, expired})
 	}
 	res, err := meta.SimpleRS([]string{"token", "bucket", "key", "actions", "gimg_params",

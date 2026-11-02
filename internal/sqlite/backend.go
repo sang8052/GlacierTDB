@@ -53,6 +53,8 @@ type Backend struct {
 	maxRows int64
 	slowMs  int64
 
+	stmtCacheMax int // 每会话 prepared statement LRU 容量（v1.4.0；<=0 = 禁用）
+
 	dbLocksMu sync.Mutex
 	dbLocks   map[string]*sync.Mutex // 每库一把写锁（惰性创建）：单库单线程，多库并行
 
@@ -76,6 +78,7 @@ type Backend struct {
 }
 
 // Session 是一个客户端连接专属的 SQLite 会话（独占一个物理连接，绑定当前库）。
+// 注意：含互斥量字段，禁止按值拷贝（全部调用方均持 *Session）。
 type Session struct {
 	ID        uint64
 	User      string
@@ -88,6 +91,11 @@ type Session struct {
 	writeMu   *sync.Mutex // AcquireWrite 时记录的锁对象
 	startedAt time.Time
 	qosWaitMs int64 // 最近一次执行的 QoS 排队毫秒
+
+	stmtMu       sync.Mutex        // 保护以下三字段（v1.4.0 会话级语句缓存）
+	stmtCache    map[string]*sql.Stmt
+	stmtLRU      []string          // LRU 序（最旧在前）
+	stmtCacheMax int               // <=0 = 禁用（来自 sqlite.stmt_cache_size）
 }
 
 // NewBackend 创建后端并自检（目录存在/可写、默认库可用）。
@@ -96,6 +104,7 @@ func NewBackend(cfg *config.Config) (*Backend, error) {
 		dir:          cfg.DBDir,
 		maxRows:      cfg.SQLite.MaxResultRows,
 		slowMs:       cfg.Log.SlowQueryMs,
+		stmtCacheMax: cfg.SQLite.StmtCacheSize, // v1.4.0：Fill 后 0 = 关闭
 		authPassword: cfg.Auth.Password,
 		roPassword:   cfg.Auth.ReadOnlyPassword,
 		dbLocks:      make(map[string]*sync.Mutex),
@@ -231,13 +240,14 @@ func (b *Backend) OpenSession(user, remote, defaultDB string) (*Session, error) 
 		return nil, err
 	}
 	s := &Session{
-		ID:        b.sessionSeq.Add(1),
-		User:      user,
-		Remote:    remote,
-		db:        db,
-		backend:   b,
-		currentDB: defaultDB,
-		startedAt: time.Now(),
+		ID:           b.sessionSeq.Add(1),
+		User:         user,
+		Remote:       remote,
+		db:           db,
+		backend:      b,
+		currentDB:    defaultDB,
+		startedAt:    time.Now(),
+		stmtCacheMax: b.stmtCacheMax, // v1.4.0 语句缓存容量
 	}
 	if _, _, err := s.Exec("SELECT 1"); err != nil {
 		db.Close()
@@ -485,6 +495,7 @@ func (s *Session) Use(dbName string) error {
 		ndb.Close()
 		return err
 	}
+	s.closeStmts() // v1.4.0：prepared stmt 绑定旧连接，切库前清空
 	s.db.Close()
 	s.db = ndb
 	s.currentDB = dbName
@@ -494,6 +505,103 @@ func (s *Session) Use(dbName string) error {
 // ---------------------------------------------------------------------------
 // 查询执行
 // ---------------------------------------------------------------------------
+
+// querySQL 执行查询（v1.4.0：语句缓存启用时走 prepared stmt 复用，免去逐查询的
+// WASM compile+finalize；禁用或预备失败时行为与原 s.db.Query 一致）。
+// panic→error 兜底：零语句（纯注释）等异常语句会让 ncruces 驱动在执行期
+// nil 解引用 panic——转成普通错误返回，绝不让 panic 穿透连接处理。
+func (s *Session) querySQL(q string) (rows *sql.Rows, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			rows, err = nil, fmt.Errorf("sqlite driver rejected statement (panic: %v)", r)
+		}
+	}()
+	if s.stmtCacheMax > 0 {
+		st, err := s.getStmt(q)
+		if err != nil {
+			return nil, err
+		}
+		return st.Query()
+	}
+	return s.db.Query(q)
+}
+
+// execSQL 执行写语句（v1.4.0：语句缓存启用时走 prepared stmt 复用；panic 兜底同 querySQL）。
+func (s *Session) execSQL(q string) (res sql.Result, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			res, err = nil, fmt.Errorf("sqlite driver rejected statement (panic: %v)", r)
+		}
+	}()
+	if s.stmtCacheMax > 0 {
+		st, err := s.getStmt(q)
+		if err != nil {
+			return nil, err
+		}
+		return st.Exec()
+	}
+	return s.db.Exec(q)
+}
+
+// getStmt 会话级语句缓存命中 / 预备（v1.4.0）。
+// 各会话持有独立 *sql.DB（MaxOpenConns(1)），database/sql 对同一 Stmt 的并发使用
+// 自动排队（rendezvous），无共享冲突；命中不 Close（缓存持有至淘汰/会话关闭）。
+func (s *Session) getStmt(q string) (*sql.Stmt, error) {
+	s.stmtMu.Lock()
+	if st, ok := s.stmtCache[q]; ok {
+		s.stmtTouch(q)
+		s.stmtMu.Unlock()
+		return st, nil
+	}
+	s.stmtMu.Unlock()
+	st, err := s.db.Prepare(q)
+	if err != nil {
+		return nil, err // 预备失败不缓存，错误行为与直连一致
+	}
+	s.stmtMu.Lock()
+	if s.stmtCache == nil {
+		s.stmtCache = make(map[string]*sql.Stmt, s.stmtCacheMax+1)
+	}
+	if dup, ok := s.stmtCache[q]; ok {
+		s.stmtMu.Unlock()
+		_ = st.Close() // 并发预备同语句：保留先入缓存者
+		return dup, nil
+	}
+	s.stmtCache[q] = st
+	s.stmtLRU = append(s.stmtLRU, q)
+	for len(s.stmtLRU) > s.stmtCacheMax { // 容量满：淘汰最旧并关闭
+		old := s.stmtLRU[0]
+		s.stmtLRU = s.stmtLRU[1:]
+		if ost, ok := s.stmtCache[old]; ok {
+			delete(s.stmtCache, old)
+			_ = ost.Close()
+		}
+	}
+	s.stmtMu.Unlock()
+	return st, nil
+}
+
+// stmtTouch 命中项移到 LRU 尾部（须持 stmtMu）。
+func (s *Session) stmtTouch(q string) {
+	for i, name := range s.stmtLRU {
+		if name == q {
+			s.stmtLRU = append(s.stmtLRU[:i], s.stmtLRU[i+1:]...)
+			s.stmtLRU = append(s.stmtLRU, q)
+			return
+		}
+	}
+}
+
+// closeStmts 清空会话语句缓存（Use 切库 / Close 时调用：prepared stmt 绑定旧连接）。
+func (s *Session) closeStmts() {
+	s.stmtMu.Lock()
+	defer s.stmtMu.Unlock()
+	for q, st := range s.stmtCache {
+		_ = st.Close()
+		delete(s.stmtCache, q)
+	}
+	s.stmtLRU = nil
+}
 
 // Query 执行只读查询（受 全局闸门 + 本库读并发 + QoS 限流，maxRows 行数保护）。
 func (s *Session) Query(q string) ([]string, [][]any, error) {
@@ -508,7 +616,7 @@ func (s *Session) Query(q string) ([]string, [][]any, error) {
 	rs := s.backend.readSemFor(s.currentDB)
 	rs.Acquire()
 	defer rs.Release()
-	rows, err := s.db.Query(q)
+	rows, err := s.querySQL(q)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -553,7 +661,7 @@ func (s *Session) Exec(q string) (int64, int64, error) {
 	defer qrelease()
 	s.backend.globalSem.Acquire()
 	defer s.backend.globalSem.Release()
-	res, err := s.db.Exec(q)
+	res, err := s.execSQL(q)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -625,6 +733,7 @@ func (s *Session) Close() {
 	}
 	s.ReleaseWrite()
 	if s.db != nil {
+		s.closeStmts() // v1.4.0：先归还全部 prepared stmt 再关连接
 		s.db.Close()
 	}
 }
@@ -708,46 +817,60 @@ func (s *Session) HoldsWriteLock() bool { return s.holdsLock }
 // 动态信号量：容量可热调（管理面 SET，重启失效回到配置文件值）
 // ---------------------------------------------------------------------------
 
+// dynSem 动态容量信号量。v1.4.0：cur/max 改原子字段——不限额（max<=0）时
+// Acquire/Release 走纯原子快路径，消除全局闸门（所有会话共享）上的锁竞争；
+// 有限额时退回 mutex+cond 等待队列。计数语义不变：快路径同样递增 cur，
+// 热改为有限额后限额立即精确生效。
 type dynSem struct {
 	mu   sync.Mutex
 	cond *sync.Cond
-	cur  int
-	max  int // <=0 表示不限
+	cur  atomic.Int64 // 在场查询数
+	max  atomic.Int64 // <=0 表示不限
 }
 
 func newDynSem(max int) *dynSem {
-	s := &dynSem{max: max}
+	s := &dynSem{}
 	s.cond = sync.NewCond(&s.mu)
+	s.max.Store(int64(max))
 	return s
 }
 
 func (s *dynSem) Acquire() {
+	// v1.4.0 快路径：不限额时原子计数直通
+	if s.max.Load() <= 0 {
+		s.cur.Add(1)
+		return
+	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	for s.max > 0 && s.cur >= s.max {
+	for s.max.Load() > 0 && s.cur.Load() >= s.max.Load() {
 		s.cond.Wait()
 	}
-	s.cur++
-}
-
-func (s *dynSem) Release() {
-	s.mu.Lock()
-	s.cur--
-	s.cond.Signal()
+	s.cur.Add(1)
 	s.mu.Unlock()
 }
 
+func (s *dynSem) Release() {
+	// v1.4.0：先原子减计数；仅有限额（可能存在等待者）时补一次唤醒。
+	// 正确性：等待者只会在 max>0 时入队，max 0→正数的热改由 SetMax 广播兜底；
+	// 若本 Release 的减计数发生在等待者判定之后，则其 max 读取必然晚于热改
+	//（否则减计数早已对等待者的条件判定可见），不会漏唤醒。
+	s.cur.Add(-1)
+	if s.max.Load() > 0 {
+		s.mu.Lock()
+		s.cond.Signal()
+		s.mu.Unlock()
+	}
+}
+
 func (s *dynSem) SetMax(n int) {
+	s.max.Store(int64(n))
 	s.mu.Lock()
-	s.max = n
 	s.cond.Broadcast()
 	s.mu.Unlock()
 }
 
 func (s *dynSem) Max() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.max
+	return int(s.max.Load())
 }
 
 // SetGlobalThreads 热改全局线程数（<=0 不限）。

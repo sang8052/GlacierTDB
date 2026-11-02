@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
@@ -387,6 +388,26 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 	if sniff <= 0 {
 		sniff = time.Millisecond
 	}
+
+	// 全局并发连接上限（v1.4.0 S13）：max_connections 此前仅在 KV 面生效，
+	// MySQL/AMQP/MQTT 面无上限——恶意连接可耗尽内存/fd。TCP 与 UDS 统一记账，
+	// 超限连接立即关闭（限频日志，避免刷屏）。
+	var connGauge, connDropLast atomic.Int64
+	acceptConn := func(c net.Conn) {
+		if int64(cfg.MaxConnections) > 0 && connGauge.Add(1) > int64(cfg.MaxConnections) {
+			connGauge.Add(-1)
+			now := time.Now().Unix()
+			if last := connDropLast.Load(); now-last >= 5 && connDropLast.CompareAndSwap(last, now) {
+				logx.Warnf("connection limit reached (%d), dropping new clients", cfg.MaxConnections)
+			}
+			_ = c.Close()
+			return
+		}
+		go func() {
+			defer connGauge.Add(-1)
+			sniffConn(msrv, maybeTLSConn(c, tlsCfg, sniff), cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm)
+		}()
+	}
 	// UDS 本地连接加速（v1.3.13 §5.1，仅 Linux）：同一协议多路复用器整体架在
 	// Unix domain socket 上，鉴权照旧（各协议认证不变，纯传输加速）
 	if cfg.ListenUnix != "" {
@@ -401,7 +422,7 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 						logx.Errorf("unix accept: %v", err)
 						continue
 					}
-					go sniffConn(msrv, maybeTLSConn(unixAddrConn{Conn: c}, tlsCfg, sniff), cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm)
+					acceptConn(unixAddrConn{Conn: c})
 				}
 			}()
 		}
@@ -413,7 +434,7 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 			logx.Errorf("accept: %v", err)
 			continue
 		}
-		go sniffConn(msrv, maybeTLSConn(c, tlsCfg, sniff), cfg, backend, reg, aq, store, s3store, s3srv, kvs, mqs, cm)
+		acceptConn(c)
 	}
 }
 

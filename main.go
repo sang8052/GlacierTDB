@@ -106,10 +106,16 @@ func main() {
 		logx.Infof("memory limit set to %d MB (soft, GOMEMLIMIT)", cfg.MemoryLimitMB)
 	}
 
-	logx.Infof("GlacierTDB %s starting: version=%s db_dir=%s default_db=%s sync=%s busy_timeout=%dms cache=%dKB wal_autocheckpoint=%d journal_size_limit=%dKB tls=%v",
+	logx.Infof("GlacierTDB %s starting: version=%s db_dir=%s default_db=%s sync=%s busy_timeout=%dms cache=%dKB stmt_cache=%d wal_autocheckpoint=%d journal_size_limit=%dKB tls=%v",
 		config.GlacierVersion, cfg.ServerVersion, cfg.DBDir, cfg.DefaultDB, cfg.SQLite.Synchronous,
-		cfg.SQLite.BusyTimeoutMs, cfg.SQLite.CacheSizeKB,
+		cfg.SQLite.BusyTimeoutMs, cfg.SQLite.CacheSizeKB, cfg.SQLite.StmtCacheSize,
 		walCheckpointDisplay(cfg.SQLite.WalAutocheckpoint), cfg.SQLite.JournalSizeLimitKB, cfg.TLS.Enable)
+
+	// S12（v1.4.0）：静态加密使用发布物内置默认口令时启动告警——拿到库文件者
+	// 可用公开口令解密；行为不变（改默认值会破坏存量数据），仅提示改配 passphrase
+	if cfg.Security.Encrypt && cfg.Security.Passphrase == "GlacierTDB" {
+		logx.Warnf("security: 静态加密正在使用内置默认口令（security.passphrase 未自定义），任何拿到库文件的人都可解密；生产环境请在配置中设置强口令后重新初始化数据目录")
+	}
 
 	// db 目录唯一锁：服务与 CLI（-vacuum）互斥，同一目录仅一个进程
 	lock, lerr := dirlock.Acquire(cfg.DBDir, *forceUnlock)
@@ -200,20 +206,20 @@ func main() {
 			logx.Errorf("init kv store: %v", err)
 			os.Exit(1)
 		}
-		logx.Infof("kv: redis protocol enabled on %s (mode:redis / RESP sniff), max_memory_mb=%d eviction=%s",
-			cfg.Listen, cfg.KV.MaxMemoryMB, cfg.KV.Eviction)
+		logx.Infof("kv: redis protocol enabled on %s (mode:redis / RESP sniff), max_memory_mb=%d eviction=%s persist=%s flush=%dms core=%v(cpu=%d)",
+			cfg.Listen, cfg.KV.MaxMemoryMB, cfg.KV.Eviction, cfg.KV.PersistMode, cfg.KV.AsyncFlushMs, cfg.KV.DedicatedCore, cfg.KV.CoreCPU)
 	}
 
 	// 消息队列（v1.3.0，mode:rabbitmq 同端口 AMQP 0-9-1；MQTT 桥接 v1.3.3）
 	var mqstore *mq.Store
 	if cfg.MQ.Enable {
-		mqstore, err = mq.Open(backend, cfg.MQ.MaxMessageMB)
+		mqstore, err = mq.Open(backend, cfg.MQ)
 		if err != nil {
 			logx.Errorf("init mq store: %v", err)
 			os.Exit(1)
 		}
-		logx.Infof("mq: amqp protocol enabled on %s (mode:rabbitmq / AMQP sniff, server_version=%s)",
-			cfg.Listen, cfg.MQ.ServerVersion)
+		logx.Infof("mq: amqp protocol enabled on %s (mode:rabbitmq / AMQP sniff, server_version=%s, async_flush=%dms)",
+			cfg.Listen, cfg.MQ.ServerVersion, cfg.MQ.AsyncFlushMs)
 		if cfg.MQ.MQTT.Enable {
 			logx.Infof("mqtt: enabled on %s (tcp sniff 0x1x / ws %s / mode:mqtt)%s",
 				cfg.Listen, cfg.MQ.MQTT.WsPath, map[bool]string{true: " + standalone " + cfg.MQ.MQTT.Listen, false: ""}[cfg.MQ.MQTT.Listen != ""])
@@ -248,6 +254,18 @@ func main() {
 		<-sig
 		logx.Infof("shutting down")
 		sdNotify("STOPPING=1")
+		// 优雅停机：异步落盘模式（kv.persist_mode:async / mq async_flush）下
+		// 强制把内存脏数据刷进 SQLite 再退出，把崩溃丢失窗口收敛到 0（v1.4.0）
+		if kvstore != nil {
+			if err := kvstore.FlushSync(); err != nil {
+				logx.Errorf("kv final flush: %v", err)
+			}
+		}
+		if mqstore != nil {
+			if err := mqstore.FlushSync(); err != nil {
+				logx.Errorf("mq final flush: %v", err)
+			}
+		}
 		os.Exit(0)
 	}()
 
