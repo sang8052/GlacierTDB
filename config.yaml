@@ -29,8 +29,8 @@ auth:
 sqlite:
   synchronous: NORMAL      # OFF | NORMAL | FULL | EXTRA（持久化强度）
   busy_timeout_ms: 5000
-  cache_size_kb: 2048      # 每连接页缓存（v1.4.0 默认 256→2048）
-  stmt_cache_size: 256     # 每会话 prepared statement LRU 缓存条数（v1.4.0；-1 = 关闭）
+  cache_size_kb: 2048      # 每连接页缓存（v1.3.15 默认 256→2048）
+  stmt_cache_size: 256     # 每会话 prepared statement LRU 缓存条数（v1.3.15；-1 = 关闭）
   # --- SQLite 调优（v1.3.12；按「安全/性能/存储磨损」权衡，生效值启动日志可见）---
   wal_autocheckpoint: 1000     # WAL 自动 checkpoint 页数（默认 1000 = SQLite 缺省；
                                #   调大 → 写入更顺但 WAL 更大、崩溃恢复更慢；SD 卡关键旋钮）
@@ -117,7 +117,7 @@ security:
   hide_version: false       # 版本号隐藏（v1.3.13）：开启后 S3 响应头/Redis INFO·HELLO/
                             # 管理面 glacier_version 不再携带真实版本号（MySQL 握手恒回 8.0.0）；
                             # 启动日志与 CLI 版本输出不隐藏（本机排障用）
-  callback_net_policy: standard  # 回调 URL 网络策略（v1.4.0，防 SSRF；作用于租户级回调：
+  callback_net_policy: standard  # 回调 URL 网络策略（v1.3.15，防 SSRF；作用于租户级回调：
                             #   S3 PUT 的 x-glacier-callback-url 头与 SUBMIT QUERY ... CALLBACK）：
                             #   standard = 封回环+链路本地/云元数据（默认）| strict = 加封全部私网段 | open = 不封 IP
 # 键值/队列（v1.2.0）：mode:redis 在 3309 同端口提供 RESP 服务（声明行/嗅探进入）
@@ -127,7 +127,7 @@ kv:
   max_memory_mb: 64       # 内存上限（0 = 不限）；超限按 eviction 策略处理
   eviction: allkeys-lru   # allkeys-lru | volatile-lru | noeviction
   scan_interval_sec: 5    # TTL 主动扫描周期（最低 1）
-  # --- 落盘与运算核（v1.4.0）---
+  # --- 落盘与运算核（v1.3.15）---
   persist_mode: sync      # sync = 每写命令事务落盘（默认，不丢数据）
                           # async = 内存缓存 + 异步批量落盘（写性能大幅提升；
                           #   崩溃丢失 ≤ async_flush_ms 窗口内数据，适合作缓存/计数器场景）
@@ -150,7 +150,7 @@ mux_sniff_ms: 300
 mq:
   enable: true            # AMQP 服务开关（默认开；false 时 3309 不识别 AMQP）
   max_message_mb: 32      # 单条消息上限
-  async_flush_ms: 200     # 写后落盘周期毫秒（v1.4.0）：durable 消息先进内存 journal、
+  async_flush_ms: 200     # 写后落盘周期毫秒（v1.3.15）：durable 消息先进内存 journal、
                           #   后台单事务批量落盘后才 publisher confirm / 派发消费；
                           #   越低延迟越低、批量越小；优雅停机自动补刷
   server_version: "3.13.0"   # 对外宣称的 RabbitMQ 版本串（Connection.Start server-properties，v1.3.3）
@@ -200,7 +200,7 @@ s3:
   # image_font: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf  # 图片文字 ttf 字体（空=内置 ASCII）
   image_cache: true         # 图片预处理结果缓存（GET 加工链路）
   image_cache_mb: 1024      # 缓存容量上限（MB；超出按最久未用淘汰；-1 = 不限）
-  # --- 内存缓存（v1.4.0「内存换硬盘」）---
+  # --- 内存缓存（v1.3.15「内存换硬盘」）---
   mem_cache: true           # 对象内存缓存总开关：热点对象读缓存 + 纯内存对象（x-glacier-memory PUT）
   mem_cache_mb: 128         # 内存缓存预算（MB；-1 = 不限；超预算按 LRU 淘汰）
   mem_cache_item_mb: 4      # 单个缓存对象上限（MB；超过不缓存）

@@ -51,7 +51,7 @@ var (
 	reUpdLimit = regexp.MustCompile(`(?is)^UPDATE\s+(` + "(`[^`]+`|[A-Za-z0-9_\\x{4e00}-\\x{9fa5}]+)" + `)\s+SET\s+(.+?)\s*(?:WHERE\s+(.+?))?\s*ORDER\s+BY\s+(.+?)\s+LIMIT\s+(\d+)\s*$`)
 	reDelLimit = regexp.MustCompile(`(?is)^DELETE\s+FROM\s+(` + "(`[^`]+`|[A-Za-z0-9_\\x{4e00}-\\x{9fa5}]+)" + `)\s*(?:WHERE\s+(.+?))?\s*ORDER\s+BY\s+(.+?)\s+LIMIT\s+(\d+)\s*$`)
 
-	// v1.4.0：原函数体内现场编译的两条正则提为包级（GROUP_CONCAT DISTINCT 判定 /
+	// v1.3.15：原函数体内现场编译的两条正则提为包级（GROUP_CONCAT DISTINCT 判定 /
 	// CAST 目标类型 INTEGER 尾缀剥离）
 	reDistinctKw  = regexp.MustCompile(`(?i)^\s*DISTINCT\b`)
 	reCastIntTail = regexp.MustCompile(`\s+INTEGER$|\s+INT$`)

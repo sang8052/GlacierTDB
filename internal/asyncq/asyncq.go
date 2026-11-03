@@ -137,7 +137,7 @@ func NewEngine(b *sqlite.Backend, cfg *config.Config) *Engine {
 		jobs:    make(map[string]*Job),
 		backend: b,
 		cfg:     cfg,
-		client:  netguard.NewClient(netguard.ParsePolicy(cfg.Security.CallbackNetPolicy), 10*time.Second), // v1.4.0：回调防 SSRF（禁重定向 + 连接期 IP 复核）
+		client:  netguard.NewClient(netguard.ParsePolicy(cfg.Security.CallbackNetPolicy), 10*time.Second), // v1.3.15：回调防 SSRF（禁重定向 + 连接期 IP 复核）
 		jobsDir: cfg.AsyncQuery.JobsDir,
 		samp:    NewSampler(cfg.AsyncQuery.MetricsIntervalSec),
 		cgrp:    make(map[string]bool),

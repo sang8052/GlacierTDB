@@ -26,7 +26,7 @@ type Message struct {
 	Persistent  bool
 	Redelivered bool
 
-	// v1.4.0 内存态（仅 async 模式使用）：state 原子访问——flusher 事务内免锁复查
+	// v1.3.15 内存态（仅 async 模式使用）：state 原子访问——flusher 事务内免锁复查
 	// 并发删除；created 为入队时间（journal 落库 created 列）。
 	state   uint32
 	created int64
@@ -69,7 +69,7 @@ type ExchangeInfo struct {
 }
 
 // Store AMQP 存储：SQLite 落盘（glacier_mq.db）+ 内存消费者注册表。
-// v1.4.0：路由内存缓存（route_cache.go）+ 写后落盘 journal/flusher（flush.go）+
+// v1.3.15：路由内存缓存（route_cache.go）+ 写后落盘 journal/flusher（flush.go）+
 // 统计内存聚合；async_flush_ms=0 时保留旧同步路径（publish/派发/确认逐条 SQL）。
 type Store struct {
 	mu          sync.Mutex
@@ -84,13 +84,13 @@ type Store struct {
 	acked     atomic.Int64
 	startTS   time.Time
 
-	// ---- 路由内存缓存（v1.4.0，route_cache.go）：Publish 热路径免查库 ----
+	// ---- 路由内存缓存（v1.3.15，route_cache.go）：Publish 热路径免查库 ----
 	routeMu sync.RWMutex
 	rExch   map[string]*routeExchange // ns\x00name → 交换机
 	rQueue  map[string]*routeQueue    // ns\x00name → 队列
 	rBind   map[string][]routeBinding // ns\x00exchange → 绑定列表
 
-	// ---- 写后落盘（v1.4.0，flush.go）：journal 与旁路批处理（s.mu 保护）----
+	// ---- 写后落盘（v1.3.15，flush.go）：journal 与旁路批处理（s.mu 保护）----
 	flushIv      time.Duration       // 落盘周期（opts.AsyncFlushMs；0 = 旧同步路径）
 	flushKick    chan struct{}       // flusher 唤醒
 	journal      []*Message          // 待落盘 durable 消息
@@ -102,13 +102,13 @@ type Store struct {
 	unackedMsgs  map[string]int64    // ns\x00queue → unacked 计数（async 模式 SHOW 用）
 	idSeq        int64               // 内存 ID 分配器（Open 以 max(seq,max_id) 播种）
 
-	// ---- 统计内存聚合（v1.4.0）：statBuf 缓冲 + statLoop 每 5s 批量 UPSERT ----
+	// ---- 统计内存聚合（v1.3.15）：statBuf 缓冲 + statLoop 每 5s 批量 UPSERT ----
 	statMu  sync.Mutex
 	statBuf map[string]*statDelta
 }
 
 // Open 打开系统库、恢复（未确认消息重入队）并启动分发循环。
-// v1.4.0：签名改为接收 config.MQOpts（AsyncFlushMs 写后落盘周期、MaxMessageMB 单条上限；
+// v1.3.15：签名改为接收 config.MQOpts（AsyncFlushMs 写后落盘周期、MaxMessageMB 单条上限；
 // main.go 已配合改为 mq.Open(backend, cfg.MQ)）。
 func Open(backend *sqlite.Backend, opts config.MQOpts) (*Store, error) {
 	db, err := backend.OpenMQDB()
@@ -172,17 +172,17 @@ CREATE TABLE IF NOT EXISTS mqtt_retains (
 		statBuf:     map[string]*statDelta{},
 		startTS:     time.Now(),
 	}
-	if err := s.loadRoutes(); err != nil { // v1.4.0：路由缓存全量加载
+	if err := s.loadRoutes(); err != nil { // v1.3.15：路由缓存全量加载
 		return nil, fmt.Errorf("mq: load route cache: %w", err)
 	}
-	if s.async() { // v1.4.0：消息全量载入内存 + flusher 后台批量落盘
+	if s.async() { // v1.3.15：消息全量载入内存 + flusher 后台批量落盘
 		if err := s.loadMessages(); err != nil {
 			return nil, fmt.Errorf("mq: load messages: %w", err)
 		}
 		go s.flushLoop()
 	}
 	go s.dispatchLoop()
-	go s.statLoop() // v1.4.0：统计内存聚合批量落库（两种模式共用）
+	go s.statLoop() // v1.3.15：统计内存聚合批量落库（两种模式共用）
 	logx.Infof("mq: store ready (max_message_mb=%d, async_flush_ms=%d)", opts.MaxMessageMB, opts.AsyncFlushMs)
 	return s, nil
 }
@@ -190,7 +190,7 @@ CREATE TABLE IF NOT EXISTS mqtt_retains (
 func qkey(ns, queue string) string { return ns + "\x00" + queue }
 
 // ---------------------------------------------------------------------------
-// 声明 / 绑定 / 删除（写 SQL 保持不变，落库成功后同步维护路由内存缓存，v1.4.0）
+// 声明 / 绑定 / 删除（写 SQL 保持不变，落库成功后同步维护路由内存缓存，v1.3.15）
 // ---------------------------------------------------------------------------
 
 // DeclareExchange 声明交换机；existing 不匹配返回 406 语义错误。
@@ -202,7 +202,7 @@ func (s *Store) DeclareExchange(ns, name, typ string, durable, autoDelete, passi
 	err := s.db.QueryRow(`SELECT type,durable,auto_delete FROM mq_exchanges WHERE ns=? AND name=?`, ns, name).
 		Scan(&curType, &curDur, &curAD)
 	if err == nil {
-		// v1.4.0：已存在——以 DB 行值自愈缓存（防漂移），passive 语义不变
+		// v1.3.15：已存在——以 DB 行值自愈缓存（防漂移），passive 语义不变
 		s.setRouteExchangeLocked(ns, name, curType, curDur != 0, curAD != 0)
 		if passive {
 			return nil
@@ -220,7 +220,7 @@ func (s *Store) DeclareExchange(ns, name, typ string, durable, autoDelete, passi
 	}
 	_, err = s.db.Exec(`INSERT INTO mq_exchanges(ns,name,type,durable,auto_delete,created) VALUES(?,?,?,?,?,?)`,
 		ns, name, typ, b2i(durable), b2i(autoDelete), time.Now().Unix())
-	if err == nil { // v1.4.0：缓存同步维护
+	if err == nil { // v1.3.15：缓存同步维护
 		s.setRouteExchangeLocked(ns, name, typ, durable, autoDelete)
 	}
 	return err
@@ -241,16 +241,16 @@ func (s *Store) DeclareQueue(ns, name string, durable, exclusive, autoDelete, pa
 			ns, name, b2i(durable), b2i(exclusive), b2i(autoDelete), time.Now().Unix()); err != nil {
 			return 0, 0, err
 		}
-		s.setRouteQueueLocked(ns, name, durable, exclusive, autoDelete) // v1.4.0：缓存维护
+		s.setRouteQueueLocked(ns, name, durable, exclusive, autoDelete) // v1.3.15：缓存维护
 	} else {
-		s.setRouteQueueLocked(ns, name, curDur != 0, curEx != 0, curAD != 0) // v1.4.0：缓存自愈
+		s.setRouteQueueLocked(ns, name, curDur != 0, curEx != 0, curAD != 0) // v1.3.15：缓存自愈
 		if !passive && (curDur != 0) != durable {
 			return 0, 0, fmt.Errorf("PRECONDITION_FAILED - inequivalent arg 'durable' for queue '%s'", name)
 		}
 	}
 	var ready int64
 	if s.async() {
-		ready = s.readyCountLocked(qkey(ns, name)) // v1.4.0：async 模式读内存（journal 未落盘部分 DB 缺行）
+		ready = s.readyCountLocked(qkey(ns, name)) // v1.3.15：async 模式读内存（journal 未落盘部分 DB 缺行）
 	} else {
 		ready, _ = s.countReady(ns, name)
 	}
@@ -264,7 +264,7 @@ func (s *Store) Bind(ns, exchange, queue, routingKey string) error {
 	res, err := s.db.Exec(`INSERT OR IGNORE INTO mq_bindings(ns,exchange,queue,routing_key) VALUES(?,?,?,?)`,
 		ns, exchange, queue, routingKey)
 	if err == nil {
-		if n, _ := res.RowsAffected(); n > 0 { // v1.4.0：实际新插入才记缓存（幂等去重）
+		if n, _ := res.RowsAffected(); n > 0 { // v1.3.15：实际新插入才记缓存（幂等去重）
 			s.addRouteBindingLocked(ns, exchange, queue, routingKey)
 		}
 	}
@@ -277,7 +277,7 @@ func (s *Store) Unbind(ns, exchange, queue, routingKey string) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM mq_bindings WHERE ns=? AND exchange=? AND queue=? AND routing_key=?`,
 		ns, exchange, queue, routingKey)
-	if err == nil { // v1.4.0：缓存同步维护
+	if err == nil { // v1.3.15：缓存同步维护
 		s.dropRouteBindingLocked(ns, exchange, queue, routingKey)
 	}
 	return err
@@ -289,7 +289,7 @@ func (s *Store) DeleteExchange(ns, name string) error {
 	defer s.mu.Unlock()
 	_, _ = s.db.Exec(`DELETE FROM mq_bindings WHERE ns=? AND exchange=?`, ns, name)
 	_, err := s.db.Exec(`DELETE FROM mq_exchanges WHERE ns=? AND name=?`, ns, name)
-	if err == nil { // v1.4.0：缓存同步维护
+	if err == nil { // v1.3.15：缓存同步维护
 		s.dropRouteExchangeLocked(ns, name)
 	}
 	return err
@@ -302,12 +302,12 @@ func (s *Store) DeleteQueue(ns, name string) (int64, error) {
 	k := qkey(ns, name)
 	var n int64
 	if s.async() {
-		n = s.readyCountLocked(k) // v1.4.0：async 模式 ready 数以内存为准
+		n = s.readyCountLocked(k) // v1.3.15：async 模式 ready 数以内存为准
 	} else {
 		n, _ = s.countReady(ns, name)
 	}
 	if s.async() {
-		// v1.4.0：内存全清（ready + unacked；原 SQL 同样删除该队列全部消息行）。
+		// v1.3.15：内存全清（ready + unacked；原 SQL 同样删除该队列全部消息行）。
 		// ready 链清空并标记 gone（journal 在途行由 flusher 复查跳过/回除）；
 		// unacked 消息经 live 定位一并清理，deliveredBy 顺带回收并回补 prefetch 计数。
 		if l := s.ready[k]; l != nil {
@@ -345,7 +345,7 @@ func (s *Store) DeleteQueue(ns, name string) (int64, error) {
 	_, _ = s.db.Exec(`DELETE FROM mq_queues WHERE ns=? AND name=?`, ns, name)
 	_, _ = s.db.Exec(`DELETE FROM mq_stats WHERE ns=? AND name=?`, ns, name)
 	s.consumers[k] = nil
-	s.dropRouteQueueLocked(ns, name) // v1.4.0：缓存级联清理（队列 + 各交换机指向它的绑定）
+	s.dropRouteQueueLocked(ns, name) // v1.3.15：缓存级联清理（队列 + 各交换机指向它的绑定）
 	return n, nil
 }
 
@@ -355,7 +355,7 @@ func (s *Store) PurgeQueue(ns, name string) (int64, error) {
 	defer s.mu.Unlock()
 	k := qkey(ns, name)
 	if s.async() {
-		// v1.4.0：内存 ready 链清空并标记 gone（journal 在途行由 flusher 复查跳过）；
+		// v1.3.15：内存 ready 链清空并标记 gone（journal 在途行由 flusher 复查跳过）；
 		// 已落库的 ready 行照旧 SQL 清除（unacked 行保留——原语义）。
 		n := s.readyCountLocked(k)
 		if l := s.ready[k]; l != nil {
@@ -394,12 +394,12 @@ func (s *Store) countReady(ns, queue string) (int64, error) {
 
 // Publish 发布消息（默认交换机 "" 直达队列名；direct/fanout/topic 路由）。
 // 返回投递到的队列数（0 = 不可路由，mandatory 回退判定用，v1.3.2）。
-// v1.4.0 保持签名不变（mqtt 桥接依赖）；confirm 场景用 PublishConfirm。
+// v1.3.15 保持签名不变（mqtt 桥接依赖）；confirm 场景用 PublishConfirm。
 func (s *Store) Publish(ns, exchange, routingKey string, props, payload []byte, persistent bool) (int, error) {
 	return s.publish(ns, exchange, routingKey, props, payload, persistent, nil)
 }
 
-// PublishConfirm 带 publisher confirm 回调的发布（v1.4.0）。
+// PublishConfirm 带 publisher confirm 回调的发布（v1.3.15）。
 // async 模式下 cb 在本批 journal 落库事务结束后由 flusher 调用（err=nil→basic.ack，
 // 失败→basic.nack），等价原"落库成功后 confirm"时序；回调在 flusher goroutine 执行、
 // 不持 s.mu，连接写锁由回调实现方自管（connState.writeMethod/writeFlush 持 wmu）。
@@ -407,14 +407,14 @@ func (s *Store) PublishConfirm(ns, exchange, routingKey string, props, payload [
 	return s.publish(ns, exchange, routingKey, props, payload, persistent, cb)
 }
 
-// publish 发布核心（v1.4.0）：async 模式内存构建消息入 ready 链 + journal；
+// publish 发布核心（v1.3.15）：async 模式内存构建消息入 ready 链 + journal；
 // sync 模式保持原逐条 INSERT 落库路径。
 func (s *Store) publish(ns, exchange, routingKey string, props, payload []byte, persistent bool, cb func(error)) (int, error) {
 	if s.maxMsg > 0 && int64(len(payload)) > s.maxMsg {
 		return 0, fmt.Errorf("message size %d exceeds max_message_mb limit", len(payload))
 	}
 	s.mu.Lock()
-	// v1.4.0 背压：journal 积压超阈值 → 本调用内联同步刷一轮（必须先放锁再执行事务）
+	// v1.3.15 背压：journal 积压超阈值 → 本调用内联同步刷一轮（必须先放锁再执行事务）
 	if s.async() && len(s.journal) > mqJournalBacklog {
 		s.mu.Unlock()
 		_ = s.flushOnce()
@@ -424,7 +424,7 @@ func (s *Store) publish(ns, exchange, routingKey string, props, payload []byte, 
 	now := time.Now().Unix()
 	for _, q := range queues {
 		if s.async() {
-			// v1.4.0：内存构建消息——durable 进 ready 链 + journal（flusher 批量落盘）；
+			// v1.3.15：内存构建消息——durable 进 ready 链 + journal（flusher 批量落盘）；
 			// transient 纯内存不落库（重启即失，与 RabbitMQ 非持久化语义一致）
 			m := &Message{ID: s.nextIDLocked(), NS: ns, Queue: q, Exchange: exchange,
 				RoutingKey: routingKey, Props: props, Payload: payload,
@@ -457,7 +457,7 @@ func (s *Store) publish(ns, exchange, routingKey string, props, payload []byte, 
 	return len(queues), nil
 }
 
-// routeLocked 解析路由目标队列（内存路由缓存，调用方持 s.mu；v1.4.0 替代原逐条
+// routeLocked 解析路由目标队列（内存路由缓存，调用方持 s.mu；v1.3.15 替代原逐条
 // SELECT——等价性对照见 route_cache.go 头注释）。
 func (s *Store) routeLocked(ns, exchange, routingKey string) []string {
 	s.routeMu.RLock()
@@ -548,7 +548,7 @@ func (s *Store) UnregisterConsumer(c *Consumer, requeue bool) {
 	}
 	if requeue && len(c.unackedIDs()) > 0 {
 		if s.async() {
-			// v1.4.0：内存回插队首即可——重启恢复本就把 unacked 重置 ready+redelivered=1，
+			// v1.3.15：内存回插队首即可——重启恢复本就把 unacked 重置 ready+redelivered=1，
 			// 落库态无需回写（等价原逐条 UPDATE 的最终效果）
 			for _, id := range c.unackedIDs() {
 				if m := s.live[id]; m != nil && m.state == msgStateUnacked {
@@ -568,7 +568,7 @@ func (s *Store) UnregisterConsumer(c *Consumer, requeue bool) {
 }
 
 // Ack 确认（删除消息；按 deliveredBy 回补消费者 prefetch 计数）。
-// v1.4.0：async 模式去掉每 id SELECT queue（deliveredBy/内存消息自带队列），
+// v1.3.15：async 模式去掉每 id SELECT queue（deliveredBy/内存消息自带队列），
 // durable 批量 DELETE（delPend 随 flush 落库）；transient 纯内存。
 func (s *Store) Ack(ns string, ids []int64) {
 	if len(ids) == 0 {
@@ -616,7 +616,7 @@ func (s *Store) Ack(ns string, ids []int64) {
 	s.nudge()
 }
 
-// ackAsyncLocked async 模式确认（调用方持 s.mu；v1.4.0）。
+// ackAsyncLocked async 模式确认（调用方持 s.mu；v1.3.15）。
 func (s *Store) ackAsyncLocked(ns string, ids []int64) {
 	queues := map[string]int64{}
 	var delIDs []int64
@@ -699,7 +699,7 @@ func (s *Store) Nack(ns string, ids []int64, requeue bool) {
 	s.nudge()
 }
 
-// nackAsyncLocked async 模式否定确认（调用方持 s.mu；v1.4.0）。
+// nackAsyncLocked async 模式否定确认（调用方持 s.mu；v1.3.15）。
 func (s *Store) nackAsyncLocked(ns string, ids []int64, requeue bool) {
 	for _, id := range ids {
 		c := s.deliveredBy[id]
@@ -761,7 +761,7 @@ func (s *Store) Get(ns, queue string, noAck bool) *Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.async() {
-		// v1.4.0：内存 ready 链队首直取（等价 SELECT ... ORDER BY id LIMIT 1）
+		// v1.3.15：内存 ready 链队首直取（等价 SELECT ... ORDER BY id LIMIT 1）
 		m := s.popReadyLocked(ns, queue)
 		if m == nil {
 			return nil
@@ -805,7 +805,7 @@ func (s *Store) Get(ns, queue string, noAck bool) *Message {
 func (s *Store) RequeueConn(connID uint64) {
 	s.mu.Lock()
 	if s.async() {
-		// v1.4.0：内存回插队首（旧 id 优先语义）；DB 行无需回写——重启恢复本就把
+		// v1.3.15：内存回插队首（旧 id 优先语义）；DB 行无需回写——重启恢复本就把
 		// unacked 重置 ready+redelivered=1，落库态等价
 		for k, list := range s.consumers {
 			kept := list[:0]
@@ -857,7 +857,7 @@ func (s *Store) nudge() {
 }
 
 func (s *Store) dispatchLoop() {
-	// v1.4.0：空闲退避 50ms → 250ms（kick 即时驱动活跃路径）
+	// v1.3.15：空闲退避 50ms → 250ms（kick 即时驱动活跃路径）
 	t := time.NewTicker(mqDispatchIdleTick)
 	defer t.Stop()
 	for {
@@ -883,7 +883,7 @@ func (s *Store) dispatchOnce() {
 		ns, queue := qkeySplit(k)
 		for _, c := range list {
 			if s.async() {
-				// v1.4.0：内存 ready 链直取（跳过 SELECT）；durable 派发态走 unackPend 批量 UPDATE
+				// v1.3.15：内存 ready 链直取（跳过 SELECT）；durable 派发态走 unackPend 批量 UPDATE
 				avail := -1
 				if c.Prefetch > 0 {
 					avail = c.Prefetch - c.unacked
@@ -923,7 +923,7 @@ func (s *Store) dispatchOnce() {
 				}
 				continue
 			}
-			// v1.4.0：SQL 模式批量化——单消费者单 SELECT（LIMIT=剩余 prefetch，上限 256）
+			// v1.3.15：SQL 模式批量化——单消费者单 SELECT（LIMIT=剩余 prefetch，上限 256）
 			// + 单条批量 UPDATE/DELETE，替代原逐条 SELECT+UPDATE（仍全程持锁）
 			for {
 				limit := mqDispatchBatch
@@ -991,7 +991,7 @@ func qkeySplit(k string) (string, string) {
 	return k, ""
 }
 
-// scanMsg 行扫描（v1.4.0：参数放宽为 Scan 接口，*sql.Row 与 *sql.Rows 通用）。
+// scanMsg 行扫描（v1.3.15：参数放宽为 Scan 接口，*sql.Row 与 *sql.Rows 通用）。
 func scanMsg(row interface{ Scan(dest ...any) error }, ns, queue string) (*Message, error) {
 	var m Message
 	var pers, redel int
@@ -1006,7 +1006,7 @@ func scanMsg(row interface{ Scan(dest ...any) error }, ns, queue string) (*Messa
 }
 
 // ---------------------------------------------------------------------------
-// 内存 ready 链 / ID 分配辅助（v1.4.0，async 模式）
+// 内存 ready 链 / ID 分配辅助（v1.3.15，async 模式）
 // ---------------------------------------------------------------------------
 
 // pushReadyLocked 消息入队尾（= id 递增 FIFO，等价 ORDER BY id；调用方持 s.mu）。
@@ -1062,7 +1062,7 @@ func (s *Store) nextIDLocked() int64 {
 // 统计
 // ---------------------------------------------------------------------------
 
-// bumpStatLocked 队列统计记账（v1.4.0：内存缓冲 + statLoop 每 5s 批量 UPSERT，
+// bumpStatLocked 队列统计记账（v1.3.15：内存缓冲 + statLoop 每 5s 批量 UPSERT，
 // 替代原每消息一条 INSERT——发布/派发热路径零 SQL；调用方持 s.mu，statMu 为叶锁）。
 func (s *Store) bumpStatLocked(ns, name, field string, n int64) {
 	s.statMu.Lock()
@@ -1111,7 +1111,7 @@ func (s *Store) Queues(ns string) []QueueInfo {
 		}
 		info.Durable = dur != 0
 		if s.async() {
-			// v1.4.0：async 模式 ready/unacked 以内存为准（journal 未落盘部分 DB 缺行）
+			// v1.3.15：async 模式 ready/unacked 以内存为准（journal 未落盘部分 DB 缺行）
 			k := qkey(info.NS, info.Name)
 			info.Ready = s.readyCountLocked(k)
 			info.Unacked = s.unackedMsgs[k]
@@ -1125,7 +1125,7 @@ func (s *Store) Queues(ns string) []QueueInfo {
 		var pub, del, ack sql.NullInt64
 		_ = s.db.QueryRow(`SELECT published,delivered,acked FROM mq_stats WHERE ns=? AND name=?`,
 			info.NS, info.Name).Scan(&pub, &del, &ack)
-		// v1.4.0：合并内存统计缓冲（statLoop 未落库的增量）
+		// v1.3.15：合并内存统计缓冲（statLoop 未落库的增量）
 		s.statMu.Lock()
 		if d := s.statBuf[qkey(info.NS, info.Name)]; d != nil {
 			pub.Int64 += d.pub
@@ -1283,7 +1283,7 @@ func (s *Store) RetainStats() [][]any {
 	return out
 }
 
-// QueueCount 队列总数（心跳上报用，v1.3.13；v1.4.0 改读路由内存缓存，免 SQL）。
+// QueueCount 队列总数（心跳上报用，v1.3.13；v1.3.15 改读路由内存缓存，免 SQL）。
 func (s *Store) QueueCount() int64 {
 	s.routeMu.RLock()
 	defer s.routeMu.RUnlock()
@@ -1291,7 +1291,7 @@ func (s *Store) QueueCount() int64 {
 }
 
 // MessageCount 消息总数（ready + unacked，心跳上报用，v1.3.13）。
-// v1.4.0：async 模式读内存（journal 未落盘部分 DB 缺行），同步模式照旧 COUNT。
+// v1.3.15：async 模式读内存（journal 未落盘部分 DB 缺行），同步模式照旧 COUNT。
 func (s *Store) MessageCount() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()

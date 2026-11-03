@@ -11,10 +11,10 @@ import (
 	"strings"
 )
 
-// awsChunkedReader 解码 aws-chunked 传输编码（v1.4.0 S11 重写）。
+// awsChunkedReader 解码 aws-chunked 传输编码（v1.3.15 S11 重写）。
 // 帧格式：<hex-size>;chunk-signature=<sig>\r\n<data>\r\n ... 0;chunk-signature=<sig>\r\n[trailers]\r\n
 //
-// v1.4.0 S11：签名流式变体（x-amz-content-sha256 = STREAMING-AWS4-HMAC-SHA256-
+// v1.3.15 S11：签名流式变体（x-amz-content-sha256 = STREAMING-AWS4-HMAC-SHA256-
 // PAYLOAD[-TRAILER]）的逐块签名**真实校验**——此前注释自认「仅消费不校验」，
 // 攻击者可在种子签名合法后篡改任意块内容/尺寸。现在：
 //   - 每块读毕即按 SigV4 流式规范复算签名（chunkSigner 签名链：首块种子 =
@@ -31,13 +31,13 @@ type awsChunkedReader struct {
 	remain int64
 	done   bool
 
-	// v1.4.0 S11：逐块签名校验（nil = 未签名变体，不校验）
+	// v1.3.15 S11：逐块签名校验（nil = 未签名变体，不校验）
 	signer   *chunkSigner
 	chunkSum hash.Hash // 当前块增量 sha256
 	chunkSig string    // 当前块帧内声明签名
 }
 
-// newAWSChunkedReader 构造（csig 非 nil 时启用逐块签名校验，v1.4.0 S11）。
+// newAWSChunkedReader 构造（csig 非 nil 时启用逐块签名校验，v1.3.15 S11）。
 func newAWSChunkedReader(r io.Reader, csig *chunkSigner) *awsChunkedReader {
 	return &awsChunkedReader{br: bufio.NewReaderSize(r, 32<<10), signer: csig}
 }
@@ -88,7 +88,7 @@ func (c *awsChunkedReader) Read(p []byte) (int, error) {
 		}
 		size, err := strconv.ParseInt(strings.TrimSpace(sizePart), 16, 64)
 		if err != nil {
-			// (v1.4.0) 帧损坏：显式 400（此前为 500 透内部错误）
+			// (v1.3.15) 帧损坏：显式 400（此前为 500 透内部错误）
 			return 0, &s3Error{Code: "InvalidRequest", Status: 400,
 				Msg: "aws-chunked: bad chunk size"}
 		}
@@ -112,7 +112,7 @@ func (c *awsChunkedReader) Read(p []byte) (int, error) {
 			c.done = true
 			break
 		}
-		if c.signer != nil { // (v1.4.0 S11) 签名变体：块必须带签名
+		if c.signer != nil { // (v1.3.15 S11) 签名变体：块必须带签名
 			c.chunkSum = sha256.New()
 			c.chunkSig = sig
 			if strings.TrimSpace(sig) == "" {

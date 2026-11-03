@@ -183,7 +183,7 @@ echo "---- test_v1311.py ----"; python /tests/test_v1311.py || rc=1
 echo "---- test_v1312.py ----"; python /tests/test_v1312.py || rc=1
 echo "---- test_v1313.py ----"; python /tests/test_v1313.py || rc=1
 echo "---- test_v1314.py ----"; python /tests/test_v1314.py || rc=1
-echo "---- test_v140.py ----"; python /tests/test_v140.py || rc=1
+echo "---- test_v1315.py ----"; python /tests/test_v1315.py || rc=1
 exit $rc
 EOF
 )
@@ -516,16 +516,16 @@ docker rm -f gt-s13 gt-remote pyrecv >/dev/null 2>&1 || true
 rm -rf "$S13C"
 
 # ----------------------------------------------------------------------------
-# 3.9 v1.4.0：KV async 落盘 + MQ 写后落盘 场景（换配置重启 → 写入 → 优雅停机 →
+# 3.9 v1.3.15：KV async 落盘 + MQ 写后落盘 场景（换配置重启 → 写入 → 优雅停机 →
 #     验证恢复 → 还原配置）。优雅停机（SIGTERM）触发 FlushSync，重启后应零丢失。
 # ----------------------------------------------------------------------------
-step "步骤 3.9/4: v1.4.0 异步落盘场景（kv.persist_mode=async + mq.async_flush）"
+step "步骤 3.9/4: v1.3.15 异步落盘场景（kv.persist_mode=async + mq.async_flush）"
 CFG140=/tmp/glacier-async-140.yaml
 if [ -f /tmp/glacier-async.yaml ]; then
     cp /tmp/glacier-async.yaml "$CFG140"
     cat >> "$CFG140" <<'Y140'
 
-# ---- v1.4.0 异步落盘场景追加（run_all 步骤 3.9）----
+# ---- v1.3.15 异步落盘场景追加（run_all 步骤 3.9）----
 kv:
   enable: true
   persist_mode: async
@@ -542,23 +542,23 @@ Y140
     docker rm -f "$PROXY" >/dev/null 2>&1 || true
     docker run -d --name "$PROXY" --network "$NET" -p 3309:3309         -v /data/tcp-proxy-mysql-sqlite/data:/data -v "$CFG140":/app/config.yaml         glaciertdb:latest >/dev/null 2>&1
     sleep 3
-    if docker run --rm --network "$NET" -v "$TESTS_DIR":/tests:ro "$PY_IMG" bash -c         "pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple PyMySQL redis pika >/dev/null 2>&1 && python /tests/test_v140.py --async" 2>&1 | grep -q "async scenario"; then
+    if docker run --rm --network "$NET" -v "$TESTS_DIR":/tests:ro "$PY_IMG" bash -c         "pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple PyMySQL redis pika >/dev/null 2>&1 && python /tests/test_v1315.py --async" 2>&1 | grep -q "async scenario"; then
         docker restart "$PROXY" >/dev/null 2>&1   # 优雅停机：SIGTERM → kv/mq FlushSync
         sleep 3
-        if docker run --rm --network "$NET" -v "$TESTS_DIR":/tests:ro "$PY_IMG" bash -c             "pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple PyMySQL redis pika >/dev/null 2>&1 && python /tests/test_v140.py --check-async" 2>&1 | tee "$LOG_DIR/v140_async.out" | grep -q "FAIL=0"; then
-            record "v1.4.0 async 落盘优雅停机零丢失 : PASS"
+        if docker run --rm --network "$NET" -v "$TESTS_DIR":/tests:ro "$PY_IMG" bash -c             "pip install -q -i https://pypi.tuna.tsinghua.edu.cn/simple PyMySQL redis pika >/dev/null 2>&1 && python /tests/test_v1315.py --check-async" 2>&1 | tee "$LOG_DIR/v1315_async.out" | grep -q "FAIL=0"; then
+            record "v1.3.15 async 落盘优雅停机零丢失 : PASS"
         else
-            record "v1.4.0 async 落盘优雅停机零丢失 : FAIL"
+            record "v1.3.15 async 落盘优雅停机零丢失 : FAIL"
         fi
     else
-        record "v1.4.0 async 场景写入 : FAIL"
+        record "v1.3.15 async 场景写入 : FAIL"
     fi
     # 还原原始配置容器（后续步骤与人工验证依赖 /tmp/glacier-async.yaml 基线）
     docker rm -f "$PROXY" >/dev/null 2>&1 || true
     docker run -d --name "$PROXY" --network "$NET" -p 3309:3309         -v /data/tcp-proxy-mysql-sqlite/data:/data -v /tmp/glacier-async.yaml:/app/config.yaml         glaciertdb:latest >/dev/null 2>&1
     sleep 3
 else
-    record "v1.4.0 async 场景（缺 /tmp/glacier-async.yaml，跳过） : FAIL"
+    record "v1.3.15 async 场景（缺 /tmp/glacier-async.yaml，跳过） : FAIL"
 fi
 
 # ----------------------------------------------------------------------------

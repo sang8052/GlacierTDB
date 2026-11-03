@@ -2,7 +2,7 @@
 
 package kv
 
-// 独立运算核的核绑定（v1.4.0，仅 Linux）：LockOSThread + SchedSetaffinity。
+// 独立运算核的核绑定（v1.3.15，仅 Linux）：LockOSThread + SchedSetaffinity。
 
 import (
 	"runtime"

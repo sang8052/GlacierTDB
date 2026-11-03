@@ -97,7 +97,7 @@ type Store struct {
 	fw     *firewallCtl
 	client *http.Client
 
-	gen atomic.Uint64 // 账号数据世代号（v1.4.0）：任何使 Lookup/UserType 结果变化的写路径递增
+	gen atomic.Uint64 // 账号数据世代号（v1.3.15）：任何使 Lookup/UserType 结果变化的写路径递增
 
 	failMu sync.Mutex
 	fails  map[string][]time.Time // 窗口内失败时间戳（key: ip:<ip> / acct:<user>）
@@ -106,7 +106,7 @@ type Store struct {
 	quotaCache map[string][2]int64 // 账号级配额缓存（v1.3.6；[qps, concurrency]）
 }
 
-// Generation 返回当前账号数据世代号（v1.4.0 世代缓存用）。
+// Generation 返回当前账号数据世代号（v1.3.15 世代缓存用）。
 // handler 每查询先比对世代号，未变时直读连接级 userType 缓存，
 // 省去对 MaxOpenConns(1) 的 glacier_auth.db 的逐查询 SELECT。
 func (s *Store) Generation() uint64 { return s.gen.Load() }
@@ -185,7 +185,7 @@ CREATE TABLE IF NOT EXISTS lock_state (
 
 // migrate 旧版用户策略升级：users 表为空（或缺 glacier）时按 bootstrap 落表。
 func (s *Store) migrate() error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效（启动期落表）
+	defer s.bumpGen() // v1.3.15 世代缓存失效（启动期落表）
 	var n int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
 		return err
@@ -419,7 +419,7 @@ func (s *Store) clearFails(key string) {
 
 // lockKey 落锁（指数升级）+ 防火墙封锁 + HTTP 告警。
 func (s *Store) lockKey(key, lockType, subject, ip string) {
-	defer s.bumpGen() // v1.4.0 世代缓存失效（锁定状态变更）
+	defer s.bumpGen() // v1.3.15 世代缓存失效（锁定状态变更）
 	if lockType == "ip" && isLoopbackIP(subject) {
 		logx.Debugf("auth: skip locking loopback %s", subject)
 		return
@@ -515,7 +515,7 @@ func (s *Store) notify(payload map[string]any) {
 
 // UnlockAccount 解锁账号（手动锁 + 自动锁 + 失败计数）。
 func (s *Store) UnlockAccount(username string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	_, err := s.db.Exec(`DELETE FROM lock_state WHERE lock_key=?`, "acct:"+username)
 	_, _ = s.db.Exec(`UPDATE users SET locked=0, locked_until='' WHERE username=?`, username)
 	s.clearFails("acct:" + username)
@@ -527,7 +527,7 @@ func (s *Store) UnlockAccount(username string) error {
 
 // UnlockIP 解锁 IP（自动锁 + 失败计数 + 防火墙解封）。
 func (s *Store) UnlockIP(ip string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	_, err := s.db.Exec(`DELETE FROM lock_state WHERE lock_key=?`, "ip:"+ip)
 	s.clearFails("ip:" + ip)
 	if s.fw != nil {
@@ -648,7 +648,7 @@ func (s *Store) Locks() []LockRow {
 
 // CreateUser 创建账户（默认 host '%'；plugin 空 = mysql_native_password）。
 func (s *Store) CreateUser(username, password, host, typ, plugin, defaultDB string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	if username == "" || strings.ContainsAny(username, "'\"`") {
 		return fmt.Errorf("invalid user name %q", username)
 	}
@@ -690,7 +690,7 @@ func NormalizePlugin(plugin string) (string, error) {
 
 // SetPlugin 修改账号登录算法（ALTER USER ... IDENTIFIED WITH ...）。
 func (s *Store) SetPlugin(username, plugin string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	plugin, err := NormalizePlugin(plugin)
 	if err != nil {
 		return err
@@ -717,7 +717,7 @@ func (s *Store) PluginFor(username string) string {
 
 // SetPassword 改密（管理面 SET PASSWORD / ALTER USER）。
 func (s *Store) SetPassword(username, password string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	if strings.TrimSpace(password) == "" {
 		return fmt.Errorf("empty password not allowed")
 	}
@@ -734,7 +734,7 @@ func (s *Store) SetPassword(username, password string) error {
 
 // SetAccountType 修改账号类型（super / readonly / user）。
 func (s *Store) SetAccountType(username, typ string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	switch typ {
 	case TypeSuper, TypeReadonly, TypeUser:
 	default:
@@ -747,7 +747,7 @@ func (s *Store) SetAccountType(username, typ string) error {
 
 // SetLocked 手动锁/解锁账号。
 func (s *Store) SetLocked(username string, locked bool) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	v, until := 0, ""
 	if locked {
 		v = 1
@@ -758,7 +758,7 @@ func (s *Store) SetLocked(username string, locked bool) error {
 
 // DropUser 删除账户（含 hosts / grants）。
 func (s *Store) DropUser(username string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	if username == s.boot.AdminUser {
 		return fmt.Errorf("cannot drop the super user %q", username)
 	}
@@ -772,7 +772,7 @@ func (s *Store) DropUser(username string) error {
 
 // RenameUser 改名。
 func (s *Store) RenameUser(oldName, newName string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	if _, err := s.db.Exec(`UPDATE users SET username=? WHERE username=?`, newName, oldName); err != nil {
 		return err
 	}
@@ -783,14 +783,14 @@ func (s *Store) RenameUser(oldName, newName string) error {
 
 // AddHost 增加 host 授权。
 func (s *Store) AddHost(username, host string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	_, err := s.db.Exec(`INSERT OR IGNORE INTO user_hosts(username,host_pattern) VALUES(?,?)`, username, host)
 	return err
 }
 
 // Grant 授权（db / table 可用 *；privs 逗号分隔，ALL 覆盖全部）。
 func (s *Store) Grant(username, db, table, privs string, grantOption bool) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	if db == "" {
 		db = "*"
 	}
@@ -809,7 +809,7 @@ func (s *Store) Grant(username, db, table, privs string, grantOption bool) error
 
 // Revoke 回收权限（privs 为空 = 删除整行）。
 func (s *Store) Revoke(username, db, table, privs string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	if db == "" {
 		db = "*"
 	}
@@ -1100,7 +1100,7 @@ func runCmd(name string, args ...string) error {
 
 // SetDefaultDB 设置账号默认库（CREATE USER DEFAULT_DB / SET USER DEFAULT_DB）。
 func (s *Store) SetDefaultDB(username, db string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	res, err := s.db.Exec(`UPDATE users SET default_db=?, updated_ts=? WHERE username=?`,
 		db, time.Now().Format("2006-01-02 15:04:05"), username)
 	if err != nil {
@@ -1143,7 +1143,7 @@ func (s *Store) GrantedDBs(username string) (map[string]bool, bool) {
 
 // SetQuota 设置账号级配额（qps/concurrency，0 = 不限；v1.3.6）。
 func (s *Store) SetQuota(username string, qps, concurrency int64) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	if qps < 0 || concurrency < 0 {
 		return fmt.Errorf("quota values must be >= 0")
 	}
@@ -1162,7 +1162,7 @@ func (s *Store) SetQuota(username string, qps, concurrency int64) error {
 
 // ClearQuota 清除账号配额（恢复不限）。
 func (s *Store) ClearQuota(username string) error {
-	defer s.bumpGen() // v1.4.0 世代缓存失效
+	defer s.bumpGen() // v1.3.15 世代缓存失效
 	_, err := s.db.Exec(`DELETE FROM user_quotas WHERE username=?`, username)
 	s.quotaMu.Lock()
 	delete(s.quotaCache, username)

@@ -7,7 +7,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// 路由内存缓存（v1.4.0）：Publish 热路径不再查库
+// 路由内存缓存（v1.3.15）：Publish 热路径不再查库
 //
 // 原实现 routeLocked 每次发布都要执行 SELECT：
 //   ① 默认交换机：SELECT name FROM mq_queues WHERE ns=? AND name=?（存在性判断）
@@ -48,7 +48,7 @@ type routeBinding struct {
 	rk    string
 }
 
-// loadRoutes 全量加载路由缓存（Open 时调用，单线程；v1.4.0）。
+// loadRoutes 全量加载路由缓存（Open 时调用，单线程；v1.3.15）。
 func (s *Store) loadRoutes() error {
 	s.routeMu.Lock()
 	defer s.routeMu.Unlock()

@@ -166,7 +166,7 @@ type qosManager struct {
 	cfg  config.QosOpts
 	gl   *qosScope
 	dbs  map[string]*qosScope
-	idle atomic.Bool // v1.4.0：全局全零且无单库配额时为 true，acquire 走零开销快路径
+	idle atomic.Bool // v1.3.15：全局全零且无单库配额时为 true，acquire 走零开销快路径
 }
 
 func newQoSManager(cfg config.QosOpts) *qosManager {
@@ -182,7 +182,7 @@ func newQoSManager(cfg config.QosOpts) *qosManager {
 	return qm
 }
 
-// refreshIdle 重算空闲标志（v1.4.0）：全局配额全零且无任何单库配额时，
+// refreshIdle 重算空闲标志（v1.3.15）：全局配额全零且无任何单库配额时，
 // acquire 的令牌桶/并发闸门/统计记账全部为无操作，可整段跳过。
 // 任何 SetQOS/配置变更路径末尾调用。
 func (q *qosManager) refreshIdle() {
@@ -205,7 +205,7 @@ func (q *qosManager) scopeFor(db string) *qosScope {
 
 // acquire 获取执行配额（全局 + 单库两级），返回等待毫秒数与 release。
 func (q *qosManager) acquire(db string) (waitedMs int64, release func(), err error) {
-	// v1.4.0 零开销快路径：未配置任何限流时直通（热路径免锁免记账）
+	// v1.3.15 零开销快路径：未配置任何限流时直通（热路径免锁免记账）
 	if q.idle.Load() {
 		return 0, func() {}, nil
 	}
@@ -268,7 +268,7 @@ func (q *qosManager) acquireScope(s *qosScope) error {
 
 // paceRows 行吞吐节流：窗口内累计行数超过 rows_per_sec 时睡到窗口结束。
 func (q *qosManager) paceRows(db string, n int) {
-	if q.idle.Load() { // v1.4.0：无限流时直通
+	if q.idle.Load() { // v1.3.15：无限流时直通
 		return
 	}
 	scopes := []*qosScope{q.gl}
@@ -305,7 +305,7 @@ func (q *qosManager) SetGlobal(lim config.QosLimit) {
 	q.cfg.Global = lim
 	q.mu.Unlock()
 	q.gl.apply(lim)
-	q.refreshIdle() // v1.4.0
+	q.refreshIdle() // v1.3.15
 }
 
 // SetDB 热改/新建单库配额。
@@ -315,7 +315,7 @@ func (q *qosManager) SetDB(db string, lim config.QosLimit) {
 	q.mu.Unlock()
 	if s := q.scopeFor(db); s != nil {
 		s.apply(lim)
-		q.refreshIdle() // v1.4.0
+		q.refreshIdle() // v1.3.15
 		return
 	}
 	q.mu.Lock()
@@ -323,7 +323,7 @@ func (q *qosManager) SetDB(db string, lim config.QosLimit) {
 		q.dbs[db] = newScope(db, lim)
 	}
 	q.mu.Unlock()
-	q.refreshIdle() // v1.4.0
+	q.refreshIdle() // v1.3.15
 }
 
 // ClearDB 删除单库配额覆盖（回到仅全局）。
@@ -332,7 +332,7 @@ func (q *qosManager) ClearDB(db string) {
 	delete(q.cfg.Databases, db)
 	delete(q.dbs, db)
 	q.mu.Unlock()
-	q.refreshIdle() // v1.4.0
+	q.refreshIdle() // v1.3.15
 }
 
 func (s *qosScope) apply(lim config.QosLimit) {

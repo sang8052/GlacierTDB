@@ -20,7 +20,7 @@ import (
 	"glaciertdb/internal/logx"
 )
 
-// reDomainHost 域名白名单（v1.4.0 S5）：host 会派生证书文件路径
+// reDomainHost 域名白名单（v1.3.15 S5）：host 会派生证书文件路径
 // <db_dir>/certs/<host>.pem —— 含 '/'、'\\'、'..' 等可写出目录（路径穿越）。
 // 只放行字母数字点连字符下划线与泛域名星号；"." / ".." 及 ".." 段显式拒绝。
 var reDomainHost = regexp.MustCompile(`^[A-Za-z0-9._*-]+$`)
@@ -77,7 +77,7 @@ func (c *certRegistry) reloadDomains() {
 	}
 	m := map[string]string{}
 	for _, d := range c.store.Domains() {
-		if !validDomainHost(d.Host) { // (v1.4.0 S5) 存量脏行防御：不合法 host 不派生路径
+		if !validDomainHost(d.Host) { // (v1.3.15 S5) 存量脏行防御：不合法 host 不派生路径
 			logx.Warnf("s3: skip invalid custom domain host %q", d.Host)
 			continue
 		}
@@ -148,7 +148,7 @@ func (c *certRegistry) load(certFile, keyFile string) (*tls.Certificate, error) 
 }
 
 // issueSelfSigned 为自定义域名签发自签证书（SAN 映射到 bucket 域名，365 天），
-// 落盘 <db_dir>/certs/<host>.pem|.key。(v1.4.0 S5) 落盘前白名单复检（filepath.Base
+// 落盘 <db_dir>/certs/<host>.pem|.key。(v1.3.15 S5) 落盘前白名单复检（filepath.Base
 // 同源判定 + ".." 拒绝），防存量库脏行/未来新调用方绕过 AddDomain 校验。
 func (c *certRegistry) issueSelfSigned(host string) (certFile, keyFile string, err error) {
 	if !validDomainHost(host) {

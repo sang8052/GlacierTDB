@@ -30,7 +30,7 @@ type frame struct {
 	payload []byte
 }
 
-// readFrame 读一帧（v1.4.0：header 用栈数组，每帧仅 1 次堆分配，原 2 次）。
+// readFrame 读一帧（v1.3.15：header 用栈数组，每帧仅 1 次堆分配，原 2 次）。
 func readFrame(r io.Reader) (frame, error) {
 	var f frame
 	var hdr [7]byte
@@ -54,7 +54,7 @@ func readFrame(r io.Reader) (frame, error) {
 	return f, nil
 }
 
-// writeFrame 写一帧（v1.4.0：单缓冲一次 Write，原 3 次 conn.Write；配合
+// writeFrame 写一帧（v1.3.15：单缓冲一次 Write，原 3 次 conn.Write；配合
 // connState.bw 的 bufio 攒批，方法帧+content 头帧+body 帧序列合并出网）。
 func writeFrame(w io.Writer, f frame) error {
 	n := len(f.payload)

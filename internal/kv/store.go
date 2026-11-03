@@ -4,17 +4,17 @@
 //   - key 类型：string / list 队列；
 //   - TTL：惰性过期 + 定期扫描；
 //   - 自动落盘：变更写 SQLite（glacier_kv.db，WAL），内存为缓存层，重启无损恢复；
-//     落盘模式（v1.4.0，kv.persist_mode）：
+//     落盘模式（v1.3.15，kv.persist_mode）：
 //     sync（默认）= 每写命令单显式事务实时落盘，崩溃一致性与 v1.3.x 等价；
 //     async = 内存先行 + AsyncFlushMs 周期批量落盘——崩溃丢失 ≤ flush 窗口
 //     （默认 200ms；main.go 停机钩子调 FlushSync 可把优雅停机的丢失窗口收敛为 0）；
 //   - 命名空间：每用户独立 namespace（key 按登录账号隔离，跨用户不可见）；
 //   - 内存治理：kv.max_memory_mb 上限 + allkeys-lru / volatile-lru / noeviction 淘汰；
-//     v1.4.0 起为 16 分片存储：分片键 = FNV-1a(ns+"/"+key)&15，每分片独立互斥锁
+//     v1.3.15 起为 16 分片存储：分片键 = FNV-1a(ns+"/"+key)&15，每分片独立互斥锁
 //     与 LRU 双向链表，键操作只落对应分片锁；跨分片操作（FlushDB/淘汰全扫/
 //     过期扫描/Stats 汇总）逐分片加锁，任何路径不同时持有两把分片锁。
 //
-// v1.4.0 崩溃语义补充（惰性过期 / 淘汰的 SQL 补删）：
+// v1.3.15 崩溃语义补充（惰性过期 / 淘汰的 SQL 补删）：
 //   - 读路径惰性过期与内存淘汰只摘内存并投递待删标记（pendingDelete，经脏表
 //     通道），SQL 行删除由后台 flusher 补做——锁内零 IO；
 //   - 崩溃时的残留行：启动 load 已按 expiresAt 过滤清理过期行（v1.3.x 即有）；
@@ -43,7 +43,7 @@ import (
 	"glaciertdb/internal/sqlite"
 )
 
-// shardCount 分片数（v1.4.0：全局单锁 → 16 分片，降低多连接写争用）；
+// shardCount 分片数（v1.3.15：全局单锁 → 16 分片，降低多连接写争用）；
 // evictScanWindow 淘汰第一轮在 LRU 尾部方向的最大扫描步数（超出退化第二轮纯 LRU）；
 // lruItemOverhead 每个 list 元素的内存开销估值。
 const (
@@ -60,10 +60,10 @@ type entry struct {
 	expiresAt int64 // epoch ms，0 = 永不过期
 	lastUsed  uint64
 	prio      int // 驱逐优先级（v1.3.13）：-1 = 未设置（纯 LRU），0-255 显式（0 最先驱逐，255 最受保护）
-	// cachedSize 可变部分大小缓存（v1.4.0）：'s' = len(str)；'l' = Σ(len(val)+24)。
+	// cachedSize 可变部分大小缓存（v1.3.15）：'s' = len(str)；'l' = Σ(len(val)+24)。
 	// Set/Push/Pop/Append 增量维护，estEntry O(1)（原实现每次 O(list 长) 全量估算）。
 	cachedSize int64
-	// el 所在分片 LRU 链表元素（v1.4.0）；O(1) MoveToFront / Remove。
+	// el 所在分片 LRU 链表元素（v1.3.15）；O(1) MoveToFront / Remove。
 	el *list.Element
 }
 
@@ -72,7 +72,7 @@ type listItem struct {
 	val []byte
 }
 
-// lruNode 分片 LRU 链表元素负载（v1.4.0）：ns+key 反查内存 entry。
+// lruNode 分片 LRU 链表元素负载（v1.3.15）：ns+key 反查内存 entry。
 type lruNode struct {
 	ns  string
 	key string
@@ -91,7 +91,7 @@ type namespace struct {
 	evLRU   int64 // 未设优先级键的纯 LRU 淘汰计数（v1.3.13）
 }
 
-// shard 存储分片（v1.4.0）：独立互斥锁 + 命名空间表 + LRU 双向链表。
+// shard 存储分片（v1.3.15）：独立互斥锁 + 命名空间表 + LRU 双向链表。
 type shard struct {
 	mu    sync.Mutex
 	ns    map[string]*namespace
@@ -100,7 +100,7 @@ type shard struct {
 }
 
 // Store 键值存储：内存缓存 + SQLite 落盘（glacier_kv.db）。
-// v1.4.0：16 分片存储 + 可配落盘模式（sync/async）+ 独立运算核执行通道。
+// v1.3.15：16 分片存储 + 可配落盘模式（sync/async）+ 独立运算核执行通道。
 type Store struct {
 	shards [shardCount]*shard
 	db     *sql.DB
@@ -113,17 +113,17 @@ type Store struct {
 	blockMu sync.Mutex    // blockCh 轮换保护（原全局锁职责拆出）
 	blockCh chan struct{} // 阻塞弹出广播唤醒（Push 后轮换，v1.3.2）
 
-	// 落盘模式（v1.4.0）
+	// 落盘模式（v1.3.15）
 	persistMode string // sync | async
 	flushMs     int    // 异步刷盘周期毫秒
 
-	// 独立运算核（v1.4.0）
+	// 独立运算核（v1.3.15）
 	dedicated  bool
 	coreCPU    int
 	corePinned atomic.Int64 // 绑定的核号（-1 = 未绑/未启用）
 	execCh     chan func()  // nil = 非专用模式（原地执行）
 
-	// 脏标记（v1.4.0；详见 store_flush.go）
+	// 脏标记（v1.3.15；详见 store_flush.go）
 	dirtyMu   sync.Mutex
 	dirtyKeys map[string]byte // ns\x00key → kind('w' 重写 / 'd' 删行)
 	dirtyNS   map[string]struct{}
@@ -209,7 +209,7 @@ CREATE TABLE IF NOT EXISTS kv_list (
 	}
 	s := &Store{
 		dir:         cfg.DBDir,
-		db:          db, // v1.4.0 修复：漏挂导致 loadSources/load 解引用 nil panic
+		db:          db, // v1.3.15 修复：漏挂导致 loadSources/load 解引用 nil panic
 		blockCh:     make(chan struct{}),
 		startTS:     time.Now(),
 		srcFlight:   map[string]*srcCall{},
@@ -245,7 +245,7 @@ CREATE TABLE IF NOT EXISTS kv_list (
 	// flusher：两种模式都启动——async 模式批量落盘；sync 模式承接读路径惰性
 	// 过期 / 后台扫描产生的补删标记（锁内零 IO，行删除 ≤ flush 周期内完成）
 	s.startFlusher()
-	// 独立运算核（v1.4.0）：dedicated_core = 全部非阻塞 RESP 命令投递到单
+	// 独立运算核（v1.3.15）：dedicated_core = 全部非阻塞 RESP 命令投递到单
 	// goroutine 串行执行（Redis 单线程模型），Linux 下绑核隔离调度噪声
 	if s.dedicated {
 		s.startExecCore()
@@ -306,7 +306,7 @@ func (s *Store) load() error {
 				var it listItem
 				if lr.Scan(&it.seq, &it.val) == nil {
 					e.items = append(e.items, it)
-					e.cachedSize += int64(len(it.val)) + lruItemOverhead // v1.4.0：cachedSize 一次算清
+					e.cachedSize += int64(len(it.val)) + lruItemOverhead // v1.3.15：cachedSize 一次算清
 				}
 			}
 			lr.Close()
@@ -321,7 +321,7 @@ func (s *Store) load() error {
 }
 
 // ---------------------------------------------------------------------------
-// 分片基础设施（v1.4.0）
+// 分片基础设施（v1.3.15）
 // ---------------------------------------------------------------------------
 
 // shardOf 分片键 = FNV-1a(ns + "/" + key) & 15（手写避免 hash.Hash 分配）。
@@ -408,14 +408,14 @@ func (s *Store) adjMemShard(sh *shard, ns, key string, e *entry, oldEst int64) {
 	s.memTotal.Add(delta)
 }
 
-// estEntry 估算内存占用（v1.4.0：可变部分缓存于 e.cachedSize，O(1)；
+// estEntry 估算内存占用（v1.3.15：可变部分缓存于 e.cachedSize，O(1)；
 // 原实现 list 类每次遍历全表）。
 func estEntry(key string, e *entry) int64 {
 	return int64(len(key)) + 96 + e.cachedSize
 }
 
 // expireLocked 惰性过期检查（调用方持 sh.mu）；返回键是否仍有效。
-// v1.4.0：锁内只摘内存 + 投递待删标记（'d'），SQL 行删除由 flusher 补做
+// v1.3.15：锁内只摘内存 + 投递待删标记（'d'），SQL 行删除由 flusher 补做
 // （两种模式一致，锁内零 IO；崩溃残留行由启动 load 按 TTL 过滤兜底）。
 func (s *Store) expireLocked(sh *shard, ns, key string, e *entry) bool {
 	if e.expiresAt > 0 && e.expiresAt <= time.Now().UnixMilli() {
@@ -480,7 +480,7 @@ var errWrongType = fmt.Errorf("WRONGTYPE Operation against a key holding the wro
 
 // Set SET key value [ttlMs] [nx|xx]（nx/xx: ' ' 不限、n 仅不存在、x 仅存在）。
 // 返回 (applied, err)。
-// v1.4.0：sync 模式 3 条隐式事务合并为 1 条显式事务（syncWriteStr）；
+// v1.3.15：sync 模式 3 条隐式事务合并为 1 条显式事务（syncWriteStr）；
 // async 模式仅写内存 + 标脏（flusher 批量落盘）。
 func (s *Store) Set(ns, key string, val []byte, ttlMs int64, mode byte) (bool, error) {
 	s.ops.Add(1)
@@ -732,7 +732,7 @@ func (s *Store) IncrBy(ns, key string, delta int64) (int64, error) {
 	return nv, nil
 }
 
-// writeStrMem 写 string 类型 entry 的内存部分（调用方持 sh.mu；v1.4.0）。
+// writeStrMem 写 string 类型 entry 的内存部分（调用方持 sh.mu；v1.3.15）。
 func (s *Store) writeStrMem(sh *shard, ns, key string, val []byte, ttlAt int64) {
 	e := &entry{typ: 's', str: val, expiresAt: ttlAt, cachedSize: int64(len(val))}
 	s.putMem(sh, ns, key, e)
@@ -788,7 +788,7 @@ func (s *Store) MGet(ns string, keys []string) [][]byte {
 	return out
 }
 
-// MSet MSET k v ...（v1.4.0：分片下逐键原子——跨键整体原子性经 MULTI/EXEC 表达）。
+// MSet MSET k v ...（v1.3.15：分片下逐键原子——跨键整体原子性经 MULTI/EXEC 表达）。
 func (s *Store) MSet(ns string, kvs [][2][]byte) {
 	s.ops.Add(1)
 	for _, kv := range kvs {
@@ -807,7 +807,7 @@ func (s *Store) MSet(ns string, kvs [][2][]byte) {
 	}
 }
 
-// Keys KEYS pattern（glob：* ?；v1.4.0：跨分片汇聚）。
+// Keys KEYS pattern（glob：* ?；v1.3.15：跨分片汇聚）。
 func (s *Store) Keys(ns, pattern string) []string {
 	s.ops.Add(1)
 	var out []string
@@ -833,7 +833,7 @@ func (s *Store) Keys(ns, pattern string) []string {
 // list 队列
 // ---------------------------------------------------------------------------
 
-// listMem 取 list 项（调用方持 sh.mu；v1.4.0：纯内存部分）。
+// listMem 取 list 项（调用方持 sh.mu；v1.3.15：纯内存部分）。
 func (s *Store) listMem(sh *shard, ns, key string) *entry {
 	nd := sh.ns[ns]
 	var e *entry
@@ -876,7 +876,7 @@ func (s *Store) listSeq(e *entry) (int64, int64) {
 }
 
 // Push LPUSH/RPUSH（left=true 左插）→ 新长度。
-// v1.4.0：sync 模式每元素 INSERT + meta UPDATE 合并为单显式事务；async 模式标脏。
+// v1.3.15：sync 模式每元素 INSERT + meta UPDATE 合并为单显式事务；async 模式标脏。
 func (s *Store) Push(ns, key string, vals [][]byte, left bool) (int64, error) {
 	s.ops.Add(1)
 	sh := s.shardOf(ns, key)
@@ -927,7 +927,7 @@ func (s *Store) Pop(ns, key string, left bool, count int) ([][]byte, error) {
 	return s.popOnce(ns, key, left, count)
 }
 
-// popOnce 弹出实现（v1.4.0：分片锁内做内存摘除，锁外补 SQL/标脏；
+// popOnce 弹出实现（v1.3.15：分片锁内做内存摘除，锁外补 SQL/标脏；
 // Pop 与 BlockPop 共用）。
 func (s *Store) popOnce(ns, key string, left bool, count int) ([][]byte, error) {
 	sh := s.shardOf(ns, key)
@@ -1097,7 +1097,7 @@ func (s *Store) LRange(ns, key string, start, stop int64) ([][]byte, error) {
 	return out, nil
 }
 
-// Flush FLUSHDB：清空本命名空间（v1.4.0 分片版：按 0→15 顺序获取全部分片锁
+// Flush FLUSHDB：清空本命名空间（v1.3.15 分片版：按 0→15 顺序获取全部分片锁
 // 后整体清空——唯一同时持有多把分片锁的路径，其余路径均单锁，无死锁；
 // 恢复 v1.3.x 全局锁的 FLUSHDB 原子性，杜绝与并发 SET 的删行/写行交叠）。
 func (s *Store) Flush(ns string) int64 {
@@ -1147,11 +1147,11 @@ func (s *Store) Flush(ns string) int64 {
 }
 
 // ---------------------------------------------------------------------------
-// 内存治理（v1.4.0 分片版）
+// 内存治理（v1.3.15 分片版）
 // ---------------------------------------------------------------------------
 
 // evictAfterWrite 写后淘汰检查：先在本分片逐到水位线下，仍超限则全分片轮扫。
-// 调用方不得持有任何分片锁（v1.4.0）。
+// 调用方不得持有任何分片锁（v1.3.15）。
 func (s *Store) evictAfterWrite(sh *shard, protectNs, protectKey string) {
 	if s.maxB.Load() <= 0 || s.policy() == "noeviction" {
 		return
@@ -1200,7 +1200,7 @@ func (s *Store) evictGlobal(protectNs, protectKey string) {
 // 久未用 = 离 Back 更近者）；窗口内无显式 prio 键 → 第二轮纯 LRU 摘尾。
 // volatile-lru 策略两轮均跳过无 TTL 键。对 v1.3.13 全库扫语义的取舍：显式
 // prio 键只在 LRU 尾部窗口内参选（近期活跃的显式 prio 键暂不逐出），已在
-// CHANGELOG 标注（v1.4.0）。
+// CHANGELOG 标注（v1.3.15）。
 func (s *Store) evictOneLocked(sh *shard, protectNs, protectKey string) bool {
 	volatileOnly := s.policy() == "volatile-lru"
 	eligible := func(e *entry) bool { return !volatileOnly || e.expiresAt != 0 }
@@ -1348,7 +1348,7 @@ func (s *Store) MaxMemoryMB() int { return int(s.maxB.Load() >> 20) }
 func (s *Store) Eviction() string { return s.policy() }
 
 // Stats kv_stats 行（每命名空间 + '*' 合计；回源计数为全局值，v1.3.13）。
-// v1.4.0：跨分片逐分片快照汇聚；按 ns 名排序输出（分片化前行序为 map 随机序）。
+// v1.3.15：跨分片逐分片快照汇聚；按 ns 名排序输出（分片化前行序为 map 随机序）。
 func (s *Store) Stats() []StatRow {
 	srcH, srcM, srcE := s.srcHits.Load(), s.srcMisses.Load(), s.srcErrors.Load()
 	acc := map[string]*StatRow{}
@@ -1413,7 +1413,7 @@ func (s *Store) totalKeys() int64 {
 	return n
 }
 
-// expireLoop 定期扫描过期键（主动过期；v1.4.0：逐分片锁内摘内存，锁外投递
+// expireLoop 定期扫描过期键（主动过期；v1.3.15：逐分片锁内摘内存，锁外投递
 // 待删标记，SQL 补删由 flusher 完成——锁内零 IO）。
 func (s *Store) expireLoop(interval time.Duration) {
 	t := time.NewTicker(interval)
@@ -1483,7 +1483,7 @@ func (s *Store) EvictedPrioCount() int64 { return s.evictedPrio.Load() }
 func (s *Store) EvictedLRUCount() int64 { return s.evictedLRU.Load() }
 
 // ---------------------------------------------------------------------------
-// sync 模式落盘（v1.4.0：每写命令单显式事务，替代原多条隐式事务）
+// sync 模式落盘（v1.3.15：每写命令单显式事务，替代原多条隐式事务）
 // ---------------------------------------------------------------------------
 
 // syncWriteStr string 键整键落盘（DELETE kv_list + UPSERT kv_meta + UPSERT kv_str，

@@ -258,7 +258,7 @@ var (
 	reIdentLike = regexp.MustCompile("^[A-Za-z_\\x{4e00}-\\x{9fa5}][A-Za-z0-9_$\\x{4e00}-\\x{9fa5}]*$")
 	reRenameCol = regexp.MustCompile("(?i)^(?:COLUMN\\s+)?(`[^`]+`|[A-Za-z0-9_$\\x{4e00}-\\x{9fa5}]+)\\s+TO\\s+(`[^`]+`|[A-Za-z0-9_$\\x{4e00}-\\x{9fa5}]+)")
 
-	// v1.4.0：原函数体内现场编译的正则提为包级（列定义 NOT NULL/PRIMARY KEY 判定、
+	// v1.3.15：原函数体内现场编译的正则提为包级（列定义 NOT NULL/PRIMARY KEY 判定、
 	// UPDATE ... SET 定位、RENAME TABLE 对拆分）
 	reNotNullPK  = regexp.MustCompile(`(?i)\bNOT\s+NULL\b|\bPRIMARY\s+KEY\b`)
 	reSetKw      = regexp.MustCompile(`(?i)\bSET\s+`)
@@ -337,7 +337,7 @@ func buildColDefLocal(name, rest string) (colmeta.ColDef, bool) {
 		return colmeta.ColDef{}, false
 	}
 	cd := colmeta.ColDef{Name: name, Type: typ, Code: colmeta.ParseTypeCode(typ), Nullable: true}
-	if reNotNullPK.MatchString(rest) { // v1.4.0 预编译
+	if reNotNullPK.MatchString(rest) { // v1.3.15 预编译
 		cd.Nullable = false
 	}
 	return cd, true
@@ -407,7 +407,7 @@ func (h *Handler) quoteTextColumnLiterals(sq string) string {
 			return sq
 		}
 		prefix := sq[:len(sq)-len(after)] // m + tbl
-		sloc := reSetKw.FindStringIndex(after) // v1.4.0 预编译
+		sloc := reSetKw.FindStringIndex(after) // v1.3.15 预编译
 		if sloc == nil {
 			return sq
 		}
@@ -598,7 +598,7 @@ func (h *Handler) rewriteFloatPredicates(sq string) string {
 	}
 	return rewriteOutsideQuotesLocal(sq, func(seg string) string {
 		for col := range floatCols {
-			re := floatColPredRe(col) // v1.4.0 列模式缓存（此前每列每查询现场编译）
+			re := floatColPredRe(col) // v1.3.15 列模式缓存（此前每列每查询现场编译）
 			seg = re.ReplaceAllString(seg, "${1}CAST(${2} AS REAL) ${3}")
 			if m := reOrderBy.FindStringIndex(seg); m != nil {
 				seg = seg[:m[0]] + wrapOrderByCols(seg[m[0]:], col)
@@ -608,7 +608,7 @@ func (h *Handler) rewriteFloatPredicates(sq string) string {
 	})
 }
 
-// floatPredReCache / orderItemReCache 列名 → 编译正则缓存（v1.4.0：
+// floatPredReCache / orderItemReCache 列名 → 编译正则缓存（v1.3.15：
 // 浮点列比较谓词与 ORDER BY 包装的模式仅列名可变，逐查询现场编译是热点）。
 var (
 	floatPredReCache sync.Map  // string → *regexp.Regexp
@@ -678,7 +678,7 @@ func rewriteOutsideQuotesLocal(q string, fn func(string) string) string {
 
 // wrapOrderByCols ORDER BY 子句里该列的裸引用包 CAST。
 func wrapOrderByCols(orderBy string, col string) string {
-	reItem := orderItemRe(col) // v1.4.0 列模式缓存
+	reItem := orderItemRe(col) // v1.3.15 列模式缓存
 	return reItem.ReplaceAllString(orderBy, "${1}CAST(${2} AS REAL)${3}${4}")
 }
 
@@ -782,7 +782,7 @@ func (h *Handler) handleRenameTable(q string) (*mysql.Result, bool, error) {
 	}
 	db := h.session.CurrentDB()
 	for _, pair := range splitTopLevelLocal(m[1]) {
-		to := reRenamePair.FindStringSubmatch(strings.TrimSpace(pair)) // v1.4.0 预编译
+		to := reRenamePair.FindStringSubmatch(strings.TrimSpace(pair)) // v1.3.15 预编译
 		if to == nil {
 			return nil, true, mysql.NewError(1064, "syntax error near "+pair)
 		}
@@ -811,7 +811,7 @@ var alterNopPatterns = []string{
 	`^alter\s+(column\s+)?\S+\s+(set|drop)\s+default`, `^force`, `^validate`, `^discard\s+tablespace`,
 }
 
-// alterNopRes no-op ALTER 子句模式的预编译版（v1.4.0：此前每次 ALTER 逐条现场编译）。
+// alterNopRes no-op ALTER 子句模式的预编译版（v1.3.15：此前每次 ALTER 逐条现场编译）。
 var alterNopRes = func() []*regexp.Regexp {
 	out := make([]*regexp.Regexp, len(alterNopPatterns))
 	for i, p := range alterNopPatterns {
@@ -835,7 +835,7 @@ func (h *Handler) handleAlterTableIntercept(q string) (handled bool, stmt string
 	a := strings.TrimSpace(after)
 	low := strings.ToLower(a)
 
-	for _, nop := range alterNopRes { // v1.4.0 预编译
+	for _, nop := range alterNopRes { // v1.3.15 预编译
 		if nop.MatchString(low) {
 			return true, "", nil
 		}

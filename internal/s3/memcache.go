@@ -1,7 +1,7 @@
 package s3
 
 // ---------------------------------------------------------------------------
-// 统一内存缓存 + 纯内存对象（v1.4.0）
+// 统一内存缓存 + 纯内存对象（v1.3.15）
 //
 // memCache 是包内所有「可驱逐」内存字节的单一预算出口（s3.mem_cache /
 // mem_cache_mb / mem_cache_item_mb）。命名空间约定：
@@ -212,7 +212,7 @@ func (s *Store) memCacheInvalidatePrefix(prefix string) {
 	s.mem.invalidatePrefix(prefix)
 }
 
-// MemCacheStats 内存缓存观测（多行 "key: value"；SHOW S3 STATS 接线用，v1.4.0）。
+// MemCacheStats 内存缓存观测（多行 "key: value"；SHOW S3 STATS 接线用，v1.3.15）。
 func (s *Store) MemCacheStats() string {
 	if s.mem == nil {
 		return "mem_cache: disabled\n"
@@ -251,7 +251,7 @@ type memObj struct {
 	body []byte
 }
 
-// PutMemoryObject 写纯内存对象（v1.4.0）。语义定稿（beta）：
+// PutMemoryObject 写纯内存对象（v1.3.15）。语义定稿（beta）：
 //   - 元数据 + 内容仅存进程内存（memObjs 权威持有，不参与 LRU 驱逐），重启即失；
 //   - 单版本覆盖：versioning 桶亦不产生版本链 / 删除标记（VersionID 恒为空）；
 //   - 同 key 的既有 SQLite 副本（含全部版本）随本次写入清除——每个 key 的权威
@@ -306,7 +306,7 @@ func (s *Store) PutMemoryObject(bucket, key string, r io.Reader, attrs ObjectAtt
 	return meta, nil
 }
 
-// memObjAdmit 内存对象预算准入（v1.4.0；显式失败优先于静默驱逐丢数据）。
+// memObjAdmit 内存对象预算准入（v1.3.15；显式失败优先于静默驱逐丢数据）。
 func (s *Store) memObjAdmit(size int64) error {
 	if s.mem == nil {
 		return &s3Error{Code: "InvalidRequest", Status: 400,

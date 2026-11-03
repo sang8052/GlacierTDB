@@ -381,7 +381,7 @@ func (s *Store) CompleteMultipart(bucket, key, uploadID string, parts []PartSpec
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	// (v1.4.0 S6) 锁内 WORM 复检（TOCTOU 兜底，与锁前检查同语义）
+	// (v1.3.15 S6) 锁内 WORM 复检（TOCTOU 兜底，与锁前检查同语义）
 	if err := s.lockRecheckLocked(b, key); err != nil {
 		return out, false, err
 	}
@@ -547,7 +547,7 @@ func (s *Store) CompleteMultipart(bucket, key, uploadID string, parts []PartSpec
 	if err := tx.Commit(); err != nil {
 		return out, false, err
 	}
-	// (v1.4.0) 该 key 缓存失效（读缓存 + 纯内存命名空间）
+	// (v1.3.15) 该 key 缓存失效（读缓存 + 纯内存命名空间）
 	s.memCacheInvalidatePrefix(oBucketPrefix(bucket, key))
 	s.memObjDel(bucket, key)
 

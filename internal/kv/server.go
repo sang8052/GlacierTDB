@@ -267,7 +267,7 @@ func ServeConn(c net.Conn, store *Store, auths *auth.Store, cfg *config.Config) 
 	}
 }
 
-// blockingCmd 阻塞/会话态命令（v1.4.0）：dedicated_core 下留在连接 goroutine
+// blockingCmd 阻塞/会话态命令（v1.3.15）：dedicated_core 下留在连接 goroutine
 // 原地执行——BLPOP/BRPOP 会挂死全局串行执行核；SUBSCRIBE 族依赖连接本地
 // 订阅状态与确认帧顺序；AUTH/HELLO 携带会话级认证状态写入。
 func blockingCmd(cmd string) bool {
@@ -278,7 +278,7 @@ func blockingCmd(cmd string) bool {
 	return false
 }
 
-// runDispatch 按运算核模式执行单命令（v1.4.0）：dedicated_core 开启且非阻塞
+// runDispatch 按运算核模式执行单命令（v1.3.15）：dedicated_core 开启且非阻塞
 // 命令 → 投递专用执行 goroutine（同步等待：连接内保序、EXEC 内层顺序执行）；
 // 否则原地执行。返回 true 表示连接应关闭（QUIT）。
 func (s *session) runDispatch(cmd string, rest []string) bool {
@@ -335,7 +335,7 @@ func (s *session) dispatch(cmd string, rest []string) bool {
 
 	case "INFO":
 		// v1.3.13：glaciertdb_instance_id 字段（§6.2）+ 驱逐优先级分层计数 +
-		// SQL 回源观测（§3.2）；v1.4.0：落盘模式 / 刷盘计数 / 运算核模式；
+		// SQL 回源观测（§3.2）；v1.3.15：落盘模式 / 刷盘计数 / 运算核模式；
 		// hide_version 开启时 version 字段隐藏
 		ver := config.DisplayVersion()
 		if ver == "" {
@@ -1015,7 +1015,7 @@ func preAuthOK(cmd string) bool {
 var helloConnSeq uint64
 
 // doAuth 认证（统一账号体系：密码比对 + host 授权 + 锁定检查 + 登录审计/防爆破）。
-// 返回命名空间（账号名）。v1.4.0：密码比对改常数时间（crypto/subtle），防时序侧信道。
+// 返回命名空间（账号名）。v1.3.15：密码比对改常数时间（crypto/subtle），防时序侧信道。
 func doAuth(rest []string, ip, remote string, auths *auth.Store) (string, bool) {
 	var user, pass string
 	switch len(rest) {
@@ -1025,7 +1025,7 @@ func doAuth(rest []string, ip, remote string, auths *auth.Store) (string, bool) 
 			return "", false
 		}
 		for _, u := range auths.Users() {
-			// (v1.4.0) 常数时间比较：空密码账号不参与单密码路径匹配
+			// (v1.3.15) 常数时间比较：空密码账号不参与单密码路径匹配
 			if u.Password != "" && subtle.ConstantTimeCompare([]byte(u.Password), []byte(pass)) == 1 {
 				user = u.Username
 				break
@@ -1056,7 +1056,7 @@ func doAuth(rest []string, ip, remote string, auths *auth.Store) (string, bool) 
 		}
 	}
 	u, ok, err := auths.Lookup(user)
-	// (v1.4.0) 常数时间比较
+	// (v1.3.15) 常数时间比较
 	if err != nil || !ok || subtle.ConstantTimeCompare([]byte(u.Password), []byte(pass)) != 1 {
 		auths.RecordLogin(ip, remote, user, false, "kv: wrong password")
 		return "", false

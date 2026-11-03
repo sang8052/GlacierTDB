@@ -19,7 +19,7 @@ import (
 // 通道与用户系统告警一致：X-Glacier-Signature: sha256=<hmac_hex>。
 // URL / 密钥三级优先（v1.3.12）：请求级头 x-glacier-callback-url[-secret] >
 // 桶级（SET S3 CALLBACK）> 全局（s3.callback_url / s3.callback_secret）。
-// (v1.4.0 S2)：出站 client 换 netguard 防护（策略 security.callback_net_policy）——
+// (v1.3.15 S2)：出站 client 换 netguard 防护（策略 security.callback_net_policy）——
 // 不跟随重定向 + 连接期实际 IP 复核（防 DNS rebinding）；写路径另有静态预检
 //（Server.checkCallbackURL），此处 client 侧 Control 是第二道防线（重试全程生效）。
 func (s *Server) notifyPut(b Bucket, m ObjectMeta, replaced bool, ov *callbackOverride) {
@@ -42,7 +42,7 @@ func (s *Server) notifyPut(b Bucket, m ObjectMeta, replaced bool, ov *callbackOv
 	if url == "" {
 		return
 	}
-	// (v1.4.0 S2) 每次回调独立构造 netguard 防护 client（回调 fire-and-forget，
+	// (v1.3.15 S2) 每次回调独立构造 netguard 防护 client（回调 fire-and-forget，
 	// 无连接复用诉求；换取不跟随重定向 + 连接期 IP 复核）
 	client := netguard.NewClient(netguard.ParsePolicy(s.cfg.Security.CallbackNetPolicy), 10*time.Second)
 	payload := map[string]any{

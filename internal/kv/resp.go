@@ -4,7 +4,7 @@
 //   - key 类型：string / list 队列；
 //   - TTL：惰性过期 + 定期扫描；
 //   - 自动落盘：变更写 SQLite（glacier_kv.db，WAL），内存为缓存层，重启无损恢复；
-//     v1.4.0 起落盘模式可配（kv.persist_mode）：sync = 每写命令单事务实时落盘（默认）；
+//     v1.3.15 起落盘模式可配（kv.persist_mode）：sync = 每写命令单事务实时落盘（默认）；
 //     async = 内存先行 + AsyncFlushMs 周期批量落盘，崩溃丢失 ≤ flush 窗口（见 store.go 包注释）；
 //   - 命名空间：每用户独立 namespace（key 按登录账号隔离，跨用户不可见）；
 //   - 内存治理：kv.max_memory_mb 上限 + allkeys-lru / volatile-lru / noeviction 淘汰。
@@ -25,14 +25,14 @@ const (
 	maxBulkLen = 64 << 20
 )
 
-// respRWBuf 初始读写缓冲（v1.4.0：32KB → 4KB，万级连接下每连接固定内存减半；
+// respRWBuf 初始读写缓冲（v1.3.15：32KB → 4KB，万级连接下每连接固定内存减半；
 // RespWriter 的累积缓冲按需增长，大值写出后收缩回收）。
 const respRWBuf = 4096
 
 // RespReader RESP2 命令读取器（数组形式 + 内联形式）。
 type RespReader struct {
 	br   *bufio.Reader
-	bulk []byte // 复用的 bulk 参数读取缓冲（v1.4.0：避免每参数 make+双重拷贝）
+	bulk []byte // 复用的 bulk 参数读取缓冲（v1.3.15：避免每参数 make+双重拷贝）
 }
 
 // NewRespReader 构造读取器。
@@ -40,7 +40,7 @@ func NewRespReader(r io.Reader) *RespReader {
 	return &RespReader{br: bufio.NewReaderSize(r, respRWBuf)}
 }
 
-// growBulk 确保 bulk 缓冲 ≥ n 字节（2 的幂增长；v1.4.0）。
+// growBulk 确保 bulk 缓冲 ≥ n 字节（2 的幂增长；v1.3.15）。
 func (r *RespReader) growBulk(n int) {
 	if cap(r.bulk) >= n {
 		return
@@ -53,7 +53,7 @@ func (r *RespReader) growBulk(n int) {
 }
 
 // readLine 读一行并以 string 返回（CRLF/LF 尾去除）。
-// v1.4.0：改 ReadSlice 零拷贝快路径（超缓冲的罕见长行走拼接慢路径）。
+// v1.3.15：改 ReadSlice 零拷贝快路径（超缓冲的罕见长行走拼接慢路径）。
 func (r *RespReader) readLine() (string, error) {
 	line, err := r.br.ReadSlice('\n')
 	if err == bufio.ErrBufferFull {
@@ -81,9 +81,9 @@ func (r *RespReader) readLine() (string, error) {
 }
 
 // ReadCommand 读取一条命令（参数为字符串切片）；连接关闭返回 io.EOF。
-// v1.4.0：bulk 参数读进复用缓冲后 string(b) 一次成形（原实现 make([]byte,l+2)
+// v1.3.15：bulk 参数读进复用缓冲后 string(b) 一次成形（原实现 make([]byte,l+2)
 // + string 双重分配/拷贝）；返回的 []string 与内部缓冲无别名（string 不可变），
-// 可安全跨 goroutine 传递（独立运算核投递，v1.4.0）。
+// 可安全跨 goroutine 传递（独立运算核投递，v1.3.15）。
 func (r *RespReader) ReadCommand() ([]string, error) {
 	for {
 		line, err := r.readLine()
@@ -127,7 +127,7 @@ func (r *RespReader) ReadCommand() ([]string, error) {
 }
 
 // RespWriter RESP2 应答写入器。
-// v1.4.0：bufio.Writer + fmt.Fprintf 换为内部字节切片直接 append（整型走
+// v1.3.15：bufio.Writer + fmt.Fprintf 换为内部字节切片直接 append（整型走
 // strconv.AppendInt），Flush 一次 Write 系统调用写出；公开方法签名不变。
 type RespWriter struct {
 	dst io.Writer
@@ -188,7 +188,7 @@ func (w *RespWriter) Bulk(b []byte) {
 	w.buf = append(w.buf, '\r', '\n')
 }
 
-// BulkStr 字符串便捷（直取 string 字节，无 []byte 转换分配；v1.4.0）。
+// BulkStr 字符串便捷（直取 string 字节，无 []byte 转换分配；v1.3.15）。
 func (w *RespWriter) BulkStr(s string) {
 	w.buf = append(w.buf, '$')
 	w.buf = strconv.AppendInt(w.buf, int64(len(s)), 10)
@@ -237,7 +237,7 @@ func (w *RespWriter) ScanReply(cursor string, keys [][]byte) {
 	}
 }
 
-// Flush 提交缓冲（一次 Write；大值写出后收缩缓冲，v1.4.0）。
+// Flush 提交缓冲（一次 Write；大值写出后收缩缓冲，v1.3.15）。
 func (w *RespWriter) Flush() error {
 	if len(w.buf) == 0 {
 		return nil

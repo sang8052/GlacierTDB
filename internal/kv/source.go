@@ -29,7 +29,7 @@ import (
 //   - 观测：回源命中 / 未命中 / 执行耗时计数进 INFO 与 SHOW KV STATS。
 // ---------------------------------------------------------------------------
 
-// maxSourceSQL 回源 SQL 模板长度上限（v1.4.0 加固：防超长模板内联膨胀/拖累执行器）。
+// maxSourceSQL 回源 SQL 模板长度上限（v1.3.15 加固：防超长模板内联膨胀/拖累执行器）。
 const maxSourceSQL = 8 << 10
 
 // SetSourceExecutor 注入回源执行器（proxy 启动时；nil = 关闭回源）。
@@ -51,7 +51,7 @@ func (s *Store) loadSources() {
 		var r SourceRule
 		if rows.Scan(&r.Prefix, &r.DB, &r.SQLTpl, &r.TTLms, &r.CreatedTS) == nil {
 			if len(r.SQLTpl) > maxSourceSQL {
-				continue // v1.4.0 加固：库内超长模板跳过（手工改库防线）
+				continue // v1.3.15 加固：库内超长模板跳过（手工改库防线）
 			}
 			rules = append(rules, r)
 		}
@@ -95,10 +95,10 @@ func (s *Store) AddSourceRule(r SourceRule) error {
 		return fmt.Errorf("ERR invalid database name %q", r.DB)
 	}
 	if len(r.SQLTpl) > maxSourceSQL {
-		return fmt.Errorf("ERR SQL template too long (max %d bytes)", maxSourceSQL) // v1.4.0 加固
+		return fmt.Errorf("ERR SQL template too long (max %d bytes)", maxSourceSQL) // v1.3.15 加固
 	}
 	if strings.IndexByte(r.SQLTpl, 0) >= 0 {
-		return fmt.Errorf("ERR SQL template contains NUL byte") // v1.4.0 加固
+		return fmt.Errorf("ERR SQL template contains NUL byte") // v1.3.15 加固
 	}
 	ttl := r.TTLms
 	if ttl == 0 {
@@ -294,7 +294,7 @@ func (s *Store) sourceLookup(ns, key string) ([]byte, bool) {
 		if rerr != nil {
 			return nil, false, rerr
 		}
-		// v1.4.0 加固：绑定值含 NUL 拒绝回源——bindInline 为字符串内联，
+		// v1.3.15 加固：绑定值含 NUL 拒绝回源——bindInline 为字符串内联，
 		// NUL 会截断 SQLite 字面量造成语义偏移（真参数绑定需 readonly 执行器
 		// 支持占位参数，不在本目录，见 CHANGELOG 次优解标注）
 		for _, a := range args {
@@ -341,7 +341,7 @@ type srcCall struct {
 
 // bindInline SQL 模板 + 绑定值 → 可执行 SQL（参数来源为 key 段 / 整键，可能含
 // 引号——单引号加倍转义后内联；执行器侧另有库授权 + 只读 SELECT 校验）。
-// v1.4.0 加固边界：NUL 在调用侧（sourceLookup）拒绝、模板长度在注册/加载侧
+// v1.3.15 加固边界：NUL 在调用侧（sourceLookup）拒绝、模板长度在注册/加载侧
 // 限制（maxSourceSQL）；本函数保持「引号加倍 + 原样替换」。次优解标注：真参数
 // 绑定需 sqlite 只读执行器支持占位参数（readonly.go 不在 kv 目录），留待后续。
 func bindInline(sqlText string, args []any) string {

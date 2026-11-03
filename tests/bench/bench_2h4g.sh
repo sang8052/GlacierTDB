@@ -148,7 +148,7 @@ unit_of = {}
 for r in rows:
     med[(r["capability"], r["target"], r["scenario"])].append(r["value"])
     unit_of[(r["capability"], r["scenario"])] = r.get("unit", "")
-# 达标线（v1.4.0 目标口径）：MySQL ≥ 对照 1/3；Redis ≥ 对照 1/2；
+# 达标线（v1.3.15 目标口径）：MySQL ≥ 对照 1/3；Redis ≥ 对照 1/2；
 # MQ ≥ 对照 2/3；S3 报告比值不设门槛（v1.3.14 已反超 MinIO）
 GT_RATIO = {"mysql": 1/3, "redis": 1/2, "mq": 2/3}
 print("%-8s %-18s %12s %12s %8s %6s" % ("cap", "scenario", "glaciertdb", "baseline", "ratio", "pass"))

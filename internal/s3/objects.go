@@ -125,7 +125,7 @@ func (s *Store) spoolMemMax() int {
 	return m
 }
 
-// lockRecheckLocked 写锁内 WORM 复检（v1.4.0 S6，TOCTOU 兜底）：锁前 HeadObject
+// lockRecheckLocked 写锁内 WORM 复检（v1.3.15 S6，TOCTOU 兜底）：锁前 HeadObject
 // 检查与真正写事务之间存在窗口——SetLegalHold / SetRetain 同样要拿 writeMu，
 // 完全可能插在「锁前检查之后、写锁获取之前」。持锁后对当前最新版本再判一次，
 // 与锁前检查同语义（仅非 versioning 覆盖场景；versioning 写新版本不覆盖旧版本）。
@@ -290,7 +290,7 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
-	// (v1.4.0 S6) 锁内 WORM 复检（TOCTOU 兜底）：锁前检查到拿锁之间，SetLegalHold
+	// (v1.3.15 S6) 锁内 WORM 复检（TOCTOU 兜底）：锁前检查到拿锁之间，SetLegalHold
 	// / SetRetain 可持锁插入——覆盖语义与锁前检查一致
 	if err := s.lockRecheckLocked(b, key); err != nil {
 		return out, false, err
@@ -357,7 +357,7 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 		return out, false, err
 	}
 
-	// (v1.4.0) 写路径缓存失效：该 key 全版本读缓存（o: 前缀，键带 version/etag
+	// (v1.3.15) 写路径缓存失效：该 key 全版本读缓存（o: 前缀，键带 version/etag
 	// 本就错位即 miss，此处是空间卫生）+ 纯内存对象命名空间（权威副本唯一化）。
 	// deleteObjectRowsTx 已覆盖非 versioning 路径，这里统一再清一次（幂等）。
 	s.memCacheInvalidatePrefix(oBucketPrefix(bucket, key))
@@ -386,7 +386,7 @@ func (s *Store) PutObject(bucket, key string, r io.Reader, sizeHint int64, attrs
 
 // deleteObjectRowsTx 删除对象行 + 分块引用行，并释放池引用（单事务内；
 // versionID 空 = 该 key 的全部正式行 version_id=''）。调用方持 writeMu。
-// (v1.4.0) 行删除即失效该 key 读缓存 + 纯内存命名空间（事务回滚时只是多余 miss）。
+// (v1.3.15) 行删除即失效该 key 读缓存 + 纯内存命名空间（事务回滚时只是多余 miss）。
 func (s *Store) deleteObjectRowsTx(tx *sql.Tx, b Bucket, key, versionID string) error {
 	s.memCacheInvalidatePrefix(oBucketPrefix(b.Name, key))
 	s.memObjDel(b.Name, key)
@@ -439,7 +439,7 @@ const objectCols = `key,version_id,is_latest,delete_marker,size,etag,content_typ
 	cache_control,content_disposition,metadata,storage,manifest,legal_hold,retention_mode,retain_until,created_ts`
 
 // HeadObject 查对象元数据（versionID 空 = 最新版本；不存在返回 NoSuchKey）。
-// (v1.4.0) 纯内存对象优先：内存对象单版本（VersionID 恒空），带 versionId 的
+// (v1.3.15) 纯内存对象优先：内存对象单版本（VersionID 恒空），带 versionId 的
 // 查询不命中内存命名空间、照旧走库。
 func (s *Store) HeadObject(bucket, key, versionID string) (ObjectMeta, error) {
 	if versionID == "" {
@@ -542,7 +542,7 @@ func (c *contentReader) fetchNext() error {
 				return io.EOF
 			}
 			var data []byte
-			// (v1.4.0) chunk 池读缓存："c:<poolKey>"——内容寻址（数据不可变），
+			// (v1.3.15) chunk 池读缓存："c:<poolKey>"——内容寻址（数据不可变），
 			// 无需失效；热点对象 Range/整读免 SQL 大 BLOB 拉取
 			if b, ok := c.store.memCacheGet("c:" + c.hashes[c.hidx]); ok {
 				data = b
@@ -717,7 +717,7 @@ func (s *Store) GetObjectRange(bucket, key, versionID string, start, length int6
 }
 
 func (s *Store) getObjectRange(bucket, key, versionID string, start, length int64) (ObjectMeta, io.ReadCloser, error) {
-	// (v1.4.0) 纯内存对象：内容就在内存，直接出内联读取器（versionId 不适用）
+	// (v1.3.15) 纯内存对象：内容就在内存，直接出内联读取器（versionId 不适用）
 	if versionID == "" {
 		if mo, body, ok := s.memObjGet(bucket, key); ok {
 			if start > mo.Size {
@@ -771,7 +771,7 @@ func (s *Store) getObjectRange(bucket, key, versionID string, start, length int6
 	}
 	// 内容
 	if m.Storage == "inline" {
-		// (v1.4.0) 热点内联对象读缓存：稳定键 bucket+key+version+etag（错位即
+		// (v1.3.15) 热点内联对象读缓存：稳定键 bucket+key+version+etag（错位即
 		// miss，见 memcache.go 文件头），GET 路径零 SQL 内容读取
 		var content []byte
 		ck := ocacheKey(bucket, key, m.VersionID, m.ETag)
@@ -824,7 +824,7 @@ func (s *Store) DeleteObject(bucket, key, versionID string, bypassGovernance boo
 	if err != nil {
 		return ObjectMeta{}, err
 	}
-	// (v1.4.0) 纯内存对象：删除即移除（单版本覆盖语义，无版本链 / 删除标记；
+	// (v1.3.15) 纯内存对象：删除即移除（单版本覆盖语义，无版本链 / 删除标记；
 	// 对象锁不适用——内存对象无 SQLite 行可挂）。带 versionId 的查询不命中内存
 	// 命名空间（内存对象无版本），照旧走库。
 	if versionID == "" {
@@ -1067,7 +1067,7 @@ func (s *Store) ListObjects(bucket, prefix, delimiter, marker, startAfter string
 		})
 		count++
 	}
-	// (v1.4.0) 合并纯内存对象（简化语义：追加在 SQL 结果之后——prefix 过滤 +
+	// (v1.3.15) 合并纯内存对象（简化语义：追加在 SQL 结果之后——prefix 过滤 +
 	// marker 下界 + delimiter 折叠 + maxKeys 触顶置 IsTruncated；不参与公共前缀
 	// 与 SQL 行的精确交叉分页，只保证可见性。键冲突以 SQL 行为准——写路径保证
 	// 同 key 写入清除内存对象，此处兜底去重）
@@ -1076,7 +1076,7 @@ func (s *Store) ListObjects(bucket, prefix, delimiter, marker, startAfter string
 	return res, nil
 }
 
-// mergeMemObjects LIST 结果并入纯内存对象（v1.4.0；见 ListObjects 调用点注释）。
+// mergeMemObjects LIST 结果并入纯内存对象（v1.3.15；见 ListObjects 调用点注释）。
 func (s *Store) mergeMemObjects(bucket, prefix, delimiter, after string, res *ListResult,
 	maxKeys int, count *int, seenPrefix map[string]bool) {
 	metas := s.memObjMetas(bucket)
@@ -1384,7 +1384,7 @@ func (s *Store) copyObjectRefs(srcBucket, srcKey string, m ObjectMeta, dstBucket
 
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	// (v1.4.0 S6) 锁内 WORM 复检（TOCTOU 兜底，与锁前检查同语义）
+	// (v1.3.15 S6) 锁内 WORM 复检（TOCTOU 兜底，与锁前检查同语义）
 	if err := s.lockRecheckLocked(db, dstKey); err != nil {
 		return out, err
 	}
@@ -1447,7 +1447,7 @@ func (s *Store) copyObjectRefs(srcBucket, srcKey string, m ObjectMeta, dstBucket
 	if err := tx.Commit(); err != nil {
 		return out, err
 	}
-	// (v1.4.0) 目标 key 缓存失效（读缓存 + 纯内存命名空间）
+	// (v1.3.15) 目标 key 缓存失效（读缓存 + 纯内存命名空间）
 	s.memCacheInvalidatePrefix(oBucketPrefix(dstBucket, dstKey))
 	s.memObjDel(dstBucket, dstKey)
 	s.AddUsage(db.Owner, dstBucket, "PUT", 0, 0) // 零拷贝：不计 bytes_in（内容未经过网络/磁盘重写）
@@ -1602,7 +1602,7 @@ func (s *Store) MoveObject(srcBucket, srcKey, dstBucket, dstKey string, _ Object
 		return ObjectMeta{}, err
 	}
 
-	// (v1.4.0) 源/目标 key 缓存失效（读缓存 + 纯内存命名空间）
+	// (v1.3.15) 源/目标 key 缓存失效（读缓存 + 纯内存命名空间）
 	s.memCacheInvalidatePrefix(oBucketPrefix(srcBucket, srcKey))
 	s.memCacheInvalidatePrefix(oBucketPrefix(dstBucket, dstKey))
 	s.memObjDel(srcBucket, srcKey)

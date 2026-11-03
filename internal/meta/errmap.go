@@ -1,4 +1,4 @@
-// Package meta — SQLite 错误 → MySQL 协议错误细化映射（v1.4.0）。
+// Package meta — SQLite 错误 → MySQL 协议错误细化映射（v1.3.15）。
 //
 // 此前 handler.MapSQLiteErr 对 SQLITE_ERROR 一律报 1064、CONSTRAINT 一律报 1062，
 // 客户端（pymysql / SQLAlchemy 的 IntegrityError / OperationalError / ProgrammingError

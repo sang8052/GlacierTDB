@@ -1,4 +1,4 @@
-// Package s3 — 图片预处理结果缓存（GET 加工链路，v1.3.10；v1.4.0 双后端）。
+// Package s3 — 图片预处理结果缓存（GET 加工链路，v1.3.10；v1.3.15 双后端）。
 //
 // 缓存键 = sha256(bucket + key + versionId + etag + 参数规范化串)：对象被覆盖/
 // 删除后 etag/version 变化，旧缓存条目自然失效（残留由 LRU 容量回收清理）。
@@ -27,7 +27,7 @@ import (
 	"glaciertdb/internal/logx"
 )
 
-// imgCache 图片派生缓存器（v1.4.0 双后端）：
+// imgCache 图片派生缓存器（v1.3.15 双后端）：
 //   - memory：落统一内存缓存（"g:<sha256>"，计入 mem_cache_mb 预算；image_cache_mb
 //     不生效），不写 <db_dir>/sys/gimg_cache/；
 //   - disk：原磁盘目录路径（<hash>.bin + <hash>.meta，mtime LRU）。
@@ -36,7 +36,7 @@ import (
 type imgCache struct {
 	dir      string    // 磁盘后端目录（memory 后端恒空）
 	maxBytes int64     // 磁盘后端容量上限（-1 = 不限）
-	mem      *memCache // memory 后端（nil = 磁盘后端；v1.4.0）
+	mem      *memCache // memory 后端（nil = 磁盘后端；v1.3.15）
 
 	mu        sync.Mutex
 	flights   map[string]*imgCacheFlight
@@ -60,7 +60,7 @@ type imgCacheMeta struct {
 // imgMemKey 内存后端缓存键（统一内存缓存命名空间 "g:"）。
 func imgMemKey(hash string) string { return "g:" + hash }
 
-// newImgCache 创建缓存器（v1.4.0：backend=memory 走统一内存缓存——mem 为 nil
+// newImgCache 创建缓存器（v1.3.15：backend=memory 走统一内存缓存——mem 为 nil
 // 时（mem_cache 关闭）告警回退磁盘后端；dir 空 或 maxMB==0 关闭）。
 func newImgCache(dir string, maxMB int, backend string, mem *memCache) *imgCache {
 	c := &imgCache{flights: map[string]*imgCacheFlight{}}
@@ -109,7 +109,7 @@ func (c *imgCache) get(hash string) ([]byte, string, bool) {
 	if !c.enabled() {
 		return nil, "", false
 	}
-	if c.mem != nil { // (v1.4.0) 内存后端：封包 [ctLen u16][ct][data]
+	if c.mem != nil { // (v1.3.15) 内存后端：封包 [ctLen u16][ct][data]
 		if raw, ok := c.mem.get(imgMemKey(hash)); ok && len(raw) >= 2 {
 			n := int(binary.BigEndian.Uint16(raw[:2]))
 			if 2+n <= len(raw) {
@@ -140,7 +140,7 @@ func (c *imgCache) put(hash string, data []byte, ct string) {
 	if !c.enabled() || len(data) == 0 {
 		return
 	}
-	if c.mem != nil { // (v1.4.0) 内存后端：计入 mem_cache_mb 统一预算（LRU 自管）
+	if c.mem != nil { // (v1.3.15) 内存后端：计入 mem_cache_mb 统一预算（LRU 自管）
 		if len(ct) > 65535 {
 			ct = ct[:65535]
 		}

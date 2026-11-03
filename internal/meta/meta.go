@@ -211,7 +211,7 @@ func IsAttachStmt(q string) bool { return reAttach.MatchString(q) }
 // RewriteLastInsertID 把 LAST_INSERT_ID() 改写为 SQLite 等价函数。
 func RewriteLastInsertID(q string) string { return reLastInsertIDCall.ReplaceAllString(q, "last_insert_rowid()") }
 
-// dialectTriggerFragments RewriteDialect 全部改写器的触发词并集（v1.4.0 快路径）。
+// dialectTriggerFragments RewriteDialect 全部改写器的触发词并集（v1.3.15 快路径）。
 // 逐项核对来源：RewriteOperators（&& || ! XOR RLIKE BINARY/DIV/0x/字符集前缀）、
 // RewriteJSONOps（->）、expandInterval（INTERVAL）、reDatePred（ISO 日期字面量）、
 // reTimeBucket（time(）、reFromUnix、reNow/reCurdate/reCurtime/reUnixsw、reTrunc、
@@ -222,7 +222,7 @@ func RewriteLastInsertID(q string) string { return reLastInsertIDCall.ReplaceAll
 // 反引号/@ 与 ::/DATE_FORMAT/STR_TO_DATE 按保守策略一并触发（可能误伤、绝不漏改）。
 var dialectTriggerFragments = []string{
 	"(?i)^\\s*(CREATE|ALTER|DROP|RENAME)\\b", // DDL 一律走完整改写：UNIQUE KEY uk(cols) 等
-	// MySQL 专有 DDL 语法依赖 RewriteMySQLCompat/RewriteDDLTypes 转换（v1.4.0 修复：
+	// MySQL 专有 DDL 语法依赖 RewriteMySQLCompat/RewriteDDLTypes 转换（v1.3.15 修复：
 	// 快路径曾跳过导致 UNIQUE KEY 建表丢唯一索引）
 	"[`@]",             // 反引号标识符 / 用户·系统变量（INSERT SET、DDL 规则等）
 	"::",               // PostgreSQL 风格 cast（保守触发）
@@ -288,7 +288,7 @@ var dialectTriggerFragments = []string{
 // reDialectTrigger 合并触发词正则：命中 = 需要重改写；全部未命中 = 可安全跳过。
 var reDialectTrigger = regexp.MustCompile(`(?is)` + strings.Join(dialectTriggerFragments, "|"))
 
-// RewriteFastPath 判断语句是否可走改写快路径（v1.4.0）：
+// RewriteFastPath 判断语句是否可走改写快路径（v1.3.15）：
 // 返回 true = 不含任何改写触发词，可跳过 RewriteDialect 的全套正则重改写
 //（StripComments / RewriteDBPrefix / UnescapeLiterals 等基础改写不在此列，仍须执行）。
 // 保守策略：不确定语法一律按需要改写处理（误触发只损失性能，漏触发破坏正确性）。
@@ -296,7 +296,7 @@ func RewriteFastPath(q string) bool { return !reDialectTrigger.MatchString(q) }
 
 // RewriteDialect 少量 MySQL 函数改写。
 func RewriteDialect(q string) string {
-	// ---- v1.4.0 快路径：无触发词时跳过全套重改写（RewriteLastInsertID 幂等，
+	// ---- v1.3.15 快路径：无触发词时跳过全套重改写（RewriteLastInsertID 幂等，
 	//      调用链已预处理时为 no-op，未预处理时在此补齐，语义不变）----
 	if !reDialectTrigger.MatchString(q) {
 		return RewriteLastInsertID(q)
@@ -376,7 +376,7 @@ func expandInterval(q string) string {
 // ---------------------------------------------------------------------------
 
 // HandleProbe 处理探活/元语句。MapSQLError 在 main 里注入（避免 import cycle）；
-// v1.4.0 缺省即走 SQLite→MySQL 细化映射（proxy 注入 handler.MapSQLiteErr 时含 QoS 分支）。
+// v1.3.15 缺省即走 SQLite→MySQL 细化映射（proxy 注入 handler.MapSQLiteErr 时含 QoS 分支）。
 var MapSQLError = func(err error) error { return MapSQLiteToMySQLError(err, "") }
 
 // ColumnTypeLookuper 列类型回放钩子（handler 注入 colmeta：SQLite 声明类型 →
@@ -1237,7 +1237,7 @@ var reLineComment = regexp.MustCompile(`--[^
 ]*|#[^
 ]*`)
 
-// IsEmptyStatement 判断是否空语句（仅注释 / 空白 / 分号，v1.4.0）。
+// IsEmptyStatement 判断是否空语句（仅注释 / 空白 / 分号，v1.3.15）。
 // 纯注释语句交 SQLite 预备会得到零条语句——ncruces 驱动随后执行必 panic
 //（*Stmt 为 nil，BindCount 解引用），连接随之死亡/挂起；mysql CLI 批量脚本
 //（init_schema.sql 等以注释头开头的文件）会发出这种语句。必须提前拦截。
@@ -1271,7 +1271,7 @@ func rowGet(row []any, i int) string {
 	}
 }
 
-// dbPrefixReCache 库名 → 编译正则缓存（v1.4.0：此前每查询按库名现场编译，
+// dbPrefixReCache 库名 → 编译正则缓存（v1.3.15：此前每查询按库名现场编译，
 // 一条查询一次 MustCompile 是改写管线的隐藏热点）。
 var dbPrefixReCache sync.Map // string → *regexp.Regexp
 

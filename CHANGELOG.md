@@ -2,7 +2,7 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号语义化。
 
-## [1.4.0.beta] - 2026-11-03
+## [1.3.15.beta] - 2026-11-03
 
 > 版本主题「**安全加固 + 四线性能重构**」：全仓安全审计修复（SSRF / 越权 / TOCTOU
 > 等 13 项）+ MySQL 查询性能重构 + SQL 错误消息 MySQL 标准化 + Redis 层重构

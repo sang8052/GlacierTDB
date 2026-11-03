@@ -64,7 +64,7 @@ type archiveEntry struct {
 	Size int64
 }
 
-// cleanArchiveName 打包条目名清洗（v1.4.0 S8，防 zip-slip / tar 路径穿越）：
+// cleanArchiveName 打包条目名清洗（v1.3.15 S8，防 zip-slip / tar 路径穿越）：
 // 剥前导 '/'、压缩连续 '/'（空段丢弃）、把 "." / ".." 段替换为 "_"——解包端
 // 永不越出解压目标目录。对象 key 语义不受影响（打包条目名仅展示/解包用）。
 func cleanArchiveName(key string) string {
@@ -86,7 +86,7 @@ func cleanArchiveName(key string) string {
 	return name
 }
 
-// archiveDownload 打包下载入口（handleBucket / handleObject 路由；v1.4.0 任务2：
+// archiveDownload 打包下载入口（handleBucket / handleObject 路由；v1.3.15 任务2：
 // prefix 容忍前导 '/'——vhost 形态前端常把整段 path 原样塞进参数）。
 func (h *endpointHandler) archiveDownload(w http.ResponseWriter, r *http.Request, bucket, prefix, owner, reqID string,
 	lim config.S3Limit, userTB *tokenBucket) {
@@ -153,7 +153,7 @@ func (h *endpointHandler) archiveDownload(w http.ResponseWriter, r *http.Request
 }
 
 // archiveStream 流式 tar：边读边打包边发（不压缩；Content-Length 不可知走 chunked）。
-// (v1.4.0) HEAD：仅返回响应头（tar 流式无总大小可预告，无 Content-Length）。
+// (v1.3.15) HEAD：仅返回响应头（tar 流式无总大小可预告，无 Content-Length）。
 func (h *endpointHandler) archiveStream(w http.ResponseWriter, r *http.Request, bucket string,
 	arc []archiveEntry, lim config.S3Limit, userTB *tokenBucket, reqID string, headOnly bool) {
 	w.Header().Set("Content-Type", "application/x-tar")
@@ -172,7 +172,7 @@ func (h *endpointHandler) archiveStream(w http.ResponseWriter, r *http.Request, 
 			continue
 		}
 		hdr := &tar.Header{
-			Name:    cleanArchiveName(e.Key), // (v1.4.0 S8) 条目名清洗
+			Name:    cleanArchiveName(e.Key), // (v1.3.15 S8) 条目名清洗
 			Mode:    0o644,
 			Size:    m.Size,
 			ModTime: time.Now(),
@@ -191,7 +191,7 @@ func (h *endpointHandler) archiveStream(w http.ResponseWriter, r *http.Request, 
 }
 
 // archiveDone 完成后下载：先落临时包再整包发送（支持压缩）。
-// (v1.4.0) HEAD：包照常构建（Content-Length 给真实包大小），body 不发送。
+// (v1.3.15) HEAD：包照常构建（Content-Length 给真实包大小），body 不发送。
 func (h *endpointHandler) archiveDone(w http.ResponseWriter, r *http.Request, bucket string,
 	arc []archiveEntry, format string, lim config.S3Limit, userTB *tokenBucket, reqID string, headOnly bool) {
 	tmpDir := filepath.Join(h.srv.cfg.DBDir, ".s3tmp")
@@ -204,7 +204,7 @@ func (h *endpointHandler) archiveDone(w http.ResponseWriter, r *http.Request, bu
 
 	if err := h.buildArchive(pkgPath, bucket, arc, format); err != nil {
 		_ = os.Remove(pkgPath)
-		// (v1.4.0 S7) 构建失败细节（含文件系统路径）只落日志，不进响应体
+		// (v1.3.15 S7) 构建失败细节（含文件系统路径）只落日志，不进响应体
 		logx.Errorf("s3 archive build failed: %v", err)
 		writeErr(w, r, reqID, &s3Error{Code: "InternalError", Status: 500, Msg: "archive build failed"})
 		return
@@ -219,7 +219,7 @@ func (h *endpointHandler) archiveDone(w http.ResponseWriter, r *http.Request, bu
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", name))
 	w.Header().Set("Content-Length", strconv.FormatInt(fi.Size(), 10))
 	w.WriteHeader(http.StatusOK)
-	if headOnly { // (v1.4.0) HEAD：包无下载者，直接清理
+	if headOnly { // (v1.3.15) HEAD：包无下载者，直接清理
 		_ = os.Remove(pkgPath)
 		return
 	}
@@ -281,7 +281,7 @@ func (h *endpointHandler) buildArchive(pkgPath, bucket string, arc []archiveEntr
 			if t, perr := time.ParseInLocation("2006-01-02 15:04:05", m.CreatedTS, time.Local); perr == nil {
 				mod = t
 			}
-			hdr := &zip.FileHeader{Name: cleanArchiveName(e.Key), Method: zip.Deflate, Modified: mod} // (v1.4.0 S8) 条目名清洗
+			hdr := &zip.FileHeader{Name: cleanArchiveName(e.Key), Method: zip.Deflate, Modified: mod} // (v1.3.15 S8) 条目名清洗
 			hdr.SetMode(0o644)
 			fw, zerr := zw.CreateHeader(hdr)
 			if zerr != nil {
@@ -307,7 +307,7 @@ func (h *endpointHandler) fillTar(tw *tar.Writer, bucket string, arc []archiveEn
 		if t, perr := time.ParseInLocation("2006-01-02 15:04:05", m.CreatedTS, time.Local); perr == nil {
 			mod = t
 		}
-		if err := tw.WriteHeader(&tar.Header{Name: cleanArchiveName(e.Key), Mode: 0o644, Size: m.Size, ModTime: mod, Typeflag: tar.TypeReg}); err != nil { // (v1.4.0 S8) 条目名清洗
+		if err := tw.WriteHeader(&tar.Header{Name: cleanArchiveName(e.Key), Mode: 0o644, Size: m.Size, ModTime: mod, Typeflag: tar.TypeReg}); err != nil { // (v1.3.15 S8) 条目名清洗
 			rc.Close()
 			return err
 		}

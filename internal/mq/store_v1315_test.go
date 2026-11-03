@@ -9,7 +9,7 @@ import (
 	"glaciertdb/internal/sqlite"
 )
 
-// v1.4.0 冒烟回归：写后落盘（journal+confirm）、内存派发、ack 批量删除、
+// v1.3.15 冒烟回归：写后落盘（journal+confirm）、内存派发、ack 批量删除、
 // transient 纯内存、重启恢复、async_flush_ms=0 旧同步路径兼容。
 // 说明：运行需 sqlite.Backend（本机无工具链，在远端 docker 内 go test 执行）。
 

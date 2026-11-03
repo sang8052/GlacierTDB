@@ -2,7 +2,7 @@
 
 package kv
 
-// 独立运算核（v1.4.0）：非 Linux 平台不支持核绑定，dedicated_core 的单线程
+// 独立运算核（v1.3.15）：非 Linux 平台不支持核绑定，dedicated_core 的单线程
 // 串行执行语义仍然生效，启动日志注明。
 
 // bindExecCore 非 Linux 平台：不绑核。返回 (-1, false)。

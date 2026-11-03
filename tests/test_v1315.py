@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""v1.4.0 黑盒测试（安全加固 + 四线性能重构）：
+"""v1.3.15 黑盒测试（安全加固 + 四线性能重构）：
 
 1) SQL 错误 MySQL 标准化：1146/1054/1305/1062/1048/3819/1452/1050/1064 错误码与
    标准文案（不再裸透传 SQLite 原文）
@@ -79,14 +79,14 @@ def main() -> int:
     # ==================================================================
     if ASYNC_MODE:
         r = redis.Redis(host=HOST, port=PORT, password=ADMIN_PW, decode_responses=True)
-        r.set("asyncstr:v140", "persist-me")
-        r.rpush("asyncq:v140", "a", "b", "c")
-        r.set("asyncexp:v140", "gone-soon", px=60000)
+        r.set("asyncstr:v1315", "persist-me")
+        r.rpush("asyncq:v1315", "a", "b", "c")
+        r.set("asyncexp:v1315", "gone-soon", px=60000)
         conn2 = pika.BlockingConnection(pika.ConnectionParameters(
             host=HOST, port=PORT, credentials=pika.PlainCredentials(ADMIN, ADMIN_PW)))
         ch = conn2.channel()
-        ch.queue_declare(queue="v140-async-durable", durable=True)
-        ch.basic_publish(exchange="", routing_key="v140-async-durable",
+        ch.queue_declare(queue="v1315-async-durable", durable=True)
+        ch.basic_publish(exchange="", routing_key="v1315-async-durable",
                          body=b"async-durable-payload",
                          properties=pika.BasicProperties(delivery_mode=2))
         conn2.close()
@@ -97,12 +97,12 @@ def main() -> int:
     # --check-async 场景：重启后验证数据仍在
     if CHECK_ASYNC:
         r = redis.Redis(host=HOST, port=PORT, password=ADMIN_PW, decode_responses=True)
-        check(r.get("asyncstr:v140") == "persist-me", "async 重启后 kv 字符串恢复")
-        check(r.lrange("asyncq:v140", 0, -1) == ["a", "b", "c"], "async 重启后队列元素与顺序恢复")
+        check(r.get("asyncstr:v1315") == "persist-me", "async 重启后 kv 字符串恢复")
+        check(r.lrange("asyncq:v1315", 0, -1) == ["a", "b", "c"], "async 重启后队列元素与顺序恢复")
         conn2 = pika.BlockingConnection(pika.ConnectionParameters(
             host=HOST, port=PORT, credentials=pika.PlainCredentials(ADMIN, ADMIN_PW)))
         ch = conn2.channel()
-        m, mf, body = ch.basic_get("v140-async-durable", auto_ack=False)
+        m, mf, body = ch.basic_get("v1315-async-durable", auto_ack=False)
         check(m is not None and body == b"async-durable-payload", "async 重启后 durable 消息恢复")
         if m is not None:
             ch.basic_ack(m.delivery_tag)
@@ -113,38 +113,38 @@ def main() -> int:
     # ==================================================================
     # 1) SQL 错误 MySQL 标准化
     # ==================================================================
-    cur.execute("DROP TABLE IF EXISTS e140_t1")
-    cur.execute("DROP TABLE IF EXISTS e140_t2")
-    cur.execute("CREATE TABLE e140_t1 (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL, "
+    cur.execute("DROP TABLE IF EXISTS e1315_t1")
+    cur.execute("DROP TABLE IF EXISTS e1315_t2")
+    cur.execute("CREATE TABLE e1315_t1 (id INT PRIMARY KEY, name VARCHAR(20) NOT NULL, "
                 "age INT CHECK (age >= 0), UNIQUE KEY uk_name (name))")
-    cur.execute("CREATE TABLE e140_t2 (id INT PRIMARY KEY, "
-                "t1id INT, FOREIGN KEY (t1id) REFERENCES e140_t1(id))")
+    cur.execute("CREATE TABLE e1315_t2 (id INT PRIMARY KEY, "
+                "t1id INT, FOREIGN KEY (t1id) REFERENCES e1315_t1(id))")
 
-    code, msg = err_code(cur.execute, "SELECT * FROM no_such_table_v140")
+    code, msg = err_code(cur.execute, "SELECT * FROM no_such_table_v1315")
     check(code == 1146, "表不存在 1146（got %d %s）" % (code, msg[:60]))
     check("doesn't exist" in msg, "1146 文案 'doesn't exist'（%s）" % msg[:70])
 
-    code, msg = err_code(cur.execute, "SELECT no_such_col_v140 FROM e140_t1")
+    code, msg = err_code(cur.execute, "SELECT no_such_col_v1315 FROM e1315_t1")
     check(code == 1054, "列不存在 1054（got %d）" % code)
 
-    code, msg = err_code(cur.execute, "SELECT no_such_fn_v140(1)")
+    code, msg = err_code(cur.execute, "SELECT no_such_fn_v1315(1)")
     check(code == 1305, "函数不存在 1305（got %d）" % code)
 
-    cur.execute("INSERT INTO e140_t1 VALUES (1, 'a', 10)")
-    code, msg = err_code(cur.execute, "INSERT INTO e140_t1 VALUES (2, 'a', 10)")
+    cur.execute("INSERT INTO e1315_t1 VALUES (1, 'a', 10)")
+    code, msg = err_code(cur.execute, "INSERT INTO e1315_t1 VALUES (2, 'a', 10)")
     check(code == 1062, "唯一冲突 1062（got %d %s）" % (code, msg[:60]))
-    check("e140_t1.name" in msg, "1062 带键名（SQLite 报列名）（%s）" % msg[:70])
+    check("e1315_t1.name" in msg, "1062 带键名（SQLite 报列名）（%s）" % msg[:70])
 
-    code, msg = err_code(cur.execute, "INSERT INTO e140_t1 VALUES (3, NULL, 10)")
+    code, msg = err_code(cur.execute, "INSERT INTO e1315_t1 VALUES (3, NULL, 10)")
     check(code == 1048, "NOT NULL 1048（got %d）" % code)
 
-    code, msg = err_code(cur.execute, "INSERT INTO e140_t1 VALUES (4, 'neg', -1)")
+    code, msg = err_code(cur.execute, "INSERT INTO e1315_t1 VALUES (4, 'neg', -1)")
     check(code == 3819, "CHECK 违例 3819（got %d）" % code)
 
-    code, msg = err_code(cur.execute, "INSERT INTO e140_t2 VALUES (1, 999)")
+    code, msg = err_code(cur.execute, "INSERT INTO e1315_t2 VALUES (1, 999)")
     check(code == 1452, "外键违例 1452（got %d）" % code)
 
-    code, msg = err_code(cur.execute, "CREATE TABLE e140_t1 (id INT)")
+    code, msg = err_code(cur.execute, "CREATE TABLE e1315_t1 (id INT)")
     check(code == 1050, "表已存在 1050（got %d）" % code)
 
     code, msg = err_code(cur.execute, "SELEC 1")
@@ -201,7 +201,7 @@ def main() -> int:
     check(code != 0, "S5 域名路径穿越拒绝（%d %s）" % (code, msg[:50]))
     code, msg = err_code(acur.execute, "ALTER BUCKET %s ADD DOMAIN 'bad host!'" % tkb)
     check(code != 0, "S5 非法字符域名拒绝（%d）" % code)
-    code, msg = err_code(acur.execute, "ALTER BUCKET %s ADD DOMAIN 'v140.example.com' ISSUE" % tkb)
+    code, msg = err_code(acur.execute, "ALTER BUCKET %s ADD DOMAIN 'v1315.example.com' ISSUE" % tkb)
     check(code == 0, "S5 合法域名放行（%d %s）" % (code, msg[:60]))
 
     # ==================================================================
@@ -277,11 +277,11 @@ def main() -> int:
     # 5) KV 冒烟 + 运行模式观测
     # ==================================================================
     r = redis.Redis(host=HOST, port=PORT, password=ADMIN_PW, decode_responses=True)
-    r.set("v140:smoke", "ok")
-    check(r.get("v140:smoke") == "ok", "KV SET/GET 往返")
-    check(r.incr("v140:cnt") >= 1, "KV INCR")
-    r.rpush("v140:list", "x", "y")
-    check(r.rpop("v140:list") == "y", "KV LPUSH/RPOP")
+    r.set("v1315:smoke", "ok")
+    check(r.get("v1315:smoke") == "ok", "KV SET/GET 往返")
+    check(r.incr("v1315:cnt") >= 1, "KV INCR")
+    r.rpush("v1315:list", "x", "y")
+    check(r.rpop("v1315:list") == "y", "KV LPUSH/RPOP")
     info = r.info()
     check(info.get("persist_mode", "sync") == "sync", "INFO persist_mode=sync（默认）")
     check("core_mode" in info, "INFO core_mode 存在（%s）" % info.get("core_mode"))
@@ -292,11 +292,11 @@ def main() -> int:
     conn2 = pika.BlockingConnection(pika.ConnectionParameters(
         host=HOST, port=PORT, credentials=pika.PlainCredentials(ADMIN, ADMIN_PW)))
     ch = conn2.channel()
-    ch.queue_declare(queue="v140-smoke", durable=True)
-    ch.basic_publish(exchange="", routing_key="v140-smoke", body=b"hello-140",
+    ch.queue_declare(queue="v1315-smoke", durable=True)
+    ch.basic_publish(exchange="", routing_key="v1315-smoke", body=b"hello-1315",
                      properties=pika.BasicProperties(delivery_mode=2))
-    m, mf, body = ch.basic_get("v140-smoke", auto_ack=False)
-    check(m is not None and body == b"hello-140", "MQ durable publish/consume")
+    m, mf, body = ch.basic_get("v1315-smoke", auto_ack=False)
+    check(m is not None and body == b"hello-1315", "MQ durable publish/consume")
     if m is not None:
         ch.basic_ack(m.delivery_tag)
     conn2.close()

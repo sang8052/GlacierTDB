@@ -202,7 +202,7 @@ func isS3Command(up func(int) string) bool {
 		return up(1) == "BUCKETS" || (up(1) == "S3" && (up(2) == "KEYS" || up(2) == "USAGE" ||
 			up(2) == "LIFECYCLE" || up(2) == "DOMAINS" || up(2) == "POLICIES" || up(2) == "OBJECTS" ||
 			up(2) == "UPLOADS" || up(2) == "SPACE" || up(2) == "SYNC" ||
-			up(2) == "GRANTS" || up(2) == "TOKENS" || up(2) == "CACHE")) // v1.3.14 §1/§4 + v1.4.0 CACHE
+			up(2) == "GRANTS" || up(2) == "TOKENS" || up(2) == "CACHE")) // v1.3.14 §1/§4 + v1.3.15 CACHE
 	case "ALTER":
 		return up(1) == "BUCKET" || (up(1) == "S3" && up(2) == "KEY") // SET SCOPE（v1.3.14 §2）
 	case "SET", "CLEAR":
@@ -897,7 +897,7 @@ func (h *Handler) s3ShowSpace() (*mysql.Result, bool, error) {
 	return res, true, err
 }
 
-// s3ShowCache SHOW S3 CACHE：内存缓存观测（v1.4.0「内存换硬盘」）。
+// s3ShowCache SHOW S3 CACHE：内存缓存观测（v1.3.15「内存换硬盘」）。
 func (h *Handler) s3ShowCache() (*mysql.Result, bool, error) {
 	if h.s3store == nil {
 		return nil, true, mysql.NewError(1105, "S3 module is disabled")
@@ -1317,7 +1317,7 @@ func (h *Handler) s3ShowTokens(toks []string) (*mysql.Result, bool, error) {
 			i++
 		}
 	}
-	// v1.4.0 S4：token 即 bearer 凭证（持之可直访对象）——非 super（readonly/其他
+	// v1.3.15 S4：token 即 bearer 凭证（持之可直访对象）——非 super（readonly/其他
 	// 管理面可入账号）一律脱敏展示（前 8 位 + ****），防止只读账号拖库后越权直访
 	maskToken := h.userType != auth.TypeSuper
 	var rows [][]any

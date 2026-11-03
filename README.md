@@ -16,7 +16,7 @@ GlacierTDB 用 SQLite 做唯一的存储内核，Go 编写，编译产物是一�
 
 > 🤖 本项目全程由 GLM 驱动开发。
 
-**当前版本：v1.4.0.beta** · [下载（三平台 + SHA256SUMS）](https://github.com/sang8052/GlacierTDB/releases) · [完整变更记录](CHANGELOG.md) · 许可 [MIT](LICENSE)
+**当前版本：v1.3.15.beta** · [下载（三平台 + SHA256SUMS）](https://github.com/sang8052/GlacierTDB/releases) · [完整变更记录](CHANGELOG.md) · 许可 [MIT](LICENSE)
 
 > **安全公告**：v1.3.10 及更早版本存在租户隔离越权漏洞（已在 v1.3.11 修复），v1.3.10 已撤版。
 > 在用旧版本的请立即升级，只从 Releases 获取最新版。
@@ -210,7 +210,7 @@ ARM 仅支持 64 位（arm64）。SD 卡做主存储必须配 v1.3.12 的 WAL �
 
 ## 版本
 
-- **v1.4.0**（当前）：安全加固（SSRF/越权/TOCTOU 等 13 项）+ 四线性能重构（MySQL 查询、Redis 分片+异步落盘+运算核、MQ 写后落盘、S3 内存缓存）+ SQL 错误消息 MySQL 标准化；
+- **v1.3.15**（当前）：安全加固（SSRF/越权/TOCTOU 等 13 项）+ 四线性能重构（MySQL 查询、Redis 分片+异步落盘+运算核、MQ 写后落盘、S3 内存缓存）+ SQL 错误消息 MySQL 标准化；
 - **v1.3.14**：S3 桶共享（多用户读写两权）、AK 资源范围（桶/前缀/只读）、原子移动 move 与异步批量复制、前端魔法 Token 直访、2H4G 性能对比文档；
 - **v1.3.13**：S3 去重存储与秒传、gzip 压缩、打包下载、数据同步上云、KV 驱逐优先级与 SQL 读穿透、实例 ID 与排障头、版本隐藏、心跳上报；
 - **v1.3.12**：TLS 全面支持、在线备份 `-backup`、S3 并行上传重构；

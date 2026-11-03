@@ -9,7 +9,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// 写后落盘（v1.4.0）：async_flush_ms > 0 时启用
+// 写后落盘（v1.3.15）：async_flush_ms > 0 时启用
 //
 // durable 消息发布时内存构建（含 body/props/persistent/入队时间），推入目标队列的
 // 内存 ready 链 + journal（待落盘），并 nudge flusher；flusher 被唤醒后把 journal
@@ -42,7 +42,7 @@ const (
 	msgStateGone
 )
 
-// statDelta 单队列统计增量（仿 s3 usageBuf，v1.4.0）。
+// statDelta 单队列统计增量（仿 s3 usageBuf，v1.3.15）。
 type statDelta struct {
 	pub, del, ack int64
 }
@@ -96,7 +96,7 @@ type jrow struct {
 	created int64
 }
 
-// async 是否启用写后落盘（async_flush_ms > 0；0 = 旧同步路径，v1.4.0）。
+// async 是否启用写后落盘（async_flush_ms > 0；0 = 旧同步路径，v1.3.15）。
 func (s *Store) async() bool { return s.flushIv > 0 }
 
 // nudgeFlush 唤醒 flusher。
@@ -107,7 +107,7 @@ func (s *Store) nudgeFlush() {
 	}
 }
 
-// flushLoop 落盘循环（v1.4.0）：kick 或周期触发，journal 与旁路批量单事务落库。
+// flushLoop 落盘循环（v1.3.15）：kick 或周期触发，journal 与旁路批量单事务落库。
 func (s *Store) flushLoop() {
 	t := time.NewTicker(s.flushIv)
 	defer t.Stop()
@@ -240,7 +240,7 @@ func (s *Store) loadMessages() error {
 		m.Redelivered = redel != 0
 		m.state = msgStateReady
 		s.pushReadyLocked(qkey(m.NS, m.Queue), &m)
-		s.live[m.ID] = &m // v1.4.0：恢复消息同样入 live 索引——否则恢复后 Ack/Nack/Requeue 找不到消息（unacked 计数漂移、requeue 丢消息）
+		s.live[m.ID] = &m // v1.3.15：恢复消息同样入 live 索引——否则恢复后 Ack/Nack/Requeue 找不到消息（unacked 计数漂移、requeue 丢消息）
 		n++
 	}
 	if err := rows.Err(); err != nil {
@@ -250,7 +250,7 @@ func (s *Store) loadMessages() error {
 	return nil
 }
 
-// FlushSync 同步刷空 journal 与全部旁路列表 + 统计缓冲（main.go 停机钩子，v1.4.0）。
+// FlushSync 同步刷空 journal 与全部旁路列表 + 统计缓冲（main.go 停机钩子，v1.3.15）。
 func (s *Store) FlushSync() error {
 	var lastErr error
 	if s.async() {
@@ -272,7 +272,7 @@ func (s *Store) FlushSync() error {
 }
 
 // ---------------------------------------------------------------------------
-// 统计内存聚合（v1.4.0）：bumpStatLocked 改写 statBuf，statLoop 每 5s 批量 UPSERT
+// 统计内存聚合（v1.3.15）：bumpStatLocked 改写 statBuf，statLoop 每 5s 批量 UPSERT
 //（仿 s3 usageBuf 先例）；SHOW QUEUES 读取时合并 DB 行 + 未落库增量。
 // ---------------------------------------------------------------------------
 

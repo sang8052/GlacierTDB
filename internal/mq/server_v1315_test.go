@@ -10,7 +10,7 @@ import (
 	"glaciertdb/internal/sqlite"
 )
 
-// v1.4.0 协议级冒烟：真实 ServeConn + 包内 codec 充当最小 AMQP 客户端，覆盖
+// v1.3.15 协议级冒烟：真实 ServeConn + 包内 codec 充当最小 AMQP 客户端，覆盖
 // bufio 写帧路径（连接首推 Start 落网 / 帧循环应答节奏 / 派发 goroutine Deliver
 // 落网 / flusher confirm 回调落网）、mandatory basic.return 与 Get-Empty 应答。
 

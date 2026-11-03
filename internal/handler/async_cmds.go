@@ -428,7 +428,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		if perr != nil {
 			return nil, true, mysql.NewError(1064, perr.Error())
 		}
-		// v1.4.0 S2：回调 URL 防 SSRF——提交期即按 security.callback_net_policy
+		// v1.3.15 S2：回调 URL 防 SSRF——提交期即按 security.callback_net_policy
 		// 校验（封回环/链路本地/云元数据，strict 加封全部私网），非法目标拒绝提交
 		if cb != "" && h.cfg != nil {
 			pol := netguard.ParsePolicy(h.cfg.Security.CallbackNetPolicy)
@@ -485,7 +485,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		id := h.async.Submit(job)
 		res, err := meta.SimpleRS([]string{"job_id", "state"},
 			[][]any{{id, string(asyncq.StatePending)}})
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 	}
 
 	// SHOW QUERY VARS —— WHEN 监测变量当前值（v1.0.9；含服务器级 DISK_MBPS）
@@ -502,7 +502,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			rows = append(rows, []any{v.Name, val, v.Level, v.Desc})
 		}
 		res, err := meta.SimpleRS([]string{"Variable_name", "Value", "Level", "Description"}, rows)
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 	}
 
 	// SHOW QUERY JOBS / query_jobs 表（v1.3.11：普通用户只见自己的任务）
@@ -518,7 +518,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 		rows = filterAsyncRows(rows, where)
 		if strings.TrimSpace(colsExpr) == "*" {
 			res, err := meta.SimpleRS(asyncJobCols, rows)
-			return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+			return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 		}
 		// 投影：按请求列挑选，未知列补 NULL
 		names := splitCols(colsExpr)
@@ -541,7 +541,7 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			out = append(out, row)
 		}
 		res, err := meta.SimpleRS(names, out)
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 	}
 
 	// FETCH QUERY RESULT 'id' [LIMIT n [OFFSET m]]
@@ -635,11 +635,11 @@ func (h *Handler) handleAsyncQ(s string) (*mysql.Result, bool, error) {
 			if strings.TrimSpace(m[1]) != "*" && len(names) > 0 {
 				out := projectRows(cols, filterRowsByCols(cols, rows, where), names)
 				res, err := meta.SimpleRS(names, out)
-				return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+				return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 			}
 		}
 		res, err := meta.SimpleRS(cols, filterRowsByCols(cols, rows, where))
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 	}
 	return nil, false, nil
 }
@@ -794,7 +794,7 @@ func fetchResult(h *Handler, id string, limit, offset int) (*mysql.Result, bool,
 		return nil, true, mysql.NewError(1105, err.Error())
 	}
 	res, err2 := meta.SimpleRS(cols, rows)
-	return res, true, MapSQLiteErr(err2) // v1.4.0 错误收口
+	return res, true, MapSQLiteErr(err2) // v1.3.15 错误收口
 }
 
 func atoiOr(s string, def int) int {

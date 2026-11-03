@@ -389,7 +389,7 @@ func Run(cfg *config.Config, backend *sqlite.Backend, store *auth.Store, s3store
 		sniff = time.Millisecond
 	}
 
-	// 全局并发连接上限（v1.4.0 S13）：max_connections 此前仅在 KV 面生效，
+	// 全局并发连接上限（v1.3.15 S13）：max_connections 此前仅在 KV 面生效，
 	// MySQL/AMQP/MQTT 面无上限——恶意连接可耗尽内存/fd。TCP 与 UDS 统一记账，
 	// 超限连接立即关闭（限频日志，避免刷屏）。
 	var connGauge, connDropLast atomic.Int64

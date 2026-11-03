@@ -37,7 +37,7 @@ type Handler struct {
 	readonly  bool
 	user      string // 握手成功后的真实登录账号
 	userType  string // super | readonly | user（v1.0.10 用户权限系统）
-	gen       uint64 // auth 世代号快照（v1.4.0：与 auth.Store.Generation() 不一致时刷新 userType）
+	gen       uint64 // auth 世代号快照（v1.3.15：与 auth.Store.Generation() 不一致时刷新 userType）
 	auths     *auth.Store
 	connID     uint64
 	startedAt  time.Time
@@ -95,7 +95,7 @@ func New(b *sqlite.Backend, cfg *config.Config, remote, defaultDB string, reg *a
 	}
 	if as != nil {
 		h.userType = as.UserType(cfg.Auth.User)
-		h.gen = as.Generation() // v1.4.0 世代缓存基线
+		h.gen = as.Generation() // v1.3.15 世代缓存基线
 	} else {
 		h.userType = auth.TypeSuper
 	}
@@ -112,7 +112,7 @@ func (h *Handler) BindConn(mc *server.Conn) {
 		h.user = u
 		if h.auths != nil {
 			h.userType = h.auths.UserType(u)
-			h.gen = h.auths.Generation() // v1.4.0 世代缓存基线
+			h.gen = h.auths.Generation() // v1.3.15 世代缓存基线
 		}
 		h.readonly = h.cfg.IsReadOnlyUser(u) || h.userType == auth.TypeReadonly
 		if h.session != nil {
@@ -154,7 +154,7 @@ func (h *Handler) invalidateAuthCache(user string) {
 }
 
 // MapSQLiteErr 把 SQLite 错误包装为 MySQL 协议错误。
-// v1.4.0：细化映射收口到 meta.MapSQLiteToMySQLError（1146/1054/1062/1048/3819/1452/
+// v1.3.15：细化映射收口到 meta.MapSQLiteToMySQLError（1146/1054/1062/1048/3819/1452/
 // 1050/1064/1205/1290 细分），QoS 拒绝分支保留在本侧先行判断。
 func MapSQLiteErr(err error) error {
 	if err == nil {
@@ -287,7 +287,7 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 	h.mu.Unlock()
 	s := meta.StripComments(query)
 	// 刷新账号类型与只读语义（ALTER USER 可热改 account_type，v1.0.10 权限须实时）
-	// v1.4.0 世代缓存：auth 写路径均递增 Store.gen，世代未变时直读本连接缓存，
+	// v1.3.15 世代缓存：auth 写路径均递增 Store.gen，世代未变时直读本连接缓存，
 	// 省去每查询对 glacier_auth.db（MaxOpenConns(1) 全局共享）的一次 SELECT
 	if h.auths != nil {
 		if g := h.auths.Generation(); g != h.gen {
@@ -367,7 +367,7 @@ func (h *Handler) handleQueryInner(query string) (*mysql.Result, error) {
 		return meta.OKResultPub(), nil
 	}
 	// 空语句（仅注释/空白/分号，如 mysql CLI 批量脚本开头的注释块）返回 OK——
-	// 零条语句交 SQLite 预备会让驱动在执行期 panic（v1.4.0 修复连接死亡/挂起）
+	// 零条语句交 SQLite 预备会让驱动在执行期 panic（v1.3.15 修复连接死亡/挂起）
 	if s == "" || meta.IsEmptyStatement(query) {
 		return meta.OKResult(), nil
 	}

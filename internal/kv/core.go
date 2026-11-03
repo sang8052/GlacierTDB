@@ -1,7 +1,7 @@
 package kv
 
 // ---------------------------------------------------------------------------
-// 独立运算核（v1.4.0 任务 3，kv.dedicated_core）
+// 独立运算核（v1.3.15 任务 3，kv.dedicated_core）
 //
 // 模型：dedicated_core=true 时，RESP 非阻塞命令经 exec 投递到单一执行 goroutine
 // 串行执行（Redis 单线程模型），并把该 goroutine 的 OS 线程绑到指定核
@@ -64,7 +64,7 @@ func (s *Store) startExecCore() {
 	}()
 }
 
-// CoreMode INFO 观测：shared | dedicated(cpu=N) | dedicated(unpinned)（v1.4.0）。
+// CoreMode INFO 观测：shared | dedicated(cpu=N) | dedicated(unpinned)（v1.3.15）。
 func (s *Store) CoreMode() string {
 	if s.execCh == nil {
 		return "shared"

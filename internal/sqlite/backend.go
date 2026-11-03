@@ -53,7 +53,7 @@ type Backend struct {
 	maxRows int64
 	slowMs  int64
 
-	stmtCacheMax int // 每会话 prepared statement LRU 容量（v1.4.0；<=0 = 禁用）
+	stmtCacheMax int // 每会话 prepared statement LRU 容量（v1.3.15；<=0 = 禁用）
 
 	dbLocksMu sync.Mutex
 	dbLocks   map[string]*sync.Mutex // 每库一把写锁（惰性创建）：单库单线程，多库并行
@@ -92,7 +92,7 @@ type Session struct {
 	startedAt time.Time
 	qosWaitMs int64 // 最近一次执行的 QoS 排队毫秒
 
-	stmtMu       sync.Mutex        // 保护以下三字段（v1.4.0 会话级语句缓存）
+	stmtMu       sync.Mutex        // 保护以下三字段（v1.3.15 会话级语句缓存）
 	stmtCache    map[string]*sql.Stmt
 	stmtLRU      []string          // LRU 序（最旧在前）
 	stmtCacheMax int               // <=0 = 禁用（来自 sqlite.stmt_cache_size）
@@ -104,7 +104,7 @@ func NewBackend(cfg *config.Config) (*Backend, error) {
 		dir:          cfg.DBDir,
 		maxRows:      cfg.SQLite.MaxResultRows,
 		slowMs:       cfg.Log.SlowQueryMs,
-		stmtCacheMax: cfg.SQLite.StmtCacheSize, // v1.4.0：Fill 后 0 = 关闭
+		stmtCacheMax: cfg.SQLite.StmtCacheSize, // v1.3.15：Fill 后 0 = 关闭
 		authPassword: cfg.Auth.Password,
 		roPassword:   cfg.Auth.ReadOnlyPassword,
 		dbLocks:      make(map[string]*sync.Mutex),
@@ -247,7 +247,7 @@ func (b *Backend) OpenSession(user, remote, defaultDB string) (*Session, error) 
 		backend:      b,
 		currentDB:    defaultDB,
 		startedAt:    time.Now(),
-		stmtCacheMax: b.stmtCacheMax, // v1.4.0 语句缓存容量
+		stmtCacheMax: b.stmtCacheMax, // v1.3.15 语句缓存容量
 	}
 	if _, _, err := s.Exec("SELECT 1"); err != nil {
 		db.Close()
@@ -495,7 +495,7 @@ func (s *Session) Use(dbName string) error {
 		ndb.Close()
 		return err
 	}
-	s.closeStmts() // v1.4.0：prepared stmt 绑定旧连接，切库前清空
+	s.closeStmts() // v1.3.15：prepared stmt 绑定旧连接，切库前清空
 	s.db.Close()
 	s.db = ndb
 	s.currentDB = dbName
@@ -506,7 +506,7 @@ func (s *Session) Use(dbName string) error {
 // 查询执行
 // ---------------------------------------------------------------------------
 
-// querySQL 执行查询（v1.4.0：语句缓存启用时走 prepared stmt 复用，免去逐查询的
+// querySQL 执行查询（v1.3.15：语句缓存启用时走 prepared stmt 复用，免去逐查询的
 // WASM compile+finalize；禁用或预备失败时行为与原 s.db.Query 一致）。
 // panic→error 兜底：零语句（纯注释）等异常语句会让 ncruces 驱动在执行期
 // nil 解引用 panic——转成普通错误返回，绝不让 panic 穿透连接处理。
@@ -526,7 +526,7 @@ func (s *Session) querySQL(q string) (rows *sql.Rows, err error) {
 	return s.db.Query(q)
 }
 
-// execSQL 执行写语句（v1.4.0：语句缓存启用时走 prepared stmt 复用；panic 兜底同 querySQL）。
+// execSQL 执行写语句（v1.3.15：语句缓存启用时走 prepared stmt 复用；panic 兜底同 querySQL）。
 func (s *Session) execSQL(q string) (res sql.Result, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -543,7 +543,7 @@ func (s *Session) execSQL(q string) (res sql.Result, err error) {
 	return s.db.Exec(q)
 }
 
-// getStmt 会话级语句缓存命中 / 预备（v1.4.0）。
+// getStmt 会话级语句缓存命中 / 预备（v1.3.15）。
 // 各会话持有独立 *sql.DB（MaxOpenConns(1)），database/sql 对同一 Stmt 的并发使用
 // 自动排队（rendezvous），无共享冲突；命中不 Close（缓存持有至淘汰/会话关闭）。
 func (s *Session) getStmt(q string) (*sql.Stmt, error) {
@@ -733,7 +733,7 @@ func (s *Session) Close() {
 	}
 	s.ReleaseWrite()
 	if s.db != nil {
-		s.closeStmts() // v1.4.0：先归还全部 prepared stmt 再关连接
+		s.closeStmts() // v1.3.15：先归还全部 prepared stmt 再关连接
 		s.db.Close()
 	}
 }
@@ -817,7 +817,7 @@ func (s *Session) HoldsWriteLock() bool { return s.holdsLock }
 // 动态信号量：容量可热调（管理面 SET，重启失效回到配置文件值）
 // ---------------------------------------------------------------------------
 
-// dynSem 动态容量信号量。v1.4.0：cur/max 改原子字段——不限额（max<=0）时
+// dynSem 动态容量信号量。v1.3.15：cur/max 改原子字段——不限额（max<=0）时
 // Acquire/Release 走纯原子快路径，消除全局闸门（所有会话共享）上的锁竞争；
 // 有限额时退回 mutex+cond 等待队列。计数语义不变：快路径同样递增 cur，
 // 热改为有限额后限额立即精确生效。
@@ -836,7 +836,7 @@ func newDynSem(max int) *dynSem {
 }
 
 func (s *dynSem) Acquire() {
-	// v1.4.0 快路径：不限额时原子计数直通
+	// v1.3.15 快路径：不限额时原子计数直通
 	if s.max.Load() <= 0 {
 		s.cur.Add(1)
 		return
@@ -850,7 +850,7 @@ func (s *dynSem) Acquire() {
 }
 
 func (s *dynSem) Release() {
-	// v1.4.0：先原子减计数；仅有限额（可能存在等待者）时补一次唤醒。
+	// v1.3.15：先原子减计数；仅有限额（可能存在等待者）时补一次唤醒。
 	// 正确性：等待者只会在 max>0 时入队，max 0→正数的热改由 SetMax 广播兜底；
 	// 若本 Release 的减计数发生在等待者判定之后，则其 max 读取必然晚于热改
 	//（否则减计数早已对等待者的条件判定可见），不会漏唤醒。

@@ -1,11 +1,11 @@
-# GlacierTDB 基准测试配置（bench_2h4g.sh 的 gt-bench 容器专用，v1.4.0）
+# GlacierTDB 基准测试配置（bench_2h4g.sh 的 gt-bench 容器专用，v1.3.15）
 #
 # 与线上测试配置 /tmp/glacier-async.yaml 同基线（账号/库/S3 端点一致，保证
-# 跨版本可比），另外显式打开 v1.4.0 性能模式：
+# 跨版本可比），另外显式打开 v1.3.15 性能模式：
 #   - kv.persist_mode: async      内存缓存+异步落盘（可丢失场景，崩溃丢 ≤ flush 窗口）
 #   - kv.dedicated_core: true     独立运算核（RESP 命令单线程串行+绑核）
 #   - mq.async_flush_ms: 20       durable 消息内存 journal 写后批量落盘
-#   - sqlite.stmt_cache_size / cache_size_kb  v1.4.0 新默认已含（显式声明便于核对）
+#   - sqlite.stmt_cache_size / cache_size_kb  v1.3.15 新默认已含（显式声明便于核对）
 # 对照组（mysql:8 / redis:7 / rabbitmq:3.13 / minio）各容器独占同规格资源，
 # 详见 bench_2h4g.sh 头注。
 
@@ -16,7 +16,7 @@ auth:
   user: glacier
   password: "iloveyou~"
 log:
-  sql_log_file: /data/sql.log   # v1.4.0 起缓冲批量落盘，对查询路径影响极小（口径与 v1.3.14 基线一致）
+  sql_log_file: /data/sql.log   # v1.3.15 起缓冲批量落盘，对查询路径影响极小（口径与 v1.3.14 基线一致）
 
 sqlite:
   synchronous: NORMAL
@@ -59,7 +59,7 @@ s3:
   endpoints:
     - listen: 0.0.0.0:9000
       server_names: [glacier-s3.local]
-  # v1.4.0 内存缓存：热点对象/纯内存对象/图片派生缓存统一预算（内存换硬盘）
+  # v1.3.15 内存缓存：热点对象/纯内存对象/图片派生缓存统一预算（内存换硬盘）
   mem_cache: true
   mem_cache_mb: 512
   mem_cache_item_mb: 8

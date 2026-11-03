@@ -229,9 +229,9 @@ SHOW S3 USAGE OPERATORS [FOR '<u>'];  -- 操作者维度计数（共享桶分摊
 -- ---- 魔法 Token（前端对象级直访凭证，v1.3.14；≤1h 可吊销）----
 CREATE S3 TOKEN ON <b>/<key> [PUT|GET|GIMG('<params>')] [EXPIRE <s<=3600>];
 REVOKE S3 TOKEN '<t>';
-SHOW S3 TOKENS [FOR '<u>' | ON <b>];   -- v1.4.0：非 super 账号 token 脱敏（前8位****）
+SHOW S3 TOKENS [FOR '<u>' | ON <b>];   -- v1.3.15：非 super 账号 token 脱敏（前8位****）
 
--- ---- 内存缓存观测（v1.4.0「内存换硬盘」）----
+-- ---- 内存缓存观测（v1.3.15「内存换硬盘」）----
 SHOW S3 CACHE;      -- hits/misses/cached_bytes/evicted/mem_objects（热点读缓存+纯内存对象+图片缓存统一预算）
 
 -- ---- 请求策略条件（UA / IP / Referer / 自定义 header / 方法，AND 语义）----

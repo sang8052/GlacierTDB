@@ -25,12 +25,12 @@ const (
 	payloadEmpty      = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" // sha256("")
 	payloadUnsigned   = "UNSIGNED-PAYLOAD"
 	payloadStreaming  = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
-	payloadStreamingTrailer = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" // 签名块 + checksum trailer（v1.4.0 S11）
+	payloadStreamingTrailer = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER" // 签名块 + checksum trailer（v1.3.15 S11）
 	signTimeSkew      = 15 * time.Minute // 允许时钟偏差
 	serviceName       = "s3"
 )
 
-// chunkSigner aws-chunked 逐块签名校验器（v1.4.0 S11）。
+// chunkSigner aws-chunked 逐块签名校验器（v1.3.15 S11）。
 // 每块的 stringToSign（AWS SigV4 流式规范）：
 //
 //	"AWS4-HMAC-SHA256-PAYLOAD\n" + dateTime + "\n" + scope + "\n" + prevSig +
@@ -321,7 +321,7 @@ func requestPathCandidates(r *http.Request) []string {
 }
 
 // verifySigV4 校验请求签名（表头鉴权或预签名 URL），返回签名身份、负载哈希声明
-// 与 aws-chunked 逐块签名校验器（v1.4.0 S11：仅签名流式变体返回非 nil——
+// 与 aws-chunked 逐块签名校验器（v1.3.15 S11：仅签名流式变体返回非 nil——
 // STREAMING-UNSIGNED-PAYLOAD-TRAILER 的块帧本就无 chunk-signature，不校验）。
 // secretFor(ak) 返回 (owner, sk, status, policyJSON, scopeJSON)。
 func verifySigV4(r *http.Request, region string,
@@ -419,7 +419,7 @@ func verifySigV4(r *http.Request, region string,
 		signQuery = stripQueryParam(rawQuery, "X-Amz-Signature")
 	}
 	if verifySignature(r, cs, sk, payloadHash, signQuery, requestPathCandidates(r)) {
-		// (v1.4.0 S11) 签名流式变体：构造逐块签名校验器（种子 = 请求整体签名）。
+		// (v1.3.15 S11) 签名流式变体：构造逐块签名校验器（种子 = 请求整体签名）。
 		// STREAMING-UNSIGNED-PAYLOAD-TRAILER 块帧无 chunk-signature，不返回校验器。
 		var ck *chunkSigner
 		if payloadHash == payloadStreaming || payloadHash == payloadStreamingTrailer {

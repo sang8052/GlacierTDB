@@ -12,7 +12,7 @@ import (
 )
 
 // GlacierVersion 是 GlacierTDB 自身版本（区别于对外模拟的 MySQL 协议版本）。
-const GlacierVersion = "1.4.0.beta"
+const GlacierVersion = "1.3.15.beta"
 
 // hideVersion 版本号隐藏开关（security.hide_version，v1.3.13）：开启后 S3 响应头 /
 // Redis INFO·HELLO / 管理面 glacier_version 等对外面不再携带真实版本号；
@@ -163,10 +163,10 @@ type S3Opts struct {
 	ImageFont        string   `yaml:"image_font"`             // 图片文字渲染 ttf 字体路径（空 = 内置 ASCII）
 	ImageCache       bool     `yaml:"image_cache"`            // 图片预处理结果缓存（GET 加工链路；默认开）
 	ImageCacheMB     int      `yaml:"image_cache_mb"`         // 图片缓存容量上限 MB（默认 1024；-1 = 不限）
-	MemCache         bool     `yaml:"mem_cache"`              // 对象内存缓存（v1.4.0：热点对象读缓存 + 纯内存对象；默认开）
+	MemCache         bool     `yaml:"mem_cache"`              // 对象内存缓存（v1.3.15：热点对象读缓存 + 纯内存对象；默认开）
 	MemCacheMB       int      `yaml:"mem_cache_mb"`           // 内存缓存预算 MB（默认 128；-1 = 不限；mem_cache:false 关闭）
 	MemCacheItemMB   int      `yaml:"mem_cache_item_mb"`      // 单个缓存对象上限 MB（默认 4；超过不缓存）
-	ImageCacheBackend string  `yaml:"image_cache_backend"`    // 图片派生缓存后端（v1.4.0）：memory = 内存（默认，不写盘）| disk = 磁盘目录
+	ImageCacheBackend string  `yaml:"image_cache_backend"`    // 图片派生缓存后端（v1.3.15）：memory = 内存（默认，不写盘）| disk = 磁盘目录
 	DedupScope       string   `yaml:"dedup_scope"`            // chunk 去重范围（v1.3.13）：bucket | user（默认）| system
 	GzipLevel        int      `yaml:"gzip_level"`             // GET 传输 gzip 压缩等级 1-9（默认 5；v1.3.13）
 	ErrorLog         bool     `yaml:"error_log"`              // S3 结构化错误日志开关（默认关；v1.3.13）
@@ -187,9 +187,9 @@ type KVOpts struct {
 	MaxMemoryMB     int    `yaml:"max_memory_mb"`     // 内存上限（0 = 不限）
 	Eviction        string `yaml:"eviction"`          // allkeys-lru | volatile-lru | noeviction
 	ScanIntervalSec int    `yaml:"scan_interval_sec"` // TTL 主动扫描周期（最低 1）
-	PersistMode     string `yaml:"persist_mode"`      // 落盘模式（v1.4.0）：sync = 每写命令事务落盘（默认）| async = 内存缓存+异步批量落盘（崩溃丢失 ≤ async_flush_ms 窗口）
+	PersistMode     string `yaml:"persist_mode"`      // 落盘模式（v1.3.15）：sync = 每写命令事务落盘（默认）| async = 内存缓存+异步批量落盘（崩溃丢失 ≤ async_flush_ms 窗口）
 	AsyncFlushMs    int    `yaml:"async_flush_ms"`    // 异步落盘周期毫秒（persist_mode:async 时生效，默认 200，最低 20）
-	DedicatedCore   bool   `yaml:"dedicated_core"`    // 独立运算核模式（v1.4.0，仅 Linux）：专职 OS 线程串行执行全部 RESP 命令并绑核，隔离其他组件调度噪声
+	DedicatedCore   bool   `yaml:"dedicated_core"`    // 独立运算核模式（v1.3.15，仅 Linux）：专职 OS 线程串行执行全部 RESP 命令并绑核，隔离其他组件调度噪声
 	CoreCPU         int    `yaml:"core_cpu"`          // 运算核绑定的 CPU 编号（-1 = 自动选末核；越界自动回退不绑核）
 }
 
@@ -198,7 +198,7 @@ type MQOpts struct {
 	Enable        bool     `yaml:"enable"`         // AMQP 服务开关（默认开）
 	MaxMessageMB  int      `yaml:"max_message_mb"` // 单条消息上限
 	ServerVersion string   `yaml:"server_version"` // 对外宣称的 RabbitMQ 版本串（Connection.Start server-properties，v1.3.3）
-	AsyncFlushMs  int      `yaml:"async_flush_ms"` // 写后落盘周期毫秒（v1.4.0：durable 消息进内存 journal、后台单事务批量落盘后 confirm/派发；默认 200，最低 20；越低延迟越低、批量越小）
+	AsyncFlushMs  int      `yaml:"async_flush_ms"` // 写后落盘周期毫秒（v1.3.15：durable 消息进内存 journal、后台单事务批量落盘后 confirm/派发；默认 200，最低 20；越低延迟越低、批量越小）
 	MQTT          MQTTOpts `yaml:"mqtt"`           // MQTT 接入（v1.3.3）
 }
 
@@ -222,7 +222,7 @@ type SecOpts struct {
 	Encrypt     bool   `yaml:"encrypt"`      // 首次启用要求空目录或已有加密库
 	Passphrase  string `yaml:"passphrase"`   // 启用时必填
 	HideVersion bool   `yaml:"hide_version"` // 版本号隐藏（v1.3.13 §6.4）：对外面不携带真实版本号
-	CallbackNetPolicy string `yaml:"callback_net_policy"` // 回调 URL 网络策略（v1.4.0，防 SSRF）：standard = 封回环+链路本地（默认）| strict = 加封全部私网段 | open = 不封 IP（仅强制 http/https）
+	CallbackNetPolicy string `yaml:"callback_net_policy"` // 回调 URL 网络策略（v1.3.15，防 SSRF）：standard = 封回环+链路本地（默认）| strict = 加封全部私网段 | open = 不封 IP（仅强制 http/https）
 }
 
 // HeartbeatOpts 主动心跳上报（v1.3.13 §6.5）：按配置定时 POST JSON 到用户自建
@@ -249,7 +249,7 @@ type SQLiteOpts struct {
 	WalAutocheckpoint  int    `yaml:"wal_autocheckpoint"`  // WAL 自动 checkpoint 页数（0 = SQLite 默认 1000；v1.3.12）
 	JournalSizeLimitKB int    `yaml:"journal_size_limit_kb"` // WAL 文件空间回收上限（0 = 不限；v1.3.12）
 	MaxResultRows      int64  `yaml:"max_result_rows"` // 单条查询最大返回行数保护
-	StmtCacheSize      int    `yaml:"stmt_cache_size"` // 每会话 prepared statement LRU 缓存条数（v1.4.0；默认 256，-1 = 关闭）
+	StmtCacheSize      int    `yaml:"stmt_cache_size"` // 每会话 prepared statement LRU 缓存条数（v1.3.15；默认 256，-1 = 关闭）
 }
 
 // TLSOpts 3309 复用端口（MySQL/RESP/AMQP/MQTT）与 MQTT 独立监听的 TLS 加密
@@ -469,7 +469,7 @@ func (c *Config) Fill() {
 		c.SQLite.BusyTimeoutMs = 5000
 	}
 	if c.SQLite.CacheSizeKB <= 0 {
-		c.SQLite.CacheSizeKB = 2048 // v1.4.0：256→2048（每连接页缓存，配合语句缓存提升点查吞吐）
+		c.SQLite.CacheSizeKB = 2048 // v1.3.15：256→2048（每连接页缓存，配合语句缓存提升点查吞吐）
 	}
 	if c.SQLite.StmtCacheSize == 0 {
 		c.SQLite.StmtCacheSize = 256
@@ -608,7 +608,7 @@ func (c *Config) Fill() {
 		if c.S3.ImageCacheMB == 0 {
 			c.S3.ImageCacheMB = 1024
 		}
-		// v1.4.0：对象内存缓存（热点读缓存 + 纯内存对象 + 图片派生缓存内存后端）
+		// v1.3.15：对象内存缓存（热点读缓存 + 纯内存对象 + 图片派生缓存内存后端）
 		if c.S3.MemCacheMB == 0 {
 			c.S3.MemCacheMB = 128
 		}
@@ -624,7 +624,7 @@ func (c *Config) Fill() {
 	if c.Security.HideVersion && c.ServerVersion == "8.99.999" {
 		c.ServerVersion = "8.0.0"
 	}
-	// 回调 URL 网络策略（v1.4.0，防 SSRF；作用于租户级回调 URL：
+	// 回调 URL 网络策略（v1.3.15，防 SSRF；作用于租户级回调 URL：
 	// S3 PUT 的 x-glacier-callback-url 头与 SUBMIT QUERY ... CALLBACK）
 	switch c.Security.CallbackNetPolicy {
 	case "standard", "strict", "open":
@@ -653,7 +653,7 @@ func (c *Config) Fill() {
 	if c.KV.ScanIntervalSec < 1 {
 		c.KV.ScanIntervalSec = 1
 	}
-	// v1.4.0：落盘模式 / 异步刷盘周期 / 独立运算核
+	// v1.3.15：落盘模式 / 异步刷盘周期 / 独立运算核
 	switch c.KV.PersistMode {
 	case "sync", "async":
 	default:
@@ -673,7 +673,7 @@ func (c *Config) Fill() {
 		c.MQ.MaxMessageMB = 32
 	}
 	if c.MQ.AsyncFlushMs == 0 {
-		c.MQ.AsyncFlushMs = 200 // v1.4.0：durable 写后批量落盘默认开
+		c.MQ.AsyncFlushMs = 200 // v1.3.15：durable 写后批量落盘默认开
 	}
 	if c.MQ.AsyncFlushMs < 20 {
 		c.MQ.AsyncFlushMs = 20

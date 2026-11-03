@@ -1,7 +1,7 @@
 package kv
 
 // ---------------------------------------------------------------------------
-// 异步落盘 / 补删引擎（v1.4.0 任务 2）
+// 异步落盘 / 补删引擎（v1.3.15 任务 2）
 //
 // 脏标记模型：写命令成功后（分片锁外、命令返回前）对受影响键标脏：
 //   'w'（dirtyKindWrite）= 按当前内存状态整键重写三表；
@@ -75,13 +75,13 @@ func (s *Store) startFlusher() {
 }
 
 // FlushSync 立即同步执行一轮脏数据落盘（main.go 停机钩子调用，把优雅停机的
-// async 丢失窗口收敛为 0；管理面亦可调用）。v1.4.0 新增。
+// async 丢失窗口收敛为 0；管理面亦可调用）。v1.3.15 新增。
 func (s *Store) FlushSync() error { return s.flushOnce() }
 
-// PersistMode 当前落盘模式（INFO 观测，v1.4.0）。
+// PersistMode 当前落盘模式（INFO 观测，v1.3.15）。
 func (s *Store) PersistMode() string { return s.persistMode }
 
-// FlushCounters 落盘计数快照：(成功轮数, 失败轮数, 当前待刷键数)（INFO 观测，v1.4.0）。
+// FlushCounters 落盘计数快照：(成功轮数, 失败轮数, 当前待刷键数)（INFO 观测，v1.3.15）。
 func (s *Store) FlushCounters() (total, fail, dirty int64) {
 	s.dirtyMu.Lock()
 	d := int64(len(s.dirtyKeys))
@@ -138,7 +138,7 @@ func splitDirtyKey(k string) (ns, key string, ok bool) {
 // flushBatches 脏集 → SQLite 批量事务（单 flusher goroutine 串行写，与连接池
 // 其他使用者无锁冲突；事务内 stmts 攒批提交）。
 // 对任务稿「长 list 分批 1000」的取舍：list 键整键单事务（DELETE + 全量 INSERT
-// 原子提交）——事务内分批无意义，跨事务分批会在崩溃时留下半写 list（v1.4.0）。
+// 原子提交）——事务内分批无意义，跨事务分批会在崩溃时留下半写 list（v1.3.15）。
 func (s *Store) flushBatches(wipes map[string]struct{}, keys map[string]byte) error {
 	var tx *sql.Tx
 	stmts := 0
@@ -213,7 +213,7 @@ func (s *Store) flushBatches(wipes map[string]struct{}, keys map[string]byte) er
 			snap = &entry{typ: e.typ, str: e.str, expiresAt: e.expiresAt}
 			if e.typ == 'l' {
 				// list 必须深拷贝：并发 RPUSH 的 append 可能原地写同一底层数组，
-				// 锁外遍历浅引用会构成数据竞争（v1.4.0）
+				// 锁外遍历浅引用会构成数据竞争（v1.3.15）
 				snap.items = make([]listItem, len(e.items))
 				copy(snap.items, e.items)
 			}

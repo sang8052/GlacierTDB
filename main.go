@@ -111,7 +111,7 @@ func main() {
 		cfg.SQLite.BusyTimeoutMs, cfg.SQLite.CacheSizeKB, cfg.SQLite.StmtCacheSize,
 		walCheckpointDisplay(cfg.SQLite.WalAutocheckpoint), cfg.SQLite.JournalSizeLimitKB, cfg.TLS.Enable)
 
-	// S12（v1.4.0）：静态加密使用发布物内置默认口令时启动告警——拿到库文件者
+	// S12（v1.3.15）：静态加密使用发布物内置默认口令时启动告警——拿到库文件者
 	// 可用公开口令解密；行为不变（改默认值会破坏存量数据），仅提示改配 passphrase
 	if cfg.Security.Encrypt && cfg.Security.Passphrase == "GlacierTDB" {
 		logx.Warnf("security: 静态加密正在使用内置默认口令（security.passphrase 未自定义），任何拿到库文件的人都可解密；生产环境请在配置中设置强口令后重新初始化数据目录")
@@ -255,7 +255,7 @@ func main() {
 		logx.Infof("shutting down")
 		sdNotify("STOPPING=1")
 		// 优雅停机：异步落盘模式（kv.persist_mode:async / mq async_flush）下
-		// 强制把内存脏数据刷进 SQLite 再退出，把崩溃丢失窗口收敛到 0（v1.4.0）
+		// 强制把内存脏数据刷进 SQLite 再退出，把崩溃丢失窗口收敛到 0（v1.3.15）
 		if kvstore != nil {
 			if err := kvstore.FlushSync(); err != nil {
 				logx.Errorf("kv final flush: %v", err)

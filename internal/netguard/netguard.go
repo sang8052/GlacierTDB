@@ -1,4 +1,4 @@
-// Package netguard 回调/出站 URL 安全校验（v1.4.0，防 SSRF）。
+// Package netguard 回调/出站 URL 安全校验（v1.3.15，防 SSRF）。
 //
 // 适用于「租户可控」的回调 URL（S3 PUT 的 x-glacier-callback-url 请求头、
 // SUBMIT QUERY ... CALLBACK）：这类 URL 允许普通业务账号指定，服务端会向其
@@ -110,7 +110,7 @@ func BlockedResolvedIP(ip net.IP, p Policy) bool {
 	return blockedIP(ip, p)
 }
 
-// NewClient 构造带策略防护的 http.Client（v1.4.0）：
+// NewClient 构造带策略防护的 http.Client（v1.3.15）：
 //   - 拒绝跟随重定向（重定向可把已校验目标跳转到内网地址，绕过静态校验）；
 //   - 连接期 Control 钩子复核实际连上的 IP（防 DNS rebinding：静态校验时域名
 //     解析到公网，真正拨号时再解析到内网）。

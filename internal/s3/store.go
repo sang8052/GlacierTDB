@@ -109,11 +109,11 @@ type Store struct {
 	policyCache  map[string]policyCacheEntry
 	grantsCache  map[string]grantsCacheEntry // 桶共享授权缓存（v1.3.14 §1；GRANT/REVOKE 主动失效）
 
-	// 统一内存缓存（v1.4.0）：热点内联对象 / chunk 池 / 图片派生缓存 memory 后端
+	// 统一内存缓存（v1.3.15）：热点内联对象 / chunk 池 / 图片派生缓存 memory 后端
 	// 的单一字节预算出口；nil = 禁用（s3.mem_cache: false）。见 memcache.go。
 	mem *memCache
 
-	// 纯内存对象（v1.4.0）：x-glacier-memory 对象的权威存储（元数据 + 内容仅驻
+	// 纯内存对象（v1.3.15）：x-glacier-memory 对象的权威存储（元数据 + 内容仅驻
 	// 内存，不落 SQLite、不参与 LRU 驱逐，重启即失）。bucket → key → 对象。
 	memObjMu    sync.RWMutex
 	memObjs     map[string]map[string]*memObj
@@ -184,7 +184,7 @@ func Open(backend *sqlite.Backend, cfg *config.Config) (*Store, error) {
 		policyCache:  make(map[string]policyCacheEntry),
 		touchBuf:     make(map[string]struct{}),
 	}
-	// (v1.4.0) 统一内存缓存：mem_cache=false 整体禁用（nil）；预算 mem_cache_mb
+	// (v1.3.15) 统一内存缓存：mem_cache=false 整体禁用（nil）；预算 mem_cache_mb
 	//（-1 = 不限，0 兜底默认 128）与单条上限 mem_cache_item_mb（0 兜底默认 4，
 	// config.Fill 已保证，这里防御兜底）
 	if cfg.S3.MemCache {
@@ -492,7 +492,7 @@ CREATE TABLE IF NOT EXISTS %s (
 func (s *Store) CreateBucket(name, owner string, _ string, versioning, objectLock bool) (Bucket, error) {
 	var b Bucket
 	if !ValidBucketName(name) {
-		// (v1.4.0) 显式 s3Error（400 InvalidBucketName）：toS3Err 对非受控错误
+		// (v1.3.15) 显式 s3Error（400 InvalidBucketName）：toS3Err 对非受控错误
 		// 统一 500 通用消息后，客户端可纠正错误必须保留原语义
 		return b, &s3Error{Code: "InvalidBucketName", Status: 400,
 			Msg: fmt.Sprintf("invalid bucket name %q (3-63 chars, lowercase letters/digits/./-)", name)}
@@ -583,7 +583,7 @@ func (s *Store) DropBucket(name string, force bool) error {
 	_, _ = s.db.Exec(`UPDATE s3_usage SET storage_bytes=0, object_count=0 WHERE bucket=?`, name)
 	s.dropBucketGrantsLocked(name) // 共享授权与魔法 token 级联失效（v1.3.14 §1/§4）
 	s.invalidateBucket(name)
-	// (v1.4.0) 内存侧级联清理：桶内对象读缓存 + 纯内存对象
+	// (v1.3.15) 内存侧级联清理：桶内对象读缓存 + 纯内存对象
 	s.memCacheInvalidatePrefix("o:" + name + "\x00")
 	s.memObjDropBucket(name)
 	logx.Infof("s3: bucket %s dropped (force=%v)", name, force)
@@ -892,7 +892,7 @@ func (s *Store) RunLifecycle() int {
 }
 
 // deleteAllVersionsLocked 删除一个 key 的全部版本（生命周期 / PutMemoryObject 用；
-// 调用方持 writeMu）。(v1.4.0) 行删除即失效该 key 读缓存 + 纯内存命名空间。
+// 调用方持 writeMu）。(v1.3.15) 行删除即失效该 key 读缓存 + 纯内存命名空间。
 func (s *Store) deleteAllVersionsLocked(b Bucket, key string) error {
 	s.memCacheInvalidatePrefix(oBucketPrefix(b.Name, key))
 	s.memObjDel(b.Name, key)
@@ -1082,7 +1082,7 @@ func (s *Store) Usage(owner string) []UsageRow {
 	return out
 }
 
-// csvFormulaSafe CSV 公式注入防护（v1.4.0 S9）：Excel/WPS 会把以 = + - @ TAB CR
+// csvFormulaSafe CSV 公式注入防护（v1.3.15 S9）：Excel/WPS 会把以 = + - @ TAB CR
 // 开头的单元格当公式执行——计费值（owner/bucket 来自租户可控命名）首字符命中
 // 时前缀单引号中和。
 func csvFormulaSafe(s string) string {
@@ -1113,7 +1113,7 @@ func (s *Store) UsageCSV(owner string) string {
 // ---------------------------------------------------------------------------
 
 // AddDomain 注册 bucket 自定义域名（certFile/keyFile 为空 = 用自签发证书文件）。
-// (v1.4.0 S5) host 白名单：host 会派生证书文件路径 <db_dir>/certs/<host>.pem，
+// (v1.3.15 S5) host 白名单：host 会派生证书文件路径 <db_dir>/certs/<host>.pem，
 // 含路径分隔符 / .. 等可写出目录——只放行 [A-Za-z0-9._*-] 且无 ".." 段。
 func (s *Store) AddDomain(host, bucket, certFile, keyFile string) error {
 	if !validDomainHost(host) {

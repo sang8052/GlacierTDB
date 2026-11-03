@@ -66,7 +66,7 @@ const sqlLogRotateBytes = 100 << 20 // 100MB
 var (
 	sqlLogMu   sync.Mutex
 	sqlLogFile *os.File
-	sqlLogBuf  *bufio.Writer // v1.4.0：批量缓冲写（此前逐行 write syscall，点查场景约占 1/3 开销）
+	sqlLogBuf  *bufio.Writer // v1.3.15：批量缓冲写（此前逐行 write syscall，点查场景约占 1/3 开销）
 	sqlLogSize int64
 	sqlLogOnce sync.Once
 )
@@ -122,7 +122,7 @@ func CloseSQLLog() {
 	sqlLogMu.Unlock()
 }
 
-// SQLAudit 写一行 JSON 审计记录（语句超长截断；v1.4.0 起缓冲批量落盘）。
+// SQLAudit 写一行 JSON 审计记录（语句超长截断；v1.3.15 起缓冲批量落盘）。
 func SQLAudit(line string) {
 	sqlLogMu.Lock()
 	defer sqlLogMu.Unlock()

@@ -104,7 +104,7 @@ func (h *Handler) handleRebuildRollup(q string) (*mysql.Result, bool, error) {
 	}
 	logx.Infof("rollup rebuilt for db %s table %s by conn %d", db, tbl, h.connID)
 	res, err2 := meta.SimpleRS(cols, rows)
-	return res, true, MapSQLiteErr(err2) // v1.4.0 错误收口
+	return res, true, MapSQLiteErr(err2) // v1.3.15 错误收口
 }
 
 // handleVacuumDB 管理面 VACUUM —— ⚠️ 执行期间该库全部写入被阻塞（写锁长持）。
@@ -129,7 +129,7 @@ func (h *Handler) handleVacuumDB(q string) (*mysql.Result, bool, error) {
 	}
 	res, err2 := meta.SimpleRS([]string{"database", "cost_ms", "size_before", "size_after", "note"},
 		[][]any{{m[1], cost.Milliseconds(), sizeBefore, sizeAfter, "执行期间该库所有写入被阻塞（写锁长持至 VACUUM 完成）；wasm 落盘略滞后，size_after 仅供参考"}})
-	return res, true, MapSQLiteErr(err2) // v1.4.0 错误收口
+	return res, true, MapSQLiteErr(err2) // v1.3.15 错误收口
 }
 
 // handleKill 处理 KILL <id>（全局生效，不限管理面；只读/普通用户拒绝）。
@@ -175,7 +175,7 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 	case reAdminShowConfig.MatchString(q):
 		rows := h.serverConfigRows()
 		res, err := meta.SimpleRS([]string{"name", "value"}, rows)
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 
 	case reAdminShowClient.MatchString(q):
 		var rows [][]any
@@ -186,7 +186,7 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 			})
 		}
 		res, err := meta.SimpleRS([]string{"Id", "User", "Host", "DB", "AdminMode", "ConnectedSec", "InTransaction", "HoldingWriteLock", "LastQuery"}, rows)
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 
 	case reAdminShowTx.MatchString(q):
 		var rows [][]any
@@ -199,7 +199,7 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 			}
 		}
 		res, err := meta.SimpleRS([]string{"Id", "User", "Host", "DB", "TxSec", "HoldingWriteLock", "LastQuery"}, rows)
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 
 	case reAdminSetPwd.MatchString(q):
 		if h.readonly {
@@ -334,7 +334,7 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 	case reAdminShowQos.MatchString(q):
 		rows := h.qosRows()
 		res, err := meta.SimpleRS([]string{"scope", "qps", "concurrency", "rows_per_sec", "passed", "queued", "rejected", "waiting", "avg_wait_ms"}, rows)
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 
 	// ---- 用户权限管理（v1.0.10）----
 	case reAdminCreateUser.MatchString(q):
@@ -450,7 +450,7 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		}
 		rows := h.grantRows(who)
 		res, err := meta.SimpleRS([]string{"Grants for " + who + "@%"}, rows)
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 
 	// ---- 防爆破审计 / 解锁（v1.0.10）----
 	case reAdminShowAtt.MatchString(q):
@@ -460,12 +460,12 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		}
 		rows := h.attemptRows(limit)
 		res, err := meta.SimpleRS([]string{"Id", "Time", "IP", "Remote", "User", "Success", "Reason"}, rows)
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 
 	case reAdminShowLock.MatchString(q):
 		rows := h.lockRows()
 		res, err := meta.SimpleRS([]string{"LockKey", "LockType", "LockedAt", "Until", "FailCount", "Level"}, rows)
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 
 	case reAdminUnlock.MatchString(q):
 		if err := h.adminMutateGate(); err != nil {
@@ -573,7 +573,7 @@ func (h *Handler) handleAdmin(q string) (*mysql.Result, bool, error) {
 		}
 		rows = filterAdminRows(cols, rows, where)
 		res, err := meta.SimpleRS(cols, rows)
-		return res, true, MapSQLiteErr(err) // v1.4.0 错误收口
+		return res, true, MapSQLiteErr(err) // v1.3.15 错误收口
 	}
 
 	return nil, false, nil
